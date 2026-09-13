@@ -4,13 +4,12 @@
 
 ```bash
 cargo test                    # all tests (19 total)
-cargo test --lib              # src/lib.rs tests only (10)
-cargo test --bin thalamic-relay  # src/main.rs tests only (9)
-cargo test gpu                # gpu safety tests (8)
+cargo test --lib              # src/lib.rs tests only (13: gpu + cpu)
+cargo test --bin thalamic-relay  # src/main.rs tests only (6)
+cargo test gpu                # gpu safety tests (12)
 cargo test cpu                # cpu metrics tests (1)
 cargo test test_safety        # safety-related tests
-cargo test stimuli            # UDP stimuli tests
-cargo test learning_reward    # learning reward tests
+cargo test lock_guard         # single-instance lockfile tests
 ```
 
 ### Test inventory
@@ -18,6 +17,9 @@ cargo test learning_reward    # learning reward tests
 | Binary | Test | What it covers |
 |--------|------|----------------|
 | lib.rs | `test_telemetry_struct` | GpuTelemetry default values |
+| lib.rs | `test_telemetry_to_rails` | GpuTelemetry rail conversion |
+| lib.rs | `test_read_telemetry_force_software_only` | Forced software-only telemetry read |
+| lib.rs | `test_is_gpu_healthy_does_not_panic` | GPU health check no-panic |
 | lib.rs | `test_safety_ok_on_simulated_values` | Simulated telemetry skips safety |
 | lib.rs | `test_safety_warn_on_elevated_temp` | 75-85°C warning threshold |
 | lib.rs | `test_safety_warn_on_elevated_power` | 300-350W warning threshold |
@@ -28,23 +30,23 @@ cargo test learning_reward    # learning reward tests
 | lib.rs | `test_safety_ok_on_normal_telemetry` | Normal readings pass |
 | lib.rs | `relay_metrics_default_values` | RelayMetrics defaults to 0 |
 | main.rs | `parses_custom_args_and_env_equiv` | CLI flag parsing |
-| main.rs | `stimuli_populates_and_clamps_values` | Stimuli vector population + clamping |
-| main.rs | `stimuli_truncates_when_values_exceed_channels` | Extra values ignored |
-| main.rs | `learning_reward_applies_positive_deltas` | Dopamine/cortisol increase |
-| main.rs | `learning_reward_ignores_negative_deltas` | Negative deltas clamped to 0 |
-| main.rs | `get_neuro_state_responds_with_expected_fields` | GetNeuroState JSON response |
-| main.rs | `invalid_json_does_not_panic` | Malformed input handled |
-| main.rs | `empty_json_does_not_panic` | Empty/unknown type handled |
-| main.rs | `empty_udp_no_messages_returns_false` | No messages → returns false |
+| main.rs | `parses_defaults` | CLI defaults |
+| main.rs | `parses_force_software_only_false` | `--force-software-only=false` |
+| main.rs | `lock_guard_created_and_removed` | Lockfile create/drop lifecycle |
+| main.rs | `lock_guard_rejects_active_pid` | Second instance refused while PID alive |
+| main.rs | `lock_guard_reclaims_stale_lock` | Stale lock (dead PID) reclaimed |
+
+As of RM-1143 (GH#39), `thalamic-relay` no longer runs an in-process SNN or
+exposes a UDP control surface — the `Stimuli`/`LearningReward`/`GetNeuroState`
+tests and the `num-channels`/`num-lif`/`num-izh` CLI tests were removed along
+with that code. See [`docs/ipc.md`](docs/ipc.md).
 
 ## Coverage update (RM-342)
 
-### Gaps closed
+### Gaps closed (at the time, since partly superseded by RM-1143's UDP/SNN removal above)
 
 - Software-only GPU telemetry fallback (`HardwareBridge::read_telemetry_force(true)`, `GpuTelemetry::to_rails`, `is_gpu_healthy` no-panic).
 - Single-instance lockfile lifecycle (`try_acquire_lock`, active PID rejection, stale lock reclamation, create/remove behavior).
-- UDP IPC error paths (malformed UTF-8, missing or non-array `values`, unknown type, invalid `LearningReward` deltas, multiple-message ordering).
-- CLI edge cases (`--force-software-only=false`, zero/invalid `num-channels`, defaults, `parse_nonzero_usize`).
 
 ### Gaps explicitly deferred
 
@@ -73,13 +75,13 @@ cargo build --all-features   # CI-equivalent build
 ```bash
 cargo run -- --help                          # show CLI options
 cargo run -- --force-software-only           # software-only mode (no GPU)
-cargo run -- --udp-addr 127.0.0.1:12345      # custom UDP bind
-cargo run -- --step-interval-ms 50           # faster stepping
+cargo run -- --metrics-ip 0.0.0.0            # custom Prometheus bind
+cargo run -- --step-interval-ms 50           # faster tick interval
 ```
 
 ## CI Checks
 
-The CI workflow (`.github/workflows/ci.yml`) pins Rust 1.97.1:
+The CI workflow (`.github/workflows/ci.yml`) pins Rust 1.98.1:
 
 1. `cargo fmt --check`
 2. `cargo clippy --all-targets --all-features -- -D warnings`

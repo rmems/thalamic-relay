@@ -7,8 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- Added `docs/ipc.md`, a normative contract for the UDP IPC surface (`Stimuli` / `LearningReward` / `GetNeuroState` request/reply schemas, error behavior, `--num-channels` interaction), cross-linked from `README.md` and `AGENTS.md` (#28)
-- Documented and single-sourced the MSRV as `rust-version = "1.97.1"` in `Cargo.toml` (#30)
+- **Breaking:** Removed in-process SNN execution (`neuromod::SpikingNetwork`, `NeuroModulators`) and the UDP control surface it existed to drive (`Stimuli` / `LearningReward` / `GetNeuroState`, and the `--udp-addr`/`--num-channels`/`--num-lif`/`--num-izh` flags). Thalamic is now a sensory + deterministic hardware-safety relay only; neural execution lives in `brainstem-daemon`. `docs/ipc.md` now documents the removal and points to the planned `corpus-ipc`-based replacement (RM-1143 / GH#39)
+- Removed the `neuromod` and `serde_json` dependencies (no longer used)
+- Bumped MSRV from `1.97.1` to `1.98.1`
 
 ## [0.1.0] - 2026-07-16
 

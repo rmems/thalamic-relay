@@ -1,4 +1,4 @@
-use metrics::{counter, gauge};
+use metrics::gauge;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -6,16 +6,10 @@ use tokio::time::sleep;
 use tracing::{Level, info};
 use tracing_subscriber::FmtSubscriber;
 
-/// Shared telemetry state populated by the main loop and UDP handlers
+/// Shared telemetry state populated by the main loop
 #[derive(Debug, Clone, Default)]
 pub struct RelayMetrics {
-    pub spike_count: usize,
-    pub stimulus_latency_ms: f64,
     pub telemetry_freshness_s: f64,
-    pub dopamine: f32,
-    pub cortisol: f32,
-    pub acetylcholine: f32,
-    pub stimuli_applied_count: u64,
 }
 
 /// Sets up our logging and metrics engines.
@@ -43,31 +37,19 @@ pub fn init_telemetry(metrics_addr: std::net::SocketAddr) {
     );
 }
 
-/// Spawns a background task to track relay/SNN telemetry metrics.
-/// Reads from shared state populated by the main loop and UDP handlers.
+/// Spawns a background task to track relay telemetry metrics.
+/// Reads from shared state populated by the main loop.
 pub async fn run_metrics_collector(metrics: Arc<Mutex<RelayMetrics>>) {
     info!("Starting Metrics Collector...");
 
     loop {
-        // --- 1. Track SNN / Relay Telemetry Metrics ---
-        // Read from shared state populated by the main loop and UDP handlers
+        // Read from shared state populated by the main loop
         let snapshot = {
             let guard = metrics.lock().unwrap();
             guard.clone()
         };
 
-        // Spike / stimulus metrics (Gauges go up and down)
-        gauge!("relay_spike_count").set(snapshot.spike_count as f64);
-        gauge!("stimulus_apply_latency_ms").set(snapshot.stimulus_latency_ms);
         gauge!("telemetry_freshness_s").set(snapshot.telemetry_freshness_s);
-
-        // Neuromodulator levels (from main loop + UDP rewards)
-        gauge!("modulator_dopamine").set(snapshot.dopamine as f64);
-        gauge!("modulator_cortisol").set(snapshot.cortisol as f64);
-        gauge!("modulator_acetylcholine").set(snapshot.acetylcholine as f64);
-
-        // Track applied stimuli (Counters only go up)
-        counter!("relay_stimuli_applied").absolute(snapshot.stimuli_applied_count);
 
         // Simulate tick rate
         sleep(Duration::from_secs(2)).await;
@@ -81,12 +63,6 @@ mod tests {
     #[test]
     fn relay_metrics_default_values() {
         let m = RelayMetrics::default();
-        assert_eq!(m.spike_count, 0);
-        assert_eq!(m.stimulus_latency_ms, 0.0);
         assert_eq!(m.telemetry_freshness_s, 0.0);
-        assert_eq!(m.dopamine, 0.0);
-        assert_eq!(m.cortisol, 0.0);
-        assert_eq!(m.acetylcholine, 0.0);
-        assert_eq!(m.stimuli_applied_count, 0);
     }
 }

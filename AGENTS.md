@@ -1,8 +1,10 @@
 ## Cursor Cloud specific instructions
 
 This repo is the `thalamic-relay` crate (binary `thalamic-relay`), a Rust CLI that
-observes telemetry and relays normalized stimuli to a spiking neural network and
-**FPGA (Field-Programmable Gate Array)** / network backends.
+observes hardware telemetry and provides deterministic hardware safety for the
+Spikenaut runtime stack. It does not run any neural computation itself (see
+[RM-1143 / GH#39](https://github.com/rmems/thalamic-relay/issues/39)) —
+that lives in `brainstem-daemon`.
 Below are the non-obvious gotchas.
 
 ### Dependencies
@@ -10,13 +12,13 @@ Below are the non-obvious gotchas.
 This crate no longer has any sibling `../` path dependencies. The former Core
 Backend Crates (`silicon-bridge`, `plasticity-lab`, `metabolic-ledger`,
 `limbic-critic`) were removed for modularity, so there is no need to clone
-sibling repos next to this one. The spiking neural network (SNN) engine is now
-pulled from crates.io via `neuromod` in `Cargo.toml`; build with a plain
+sibling repos next to this one. It also no longer depends on `neuromod`: the
+in-process SNN it used to step was removed in RM-1143. Build with a plain
 `cargo build` from the repo root.
 
 ### Toolchain / system deps
 
-- Requires Rust edition 2024 with MSRV 1.97.1 (toolchain >= 1.97.1; `u64::is_multiple_of` and
+- Requires Rust edition 2024 with MSRV 1.98.1 (toolchain >= 1.98.1; `u64::is_multiple_of` and
   clippy lints are used in CI; stable is set as the rustup default in this
   environment). `cargo`/`cargo build`/`cargo test`/`cargo clippy` all work from
   `/workspace`.
@@ -32,20 +34,19 @@ pulled from crates.io via `neuromod` in `Cargo.toml`; build with a plain
   parsing via clap (derive + env features; implemented for #11). Run it in tmux /
   background when testing (unless the user explicitly requests foreground behavior).
 - The relay degrades gracefully with no GPU/FPGA: it prints `nvidia-smi hung` /
-  runs in "software-only mode" and keeps stepping the in-process spiking network.
+  runs in "software-only mode" and keeps monitoring telemetry and hardware safety.
 - Single-instance guard: writes `/tmp/thalamic_relay.lock` with its PID. A stale
   lock for a dead PID is ignored automatically, but a second concurrent instance
   exits immediately. Delete the lockfile only if no instance is actually running.
 
 ### Interfaces (used for end-to-end testing)
 
-- **UDP (User Datagram Protocol)** on `127.0.0.1:9898` (or your --udp-addr; newline-free JSON):
-  `{"type":"LearningReward","dopamine_delta":..,"cortisol_delta":..}`, or
-  `{"type":"GetNeuroState"}` (which replies with a JSON neuromodulator/spike state).
-  Normative contract (all `type` values, field schemas, `--num-channels`
-  interaction, error behavior): see [`docs/ipc.md`](docs/ipc.md).
+- No control/query IPC surface currently — the prior UDP protocol
+  (`Stimuli`/`LearningReward`/`GetNeuroState`) was removed in RM-1143 along
+  with the in-process SNN it existed to drive. See [`docs/ipc.md`](docs/ipc.md)
+  for the removal note and the planned `corpus-ipc`-based replacement.
 - Prometheus metrics on `http://localhost:9000/metrics` (bind IP (Internet Protocol) configurable via --metrics-ip).
-- Both bind on startup, so only one instance can run at a time.
+- Binds on startup, so only one instance can run at a time.
 
 ### Responding to automated PR review bots
 

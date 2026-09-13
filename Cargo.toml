@@ -2,18 +2,16 @@
 name = "thalamic-relay"
 version = "0.1.0"
 edition = "2024"
-description = "Lightweight CLI relay that observes telemetry and forwards normalized stimuli to SNN (software-only, no built-in FPGA bridge)."
+description = "Lightweight CLI relay that observes hardware telemetry and provides deterministic hardware safety (software-only, no built-in FPGA bridge)."
 repository = "https://github.com/rmems/thalamic-relay"
 license = "MIT OR Apache-2.0"
-rust-version = "1.97.1"
+rust-version = "1.98.1"
 
 
 [dependencies]
 # Core Logic
-neuromod = "0.4.0"
 tokio = { version = "1.36", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 metrics = "0.24"
