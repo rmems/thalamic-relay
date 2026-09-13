@@ -1,0 +1,25 @@
+.github/workflows/ci.yml
+  s_9d036bc8e05b16::t_186a6bfc3c41a1 9-11
+README.md
+  s_9d036bc8e05b16::t_8c40a4d12f2ec8 33
+  s_9d036bc8e05b16::t_8629fdc90961a1 134-135
+  s_9d036bc8e05b16::t_0ea48bee6c8255 73-74
+docs/ipc.md
+  s_9d036bc8e05b16::t_2d69fd39250034 11
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "3ec2c720dfb9e59473780a233832a17fa7d3ed52",
+  "prompts": {},
+  "sessions": {
+    "s_9d036bc8e05b16": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "acea7f8e-dc64-4004-aff6-423670769bc5",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Raul Cardenas Montoya <montoyaraul34@gmail.com>"
+    }
+  }
+}
