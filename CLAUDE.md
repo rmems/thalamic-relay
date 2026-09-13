@@ -8,9 +8,12 @@ here too) — this file adds Claude-specific workflow notes and defers to
 ## Project
 
 `thalamic-relay` — a Rust CLI (binary `thalamic-relay`) that observes hardware
-telemetry and drives an in-process spiking neural network (SNN) via the
-`neuromod` crate, exposing a UDP control surface and Prometheus metrics.
-Software-only; no FPGA/silicon-bridge dependency.
+telemetry and provides deterministic hardware safety (thermal/power emergency
+brake) for the Spikenaut runtime stack, exposing Prometheus metrics.
+Software-only; no FPGA/silicon-bridge dependency. It does **not** run any
+neural computation itself — the in-process SNN it used to step was removed
+in [RM-1143 / GH#39](https://github.com/rmems/thalamic-relay/issues/39);
+neural execution lives in `brainstem-daemon`.
 
 ## Build / test
 
@@ -21,20 +24,17 @@ cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-Requires Rust edition 2024, MSRV 1.97.1. No sibling path dependencies — a
+Requires Rust edition 2024, MSRV 1.98.1. No sibling path dependencies — a
 plain `cargo build` from the repo root is sufficient.
 
 ## Interfaces
 
-- UDP control surface on `127.0.0.1:9898` by default (`--udp-addr` /
-  `THALAMIC_UDP_ADDR`). **The normative message contract lives in
-  [`docs/ipc.md`](docs/ipc.md)** — read it before touching
-  `process_udp_messages` in `src/main.rs` or documenting IPC behavior
-  elsewhere. It was built by verifying every claim against the actual code
-  and the pinned `neuromod` dependency source (not just the top-level
-  `process_udp_messages` function) — several non-obvious behaviors live in
-  `neuromod` itself (e.g. `SpikingNetwork::step` discards stimulus sign,
-  `NeuroModulators::decay` runs every tick, reward deltas saturate at 1.0).
+- No control/query IPC surface currently. The UDP protocol
+  (`Stimuli`/`LearningReward`/`GetNeuroState`) that used to live at
+  `127.0.0.1:9898` was removed in RM-1143 along with the in-process SNN it
+  existed to drive — see [`docs/ipc.md`](docs/ipc.md) for the removal note
+  and the planned `corpus-ipc`-based replacement (RM-1144/RM-1145, separate
+  follow-up work).
 - Prometheus metrics on `:9000/metrics`.
 
 ## Reviewing / responding to automated PR review bots

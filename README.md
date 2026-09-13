@@ -2,26 +2,48 @@
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](https://github.com/rmems/thalamic-relay#license)
 
-A lightweight CLI relay that observes hardware telemetry and forwards normalized
-stimuli to a spiking neural network (software-only; silicon-bridge/**FPGA (Field-Programmable Gate Array)** bridge dep removed for modularity).
+A lightweight CLI relay that observes hardware telemetry and provides
+deterministic hardware safety for the Spikenaut runtime stack (software-only;
+silicon-bridge/**FPGA (Field-Programmable Gate Array)** bridge dep removed
+for modularity).
 
 ## Overview
 
-Thalamic Relay is a Rust-based hardware orchestration relay that provides
-real-time monitoring of compute telemetry and drives a spiking neural network
-(SNN). It collects GPU/CPU telemetry and steps an in-process SNN, exposing a
-control/observability surface over **UDP (User Datagram Protocol)** IPC and Prometheus metrics. The relay is
-platform-agnostic: it degrades gracefully to a software-only mode when no GPU
-is present.
+Thalamic Relay is the hardware-facing **sensory + deterministic safety**
+process for the Spikenaut runtime stack:
+
+```text
+hardware telemetry
+      ↓
+thalamic-relay
+  - sensing
+  - validation
+  - normalization
+  - staleness/missingness
+  - hard safety
+      ↓
+corpus-ipc          (follow-up work — not yet implemented)
+      ↓
+brainstem-daemon
+  - SpikingNetwork
+  - neuromodulation
+  - tick loop
+```
+
+It collects GPU/CPU telemetry, runs deterministic thermal/power safety
+checks, and exposes observability over Prometheus metrics. It does **not**
+run any neural computation itself — that lives in `brainstem-daemon`. The
+relay is platform-agnostic: it degrades gracefully to a software-only mode
+when no GPU is present, and hardware safety keeps functioning even when
+`brainstem-daemon` is absent or crashed.
 
 ## Features
 
 - **GPU Telemetry**: Real-time monitoring of GPU sensors via NVML (temperature,
   power, clocks, fan, utilization) with a software fallback
-- **Software SNN stepping**: In-process spiking network with neuromodulation (no built-in FPGA bridge dep)
-- **Spiking Neural Networks**: In-process SNN stepping via the `neuromod` engine
-- **Control IPC**: UDP interface for streaming stimuli, applying reward signals,
-  and querying neuromodulator/spike state
+- **Deterministic Hardware Safety**: Thermal/power threshold checks with
+  emergency brake and hysteresis-gated release, independent of any
+  downstream neural runtime
 - **Metrics Collection**: Prometheus-compatible metrics export
 - **Process Safety**: Single-instance protection via a lockfile mechanism
 
@@ -29,7 +51,7 @@ is present.
 
 ### Prerequisites
 
-- Rust 2024 edition (MSRV 1.97.1)
+- Rust 2024 edition (MSRV 1.98.1)
 - `pkg-config` (used by some native dependencies)
 - Linux operating system (tested on Linux)
 - Optional: an NVIDIA GPU with NVML support
@@ -48,20 +70,17 @@ cargo run --bin thalamic-relay
 
 ## Usage
 
-The relay runs in software-only mode and steps the in-process SNN. Telemetry (GPU/CPU) is collected when available.
+The relay runs in software-only mode and continuously monitors telemetry
+(GPU/CPU) and hardware safety when available.
 
-While running it exposes two interfaces (addresses configurable via CLI/env; see Configuration):
+While running it exposes (address configurable via CLI/env; see Configuration):
 
-- **UDP (User Datagram Protocol) IPC** (defaults to 127.0.0.1:9898; newline-free JSON messages):
-  - `{"type":"Stimuli","values":[/* up to N f32 (N = --num-channels, default 16) */]}` — drive the network
-  - `{"type":"LearningReward","dopamine_delta":<f32>,"cortisol_delta":<f32>}` —
-    apply reward/stress modulation
-  - `{"type":"GetNeuroState"}` — returns a JSON snapshot of the current
-    neuromodulator levels and spike count
-
-  See [`docs/ipc.md`](docs/ipc.md) for the normative message contract
-  (full field schemas, clamping/error behavior, and reply shapes).
 - **Prometheus metrics** on `http://localhost:9000/metrics` (bind IP configurable via --metrics-ip)
+
+It currently has no control/query IPC surface — the prior UDP protocol was
+removed along with the in-process SNN it existed to drive; see
+[`docs/ipc.md`](docs/ipc.md) for details and the planned `corpus-ipc`-based
+replacement (follow-up work).
 
 ## Architecture
 
@@ -74,18 +93,16 @@ While running it exposes two interfaces (addresses configurable via CLI/env; see
 
 1. **Hardware Bridge**: Abstract interface for GPU communication
 2. **Telemetry System**: Real-time metrics collection and export
-3. **SNN Stepping**: In-process spiking neural network execution
-4. **Emergency Brakes**: Safety mechanisms for hardware protection
+3. **Emergency Brakes**: Safety mechanisms for hardware protection
 
 ## Dependencies
 
 ### Core Dependencies
 
 - `tokio`: Async runtime with full features
-- `serde` / `serde_json`: Serialization framework
+- `serde`: Serialization framework (used by GPU telemetry types)
 - `tracing` / `tracing-subscriber`: Structured logging and telemetry
 - `metrics` / `metrics-exporter-prometheus`: Metrics collection with Prometheus export
-- `neuromod`: Spiking neural network engine
 
 ### Hardware Interfaces
 
@@ -99,16 +116,14 @@ Run `thalamic-relay --help` (or `-V`) for the full documented surface.
 
 Key options (with env var equivalent):
 
-- `--udp-addr` / `THALAMIC_UDP_ADDR` (default: 127.0.0.1:9898) — **UDP (User Datagram Protocol)** IPC bind
 - `--metrics-ip` / `THALAMIC_METRICS_IP` (default: 127.0.0.1; port is always 9000)
-- `--step-interval-ms` / `THALAMIC_STEP_INTERVAL_MS` (default: 100)
+- `--step-interval-ms` / `THALAMIC_STEP_INTERVAL_MS` (default: 100) — relay loop tick interval
 - `--force-software-only` / `THALAMIC_FORCE_SOFTWARE_ONLY`
-- `--num-channels` / `THALAMIC_NUM_CHANNELS` (input channels/stimuli vector), `--num-lif` / `THALAMIC_NUM_LIF` (LIF neurons), `--num-izh` / `THALAMIC_NUM_IZH` (Izhikevich neurons) — SNN dims for `with_dimensions`
 - `RUST_LOG` (standard for tracing; or --log-level in future extensions)
 
 Example with env + flag:
 ```bash
-THALAMIC_UDP_ADDR=0.0.0.0:12345 THALAMIC_METRICS_IP=0.0.0.0 \
+THALAMIC_METRICS_IP=0.0.0.0 \
   cargo run --bin thalamic-relay -- --force-software-only --step-interval-ms 50
 ```
 
@@ -117,7 +132,7 @@ THALAMIC_UDP_ADDR=0.0.0.0:12345 THALAMIC_METRICS_IP=0.0.0.0 \
 ### Prometheus Metrics
 
 The relay exports metrics compatible with Prometheus monitoring, including
-GPU telemetry, SNN metrics, and system resource usage.
+GPU/CPU telemetry freshness and system resource usage.
 
 ### Logging
 
