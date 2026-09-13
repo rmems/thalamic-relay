@@ -8,7 +8,7 @@ protocol existed only to drive and query the relay's own SNN; with the SNN
 gone, there is nothing left for it to control.
 
 Thalamic is now a sensory + hardware-safety relay: it collects, validates,
-and safety-gates hardware telemetry (GPU/CPU), independent of whether any
+and safety-gates GPU telemetry, independent of whether any
 downstream neural runtime (`brainstem-daemon`) is present. It currently
 exposes no control/query IPC surface — only Prometheus metrics on
 `:9000/metrics`.

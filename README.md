@@ -30,7 +30,7 @@ brainstem-daemon
   - tick loop
 ```
 
-It collects GPU/CPU telemetry, runs deterministic thermal/power safety
+It collects GPU telemetry, runs deterministic thermal/power safety
 checks, and exposes observability over Prometheus metrics. It does **not**
 run any neural computation itself — that lives in `brainstem-daemon`. The
 relay is platform-agnostic: it degrades gracefully to a software-only mode
@@ -70,8 +70,8 @@ cargo run --bin thalamic-relay
 
 ## Usage
 
-The relay runs in software-only mode and continuously monitors telemetry
-(GPU/CPU) and hardware safety when available.
+The relay runs in software-only mode and continuously monitors GPU telemetry
+and hardware safety when available.
 
 While running it exposes (address configurable via CLI/env; see Configuration):
 
@@ -131,8 +131,8 @@ THALAMIC_METRICS_IP=0.0.0.0 \
 
 ### Prometheus Metrics
 
-The relay exports metrics compatible with Prometheus monitoring, including
-GPU/CPU telemetry freshness and system resource usage.
+The relay exports metrics compatible with Prometheus monitoring — currently
+just hardware telemetry freshness (`telemetry_freshness_s`).
 
 ### Logging
 
