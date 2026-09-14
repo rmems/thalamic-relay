@@ -5,7 +5,8 @@
 //! frame and never infers simulation from magic numeric values.
 
 use crate::telemetry::{
-    RawTelemetry, SampleValidity, TelemetryFrame, TelemetrySource, assess, unix_now_ms,
+    DEFAULT_ACQUISITION_CADENCE_MS, RawTelemetry, SampleValidity, TelemetryFrame, TelemetrySource,
+    assess_with_cadence, unix_now_ms,
 };
 use lazy_static::lazy_static;
 use nvml_wrapper::Nvml;
@@ -31,23 +32,31 @@ pub struct HardwareBridge;
 impl HardwareBridge {
     /// Acquire raw telemetry, then validate/normalize into a [`TelemetryFrame`].
     pub fn read_telemetry() -> TelemetryFrame {
-        Self::read_telemetry_force(false)
+        Self::read_telemetry_with(false, DEFAULT_ACQUISITION_CADENCE_MS)
     }
 
     /// Read telemetry, but if `force_software` is true, always use the simulated
     /// fallback (never attempt real NVML/nvidia-smi). This implements the
     /// `--force-software-only` CLI flag for #11.
     pub fn read_telemetry_force(force_software: bool) -> TelemetryFrame {
+        Self::read_telemetry_with(force_software, DEFAULT_ACQUISITION_CADENCE_MS)
+    }
+
+    /// Acquire + assess with the configured supervisor tick interval.
+    pub fn read_telemetry_with(force_software: bool, cadence_ms: u64) -> TelemetryFrame {
         let raw = Self::acquire_raw(force_software);
-        assess(&raw, unix_now_ms())
+        assess_with_cadence(&raw, unix_now_ms(), cadence_ms)
     }
 
     /// Raw acquisition only — no validation, no silent zeros for missing sensors.
+    ///
+    /// `SoftwareFallback` is used only when `force_software` is true.
+    /// NVML/driver/device failure is [`TelemetrySource::NvmlUnavailable`].
     pub fn acquire_raw(force_software: bool) -> RawTelemetry {
-        if !force_software && let Some(raw) = Self::read_nvml() {
-            return raw;
+        if force_software {
+            return RawTelemetry::software_fallback(unix_now_ms());
         }
-        RawTelemetry::software_fallback(unix_now_ms())
+        Self::read_nvml().unwrap_or_else(|| RawTelemetry::nvml_unavailable(unix_now_ms()))
     }
 
     /// Returns true if the NVIDIA driver is responsive and the GPU is healthy.
@@ -72,7 +81,9 @@ impl HardwareBridge {
 
         if !Self::is_gpu_healthy() {
             if !WAS_UNHEALTHY.swap(true, Ordering::Relaxed) {
-                println!("[hardware_bridge] nvidia-smi hung. Bypassing NVML until it recovers.");
+                println!(
+                    "[hardware_bridge] nvidia-smi hung. Treating telemetry as unavailable (fail closed)."
+                );
             }
             return None;
         }
@@ -111,9 +122,9 @@ impl HardwareBridge {
 
     /// Check GPU safety thresholds against a validated frame.
     ///
-    /// Simulation is [`TelemetrySource::SoftwareFallback`], never inferred from
-    /// values such as `temperature <= 0 && power <= 25`. Missing, invalid, or
-    /// stale safety-critical signals fail closed.
+    /// Simulation is [`TelemetrySource::SoftwareFallback`] only (forced
+    /// software-only). [`TelemetrySource::NvmlUnavailable`] is **not** simulated:
+    /// missing safety samples fail closed.
     ///
     /// Returns `(SafetyStatus, is_simulated)`.
     pub fn check_safety(frame: &TelemetryFrame) -> (SafetyStatus, bool) {
@@ -478,6 +489,40 @@ mod tests {
         let (status, is_sim) = HardwareBridge::check_safety(&oor);
         assert!(matches!(status, SafetyStatus::Critical(ref msg) if msg.contains("invalid")));
         assert!(!is_sim);
+    }
+
+    #[test]
+    fn test_acquire_raw_force_software_is_fallback_not_unavailable() {
+        let raw = HardwareBridge::acquire_raw(true);
+        assert_eq!(raw.source, TelemetrySource::SoftwareFallback);
+        let unavail = HardwareBridge::acquire_raw(false);
+        assert!(
+            matches!(
+                unavail.source,
+                TelemetrySource::Nvml | TelemetrySource::NvmlUnavailable
+            ),
+            "acquire_raw(false) must not be SoftwareFallback, got {:?}",
+            unavail.source
+        );
+        assert_ne!(unavail.source, TelemetrySource::SoftwareFallback);
+    }
+
+    #[test]
+    fn test_nvml_unavailable_fail_closes_safety() {
+        let frame = assess(&fixtures::nvml_unavailable(), fixtures::NOW);
+        let (status, is_sim) = HardwareBridge::check_safety(&frame);
+        assert!(matches!(status, SafetyStatus::Critical(ref msg) if msg.contains("missing")));
+        assert!(!is_sim);
+        assert_eq!(frame.source, TelemetrySource::NvmlUnavailable);
+        assert_eq!(frame.gpu_temp_c.value, None);
+        assert_eq!(frame.power_w.value, None);
+    }
+
+    #[test]
+    fn test_read_telemetry_with_records_configured_cadence() {
+        let frame = HardwareBridge::read_telemetry_with(true, 50);
+        assert_eq!(frame.acquisition_cadence_ms, 50);
+        assert_eq!(frame.source, TelemetrySource::SoftwareFallback);
     }
 
     #[test]

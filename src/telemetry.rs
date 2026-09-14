@@ -23,8 +23,11 @@ pub type UnixMillis = u64;
 pub enum TelemetrySource {
     /// NVIDIA Management Library (NVML) on a live device.
     Nvml,
-    /// Documented software-only idle estimates (no real GPU / forced software).
+    /// Documented software-only idle estimates (`--force-software-only`).
     SoftwareFallback,
+    /// NVML/driver/device lookup failed. Not confirmed software-only.
+    /// Safety must fail closed (missing safety samples), not skip as simulated.
+    NvmlUnavailable,
 }
 
 /// Validity of a single sample. Orthogonal to [`TelemetrySource`].
@@ -345,13 +348,21 @@ impl TelemetrySample<f32> {
         now: UnixMillis,
     ) -> Self {
         let spec = signal_spec(signal);
-        let age_ms = now.saturating_sub(observed_at);
-        let (value, validity) = match raw {
-            None => (None, SampleValidity::Missing),
-            Some(v) if !v.is_finite() => (None, SampleValidity::Invalid),
-            Some(v) if v < spec.min || v > spec.max => (Some(v), SampleValidity::Invalid),
-            Some(v) if age_ms >= spec.stale_after_ms => (Some(v), SampleValidity::Stale),
-            Some(v) => (Some(v), SampleValidity::Valid),
+        let (value, validity) = if observed_at > now {
+            match raw {
+                None => (None, SampleValidity::Missing),
+                Some(v) if !v.is_finite() => (None, SampleValidity::Invalid),
+                Some(v) => (Some(v), SampleValidity::Invalid),
+            }
+        } else {
+            let age_ms = now.saturating_sub(observed_at);
+            match raw {
+                None => (None, SampleValidity::Missing),
+                Some(v) if !v.is_finite() => (None, SampleValidity::Invalid),
+                Some(v) if v < spec.min || v > spec.max => (Some(v), SampleValidity::Invalid),
+                Some(v) if age_ms >= spec.stale_after_ms => (Some(v), SampleValidity::Stale),
+                Some(v) => (Some(v), SampleValidity::Valid),
+            }
         };
         Self {
             signal,
@@ -371,6 +382,20 @@ impl TelemetrySample<f32> {
         }
         self.value
             .map(|v| signal_spec(self.signal).normalization.apply(v))
+    }
+
+    /// Re-evaluate future/stale validity at `now` without re-acquiring.
+    ///
+    /// Missing stays missing. Samples with no engineering value keep their
+    /// validity (except a future timestamp on a non-missing empty sample is
+    /// [`SampleValidity::Invalid`]). Finite values are re-run through
+    /// [`Self::from_raw`].
+    #[must_use]
+    pub fn at_time(&self, now: UnixMillis) -> Self {
+        if self.value.is_none() {
+            return self.clone();
+        }
+        Self::from_raw(self.signal, self.value, self.observed_at, self.source, now)
     }
 }
 
@@ -410,6 +435,23 @@ impl RawTelemetry {
         }
     }
 
+    /// NVML/driver unavailable: every channel missing, not software-idle estimates.
+    #[must_use]
+    pub fn nvml_unavailable(observed_at: UnixMillis) -> Self {
+        Self {
+            observed_at,
+            source: TelemetrySource::NvmlUnavailable,
+            gpu_temp_c: None,
+            vram_temp_c: None,
+            power_w: None,
+            vddcr_gfx_v: None,
+            gpu_clock_mhz: None,
+            mem_clock_mhz: None,
+            fan_speed_pct: None,
+            mem_util_pct: None,
+        }
+    }
+
     fn value(&self, id: SignalId) -> Option<f32> {
         match id {
             SignalId::GpuTempC => self.gpu_temp_c,
@@ -429,6 +471,9 @@ impl RawTelemetry {
 pub struct TelemetryFrame {
     pub acquired_at: UnixMillis,
     pub source: TelemetrySource,
+    /// Actual supervisor acquisition interval (`--step-interval-ms`), not the
+    /// documented default in [`signal_spec`].
+    pub acquisition_cadence_ms: u64,
     pub gpu_temp_c: TelemetrySample<f32>,
     pub vram_temp_c: TelemetrySample<f32>,
     pub power_w: TelemetrySample<f32>,
@@ -441,14 +486,22 @@ pub struct TelemetryFrame {
 
 impl TelemetryFrame {
     /// Validate and stamp every raw channel. Does not mutate the raw bag.
+    /// Uses [`DEFAULT_ACQUISITION_CADENCE_MS`] as the actual cadence.
     #[must_use]
     pub fn from_raw(raw: &RawTelemetry, now: UnixMillis) -> Self {
+        Self::from_raw_with_cadence(raw, now, DEFAULT_ACQUISITION_CADENCE_MS)
+    }
+
+    /// Like [`Self::from_raw`] but records the configured acquisition interval.
+    #[must_use]
+    pub fn from_raw_with_cadence(raw: &RawTelemetry, now: UnixMillis, cadence_ms: u64) -> Self {
         let sample = |id: SignalId| {
             TelemetrySample::from_raw(id, raw.value(id), raw.observed_at, raw.source, now)
         };
         Self {
             acquired_at: raw.observed_at,
             source: raw.source,
+            acquisition_cadence_ms: cadence_ms.max(1),
             gpu_temp_c: sample(SignalId::GpuTempC),
             vram_temp_c: sample(SignalId::VramTempC),
             power_w: sample(SignalId::PowerW),
@@ -475,22 +528,31 @@ impl TelemetryFrame {
         ]
     }
 
-    /// Deterministic mapping toward corpus-ipc (`#40`).
+    /// Deterministic mapping toward corpus-ipc (`#40`) using wall-clock now.
+    #[must_use]
+    pub fn to_sensory_mapping(&self) -> SensoryMapping {
+        self.to_sensory_mapping_at(unix_now_ms())
+    }
+
+    /// Mapping at an explicit instant so held frames can go stale.
     ///
     /// Includes only runtime-input candidates ([`SignalClass::RuntimeInput`] or
     /// [`SignalClass::Both`]). Observability-only channels are omitted (no filler).
-    /// Normalized values are `None` unless the sample is [`SampleValidity::Valid`].
+    /// Normalized values are `None` unless the sample is [`SampleValidity::Valid`]
+    /// *at `now`*. Each stimulus carries `stale_after_ms` and the actual
+    /// `cadence_ms` so corpus-ipc consumers need not duplicate the inventory.
     #[must_use]
-    pub fn to_sensory_mapping(&self) -> SensoryMapping {
+    pub fn to_sensory_mapping_at(&self, now: UnixMillis) -> SensoryMapping {
         let stimuli = self
             .samples()
             .into_iter()
             .filter(|s| signal_spec(s.signal).class.includes_runtime_input())
-            .map(MappedStimulus::from_sample)
+            .map(|s| MappedStimulus::from_sample(&s.at_time(now), self.acquisition_cadence_ms))
             .collect();
         SensoryMapping {
             observed_at_unix_ms: self.acquired_at,
             acquisition_source: self.source,
+            acquisition_cadence_ms: self.acquisition_cadence_ms,
             stimuli,
         }
     }
@@ -498,13 +560,20 @@ impl TelemetryFrame {
     /// Full raw snapshot for observability, independent of sensory normalization.
     #[must_use]
     pub fn to_observability_snapshot(&self) -> ObservabilitySnapshot {
+        self.to_observability_snapshot_at(unix_now_ms())
+    }
+
+    /// Observability snapshot re-evaluated at `now`.
+    #[must_use]
+    pub fn to_observability_snapshot_at(&self, now: UnixMillis) -> ObservabilitySnapshot {
         ObservabilitySnapshot {
             observed_at_unix_ms: self.acquired_at,
             acquisition_source: self.source,
+            acquisition_cadence_ms: self.acquisition_cadence_ms,
             samples: self
                 .samples()
                 .into_iter()
-                .map(MappedStimulus::from_sample)
+                .map(|s| MappedStimulus::from_sample(&s.at_time(now), self.acquisition_cadence_ms))
                 .collect(),
         }
     }
@@ -514,6 +583,12 @@ impl TelemetryFrame {
 #[must_use]
 pub fn assess(raw: &RawTelemetry, now: UnixMillis) -> TelemetryFrame {
     TelemetryFrame::from_raw(raw, now)
+}
+
+/// Validate raw acquisition and record the configured acquisition cadence.
+#[must_use]
+pub fn assess_with_cadence(raw: &RawTelemetry, now: UnixMillis, cadence_ms: u64) -> TelemetryFrame {
+    TelemetryFrame::from_raw_with_cadence(raw, now, cadence_ms)
 }
 
 /// One channel in the corpus-ipc mapping surface (not a wire type).
@@ -529,10 +604,14 @@ pub struct MappedStimulus {
     pub raw: Option<f32>,
     /// `[0, 1]` model-input. `None` unless [`SampleValidity::Valid`].
     pub normalized: Option<f32>,
+    /// Per-signal stale threshold (ms). Consumers need not copy the inventory.
+    pub stale_after_ms: u64,
+    /// Actual acquisition cadence for this frame (`--step-interval-ms`).
+    pub cadence_ms: u64,
 }
 
 impl MappedStimulus {
-    fn from_sample(sample: &TelemetrySample<f32>) -> Self {
+    fn from_sample(sample: &TelemetrySample<f32>, cadence_ms: u64) -> Self {
         let spec = signal_spec(sample.signal);
         Self {
             signal: sample.signal,
@@ -543,6 +622,8 @@ impl MappedStimulus {
             validity: sample.validity,
             raw: sample.value,
             normalized: sample.normalized(),
+            stale_after_ms: spec.stale_after_ms,
+            cadence_ms,
         }
     }
 }
@@ -552,6 +633,7 @@ impl MappedStimulus {
 pub struct SensoryMapping {
     pub observed_at_unix_ms: UnixMillis,
     pub acquisition_source: TelemetrySource,
+    pub acquisition_cadence_ms: u64,
     pub stimuli: Vec<MappedStimulus>,
 }
 
@@ -560,6 +642,7 @@ pub struct SensoryMapping {
 pub struct ObservabilitySnapshot {
     pub observed_at_unix_ms: UnixMillis,
     pub acquisition_source: TelemetrySource,
+    pub acquisition_cadence_ms: u64,
     pub samples: Vec<MappedStimulus>,
 }
 
@@ -591,6 +674,12 @@ pub mod fixtures {
     #[must_use]
     pub fn software_fallback() -> RawTelemetry {
         RawTelemetry::software_fallback(NOW)
+    }
+
+    /// NVML unavailable: all channels missing, fail-closed safety path.
+    #[must_use]
+    pub fn nvml_unavailable() -> RawTelemetry {
+        RawTelemetry::nvml_unavailable(NOW)
     }
 
     /// Same engineering values as [`healthy_real`] but observed 10s ago.
@@ -748,7 +837,7 @@ mod tests {
     #[test]
     fn sensory_mapping_omits_observability_only_without_filler() {
         let frame = assess_now(&fixtures::healthy_real());
-        let mapping = frame.to_sensory_mapping();
+        let mapping = frame.to_sensory_mapping_at(NOW);
         assert_eq!(mapping.acquisition_source, TelemetrySource::Nvml);
         let names: Vec<&str> = mapping.stimuli.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
@@ -770,7 +859,7 @@ mod tests {
     #[test]
     fn observability_snapshot_preserves_raw_independently_of_normalization() {
         let frame = assess_now(&fixtures::out_of_range());
-        let snap = frame.to_observability_snapshot();
+        let snap = frame.to_observability_snapshot_at(NOW);
         assert_eq!(snap.samples.len(), ALL_SIGNALS.len());
         let temp = snap
             .samples
@@ -785,7 +874,7 @@ mod tests {
     #[test]
     fn missing_runtime_input_is_not_normalized_to_zero() {
         let frame = assess_now(&fixtures::sensor_dropout());
-        let mapping = frame.to_sensory_mapping();
+        let mapping = frame.to_sensory_mapping_at(NOW);
         let power = mapping
             .stimuli
             .iter()
@@ -836,5 +925,65 @@ mod tests {
             signal_spec(SignalId::FanSpeedPct).class,
             SignalClass::ObservabilityOnly
         );
+    }
+
+    #[test]
+    fn future_observed_at_is_invalid_not_valid() {
+        let mut raw = fixtures::healthy_real();
+        raw.observed_at = NOW + 5_000;
+        let frame = assess(&raw, NOW);
+        assert_eq!(frame.gpu_temp_c.validity, SampleValidity::Invalid);
+        assert_eq!(frame.gpu_temp_c.value, Some(65.0));
+        assert_eq!(frame.power_w.validity, SampleValidity::Invalid);
+        assert_eq!(frame.gpu_temp_c.normalized(), None);
+    }
+
+    #[test]
+    fn mapping_re_evaluates_stale_and_carries_thresholds() {
+        let frame = assess_now(&fixtures::healthy_real());
+        let fresh = frame.to_sensory_mapping_at(NOW);
+        let temp = fresh
+            .stimuli
+            .iter()
+            .find(|s| s.signal == SignalId::GpuTempC)
+            .unwrap();
+        assert_eq!(temp.validity, SampleValidity::Valid);
+        assert_eq!(temp.normalized, Some(0.65));
+        assert_eq!(temp.stale_after_ms, SAFETY_STALE_AFTER_MS);
+        assert_eq!(temp.cadence_ms, DEFAULT_ACQUISITION_CADENCE_MS);
+        assert_eq!(fresh.acquisition_cadence_ms, DEFAULT_ACQUISITION_CADENCE_MS);
+
+        let later = NOW + SAFETY_STALE_AFTER_MS;
+        let mapping = frame.to_sensory_mapping_at(later);
+        let temp = mapping
+            .stimuli
+            .iter()
+            .find(|s| s.signal == SignalId::GpuTempC)
+            .unwrap();
+        assert_eq!(temp.validity, SampleValidity::Stale);
+        assert_eq!(temp.raw, Some(65.0));
+        assert_eq!(temp.normalized, None);
+    }
+
+    #[test]
+    fn mapping_reports_configured_acquisition_cadence() {
+        let frame = assess_with_cadence(&fixtures::healthy_real(), NOW, 50);
+        assert_eq!(frame.acquisition_cadence_ms, 50);
+        assert_eq!(
+            signal_spec(SignalId::GpuTempC).cadence_ms,
+            DEFAULT_ACQUISITION_CADENCE_MS
+        );
+        let mapping = frame.to_sensory_mapping_at(NOW);
+        assert_eq!(mapping.acquisition_cadence_ms, 50);
+        assert!(mapping.stimuli.iter().all(|s| s.cadence_ms == 50));
+    }
+
+    #[test]
+    fn nvml_unavailable_is_missing_not_software_fallback() {
+        let frame = assess_now(&fixtures::nvml_unavailable());
+        assert_eq!(frame.source, TelemetrySource::NvmlUnavailable);
+        assert_eq!(frame.gpu_temp_c.validity, SampleValidity::Missing);
+        assert_eq!(frame.power_w.validity, SampleValidity::Missing);
+        assert_eq!(frame.gpu_temp_c.value, None);
     }
 }

@@ -17,14 +17,16 @@ does not depend on corpus-ipc transport ([GH#40](https://github.com/rmems/thalam
 TelemetrySample<T> {
     value: Option<T>,       // engineering units; None if missing or non-finite
     observed_at: unix ms,
-    source: TelemetrySource, // Nvml | SoftwareFallback
+    source: TelemetrySource, // Nvml | SoftwareFallback | NvmlUnavailable
     validity: SampleValidity, // Valid | Missing | Invalid | Stale
     unit: Unit,
 }
 ```
 
-Simulated data is [`TelemetrySource::SoftwareFallback`]. It is not inferred
-from conventions such as `temperature <= 0 && power <= 25`. An NVML sample
+Simulated data is [`TelemetrySource::SoftwareFallback`] and is used only for
+`--force-software-only`. NVML/driver/device lookup failure is
+[`TelemetrySource::NvmlUnavailable`] (all safety samples `Missing`) and
+**fail-closes** safety — it is not treated as simulated idle. An NVML sample
 that happens to read `0 °C` and `25 W` is still `source = Nvml` and may be a
 legitimate idle GPU.
 
@@ -42,9 +44,13 @@ TelemetryFrame        (per-signal TelemetrySample)
 ```
 
 The supervisor currently assesses each acquisition immediately (age ≈ 0).
-If NVML is unavailable it switches to `SoftwareFallback` rather than holding a
-last-good NVML sample until it goes stale. The `Stale` variant exists for
-held frames, tests, and downstream `#40` consumers.
+If NVML is unavailable it emits `NvmlUnavailable` with missing safety samples
+(fail closed), not `SoftwareFallback`. `SoftwareFallback` is reserved for
+`--force-software-only`. `to_sensory_mapping_at(now)` re-evaluates freshness
+so a held frame older than the per-signal stale threshold is `Stale` and
+drops its normalized value. Mapping carries `stale_after_ms` and the actual
+`acquisition_cadence_ms` (`--step-interval-ms`). `SignalSpec.cadence_ms` is
+the documented default (100 ms). Future `observed_at > now` is `Invalid`.
 
 ## Signal inventory
 
@@ -76,6 +82,7 @@ future adapter can read it.
 - **Safety-critical** (`gpu_temp_c`, `power_w`): missing / invalid / stale fail
   closed (`SafetyStatus::Critical`). Software-fallback frames skip hardware
   thresholds because provenance says there is no real GPU to protect.
+  `NvmlUnavailable` does **not** skip: missing safety samples are Critical.
 - **Runtime-input candidates**: `gpu_temp_c`, `power_w`, `gpu_clock_mhz`,
   `mem_util_pct`. These are the only channels in `SensoryMapping`.
 - **Observability-only**: `vram_temp_c`, `vddcr_gfx_v`, `mem_clock_mhz`,
@@ -85,27 +92,33 @@ future adapter can read it.
 A legitimate zero (for example `mem_util_pct = 0.0` while `Valid`) is
 distinct from missing (`value = None`, `validity = Missing`).
 
-## Software fallback estimates
+## Software fallback vs NVML unavailable
 
-When NVML is unavailable or `--force-software-only` is set, acquisition
-emits the documented idle estimates in `telemetry::software_fallback` with
-`TelemetrySource::SoftwareFallback`. VRAM temperature stays `None`. These
-numbers are estimates, not a second set of magic flags.
+`--force-software-only` emits the documented idle estimates in
+`telemetry::software_fallback` with `TelemetrySource::SoftwareFallback`. VRAM
+temperature stays `None`. These numbers are estimates, not a second set of
+magic flags.
+
+When NVML/driver/device lookup fails *without* that flag, acquisition emits
+`TelemetrySource::NvmlUnavailable` with every channel `Missing`. Safety
+fail-closes. This is not software-only confirmation.
 
 ## corpus-ipc mapping surface (#41 owns types, #40 owns transport)
 
-`TelemetryFrame::to_sensory_mapping()` produces `SensoryMapping` /
-`MappedStimulus` with timestamp, source, validity, raw engineering value, and
-normalized `[0, 1]` (only when `Valid`). `#40` should map this into published
-`corpus-ipc` types rather than copying a second wire schema. This crate does
-not take a `corpus-ipc` dependency here.
+`TelemetryFrame::to_sensory_mapping_at(now)` produces `SensoryMapping` /
+`MappedStimulus` with timestamp, source, validity (re-evaluated at `now`),
+raw engineering value, normalized `[0, 1]` (only when `Valid` at `now`),
+`stale_after_ms`, and the actual `cadence_ms`. `#40` should map this into
+published `corpus-ipc` types rather than copying a second wire schema. This
+crate does not take a `corpus-ipc` dependency here.
 
 ## Fixtures
 
 `telemetry::fixtures` provides deterministic bags for tests:
 
 - `healthy_real` — NVML-like, including legitimate `mem_util_pct = 0.0`
-- `software_fallback` — explicit simulated idle
+- `software_fallback` — explicit simulated idle (`--force-software-only`)
+- `nvml_unavailable` — all channels missing, fail-closed safety path
 - `stale` — healthy values with `observed_at` 10 s in the past
 - `sensor_dropout` — `power_w = None` (not `0.0` / `NaN`)
 - `non_finite` — `power_w = NaN`

@@ -145,9 +145,10 @@ Structured logging via `tracing` with configurable output levels.
 - **Instance Protection**: Lockfile mechanism prevents multiple relay instances (lock acquired before port binding)
 - **GPU Safety Monitoring**: Main loop checks thermal (85°C) and power (350W) thresholds every ~1 second
 - **Emergency Brakes**: Automatically throttles GPU power limit to 50% via `nvidia-smi -pl` on critical threshold
-- **Graceful Degradation**: Continues in software-only mode without GPU.
-  Safety skips software-fallback frames via explicit
-  `TelemetrySource::SoftwareFallback`, not from magic numbers such as
+- **Graceful Degradation**: Continues in software-only mode when
+  `--force-software-only` is set (`TelemetrySource::SoftwareFallback`).
+  NVML/driver failure without that flag is `NvmlUnavailable` and fail-closes
+  safety. Simulation is never inferred from magic numbers such as
   `temperature <= 0 && power <= 25`
 
 ## Telemetry contract
@@ -165,7 +166,8 @@ Every GPU reading is a typed `TelemetrySample` with `value: Option<T>`,
 
 A legitimate zero (for example 0% memory utilization) is distinct from a
 missing sensor. Simulated idle estimates are tagged
-`TelemetrySource::SoftwareFallback`. Normalization to `[0, 1]` is
+`TelemetrySource::SoftwareFallback` (forced software-only only).
+NVML/driver failure is `NvmlUnavailable`. Normalization to `[0, 1]` is
 deterministic and is not applied to missing, invalid, or stale samples.
 
 ## License

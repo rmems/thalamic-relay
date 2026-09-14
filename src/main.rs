@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thalamic_relay::cpu::{self, RelayMetrics};
 use thalamic_relay::gpu::{HardwareBridge, SafetyStatus};
-use thalamic_relay::telemetry::{TelemetryFrame, TelemetrySource, unix_now_ms};
+use thalamic_relay::telemetry::{SampleValidity, TelemetryFrame, TelemetrySample, TelemetrySource};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
@@ -117,7 +117,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         step_count += 1;
-        let telemetry = HardwareBridge::read_telemetry_force(cli.force_software_only);
+        let telemetry =
+            HardwareBridge::read_telemetry_with(cli.force_software_only, cli.step_interval_ms);
 
         let mut ok_count_updated_this_iter = false;
         if brake_task.as_ref().is_some_and(|task| task.is_finished()) {
@@ -129,8 +130,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Re-check current telemetry so a stale brake doesn't linger unnoticed
                     // until the next periodic safety check.
                     let force_software_only = cli.force_software_only;
+                    let cadence_ms = cli.step_interval_ms;
                     let post_telemetry = tokio::task::spawn_blocking(move || {
-                        HardwareBridge::read_telemetry_force(force_software_only)
+                        HardwareBridge::read_telemetry_with(force_software_only, cadence_ms)
                     })
                     .await
                     .expect("post-brake telemetry read task panicked");
@@ -157,8 +159,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(Ok(())) => {
                     ok_count_after_brake = 0;
                     let force_software_only = cli.force_software_only;
+                    let cadence_ms = cli.step_interval_ms;
                     let post_telemetry = tokio::task::spawn_blocking(move || {
-                        HardwareBridge::read_telemetry_force(force_software_only)
+                        HardwareBridge::read_telemetry_with(force_software_only, cadence_ms)
                     })
                     .await
                     .expect("post-release telemetry read task panicked");
@@ -263,11 +266,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Update shared metrics. Freshness is sample age, not loop elapsed time.
+        // Store acquired_at; collector computes freshness at scrape/export time.
         {
             let mut metrics = relay_metrics.lock().unwrap();
-            metrics.telemetry_freshness_s =
-                unix_now_ms().saturating_sub(telemetry.acquired_at) as f64 / 1000.0;
+            metrics.telemetry_acquired_at = Some(telemetry.acquired_at);
         }
 
         print_dashboard(&telemetry, step_count);
@@ -277,20 +279,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn print_dashboard(frame: &TelemetryFrame, step: u64) {
-    let pwr = match frame.power_w.value {
-        Some(w) => format!("{w:5.1}W"),
-        None => "  n/a".to_string(),
-    };
-    let vcore = match frame.vddcr_gfx_v.value {
-        Some(v) => format!("{v:.3}V"),
-        None => "n/a".to_string(),
-    };
+    let pwr = format_live_reading(&frame.power_w, |w| format!("{w:5.1}W"));
+    let vddcr = format_live_reading(&frame.vddcr_gfx_v, |v| format!("{v:.3}V"));
     let tag = match frame.source {
         TelemetrySource::SoftwareFallback => " [sim]",
+        TelemetrySource::NvmlUnavailable => " [unavail]",
         TelemetrySource::Nvml => "",
     };
-    print!("\r[Step {step}] Pwr: {pwr} | Vcore: {vcore}{tag}   ");
+    print!("\r[Step {step}] Pwr: {pwr} | Vddcr: {vddcr}{tag}   ");
     let _ = io::stdout().flush();
+}
+
+/// Live hardware display: only [`SampleValidity::Valid`] + present values.
+fn format_live_reading(sample: &TelemetrySample<f32>, fmt_val: impl Fn(f32) -> String) -> String {
+    match (sample.validity, sample.value) {
+        (SampleValidity::Valid, Some(v)) => fmt_val(v),
+        (SampleValidity::Stale, _) => "stale".to_string(),
+        (SampleValidity::Invalid, _) => "inv".to_string(),
+        (SampleValidity::Missing, _) | (_, None) => "n/a".to_string(),
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -390,5 +397,34 @@ mod tests {
         assert_eq!(content.trim(), std::process::id().to_string());
         drop(guard);
         assert!(!std::path::Path::new(lock_path).exists());
+    }
+
+    #[test]
+    fn dashboard_shows_only_valid_present_as_live_hardware() {
+        use thalamic_relay::telemetry::{assess, fixtures};
+
+        let live = assess(&fixtures::healthy_real(), fixtures::NOW);
+        assert_eq!(
+            format_live_reading(&live.power_w, |w| format!("{w:.0}W")),
+            "200W"
+        );
+
+        let stale = assess(&fixtures::stale(), fixtures::NOW);
+        assert_eq!(
+            format_live_reading(&stale.power_w, |w| format!("{w:.0}W")),
+            "stale"
+        );
+
+        let invalid = assess(&fixtures::out_of_range(), fixtures::NOW);
+        assert_eq!(
+            format_live_reading(&invalid.gpu_temp_c, |t| format!("{t:.0}")),
+            "inv"
+        );
+
+        let missing = assess(&fixtures::sensor_dropout(), fixtures::NOW);
+        assert_eq!(
+            format_live_reading(&missing.power_w, |w| format!("{w:.0}W")),
+            "n/a"
+        );
     }
 }

@@ -41,10 +41,17 @@ cargo test lock_guard         # single-instance lockfile tests
 | lib.rs | `test_safety_critical_on_non_finite_telemetry` | NaN/Inf telemetry handling |
 | lib.rs | `test_safety_critical_on_unknown_power_with_real_temperature` | Missing power with real temp |
 | lib.rs | `test_warn_from_frame_fail_closes_on_missing_temp_or_power` | Missing/None does not skip warn logic |
+| lib.rs | `test_nvml_unavailable_fail_closes_safety` | Unavailable NVML is not simulated |
+| lib.rs | `test_acquire_raw_force_software_is_fallback_not_unavailable` | force vs unavailable provenance |
+| lib.rs | `future_observed_at_is_invalid_not_valid` | Future timestamps are Invalid |
+| lib.rs | `mapping_re_evaluates_stale_and_carries_thresholds` | Mapping-time freshness + stale_after |
+| lib.rs | `mapping_reports_configured_acquisition_cadence` | Actual vs default cadence |
+| lib.rs | `freshness_seconds_grows_when_export_time_advances` | Gauge age at scrape time |
 | lib.rs | `test_safety_ok_on_normal_telemetry` | Normal readings pass |
 | lib.rs | `test_safety_critical_on_stale_and_out_of_range` | Stale/OOR fail closed |
 | lib.rs | `test_sensory_mapping_from_software_fallback_carries_provenance` | Mapping carries fallback source |
-| lib.rs | `relay_metrics_default_values` | RelayMetrics defaults to 0 |
+| lib.rs | `relay_metrics_default_values` | RelayMetrics default acquired_at |
+| main.rs | `dashboard_shows_only_valid_present_as_live_hardware` | Dashboard hides stale/invalid/missing |
 | main.rs | `parses_custom_args_and_env_equiv` | CLI flag parsing |
 | main.rs | `parses_defaults` | CLI defaults |
 | main.rs | `parses_force_software_only_false` | `--force-software-only=false` |
@@ -68,7 +75,7 @@ with that code. See [`docs/ipc.md`](docs/ipc.md).
 
 - `cpu::init_telemetry` / `cpu::run_metrics_collector`: bind a network port and run an indefinite loop; not safely unit-testable without an integration harness.
 - `HardwareBridge::apply_emergency_brake` / `release_emergency_brake` / `power_limit_matches_emergency_brake`: require a real NVML-capable GPU and can mutate board power limits, so they are intentionally not exercised in software-only CI.
-- The `main` async supervisor loop and `print_dashboard`: covered by manual run instructions and end-to-end smoke tests rather than unit tests.
+- The `main` async supervisor loop: covered by manual run instructions and end-to-end smoke tests rather than unit tests. Dashboard reading formatting is unit-tested.
 
 ## Linting
 
