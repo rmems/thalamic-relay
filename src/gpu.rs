@@ -266,12 +266,17 @@ fn safety_value(
     }
 }
 
+/// Require both safety-critical samples to be valid and present.
+/// Missing, invalid, and stale fail closed — never a silent `None`.
+fn safety_readings(frame: &TelemetryFrame) -> Result<(f32, f32), SafetyStatus> {
+    Ok((
+        safety_value("gpu_temp_c", &frame.gpu_temp_c)?,
+        safety_value("power_w", &frame.power_w)?,
+    ))
+}
+
 fn critical_from_frame(frame: &TelemetryFrame) -> Option<SafetyStatus> {
-    let gpu_temp_c = match safety_value("gpu_temp_c", &frame.gpu_temp_c) {
-        Ok(v) => v,
-        Err(status) => return Some(status),
-    };
-    let power_w = match safety_value("power_w", &frame.power_w) {
+    let (gpu_temp_c, power_w) = match safety_readings(frame) {
         Ok(v) => v,
         Err(status) => return Some(status),
     };
@@ -290,9 +295,10 @@ fn critical_from_frame(frame: &TelemetryFrame) -> Option<SafetyStatus> {
 }
 
 fn warn_from_frame(frame: &TelemetryFrame) -> Option<SafetyStatus> {
-    // Validity was already checked in critical_from_frame; these are Valid.
-    let gpu_temp_c = frame.gpu_temp_c.value?;
-    let power_w = frame.power_w.value?;
+    let (gpu_temp_c, power_w) = match safety_readings(frame) {
+        Ok(v) => v,
+        Err(status) => return Some(status),
+    };
     if gpu_temp_c > 75.0 {
         return Some(SafetyStatus::Warn(format!(
             "GPU thermal: {gpu_temp_c:.0}°C approaching 85°C limit"
@@ -394,6 +400,49 @@ mod tests {
         assert!(!is_sim);
         assert_eq!(frame.power_w.validity, SampleValidity::Missing);
         assert_eq!(frame.power_w.value, None);
+    }
+
+    #[test]
+    fn test_warn_from_frame_fail_closes_on_missing_temp_or_power() {
+        // Direct call: `?` on Option would return None and skip warn logic.
+        // Missing safety-critical samples must fail closed as Critical, same as
+        // critical_from_frame / check_safety.
+        let mut raw = fixtures::healthy_real();
+        raw.gpu_temp_c = None;
+        let frame = assess(&raw, fixtures::NOW);
+        assert!(
+            matches!(warn_from_frame(&frame), Some(SafetyStatus::Critical(ref msg)) if msg.contains("gpu_temp_c"))
+        );
+        let (status, is_sim) = HardwareBridge::check_safety(&frame);
+        assert!(matches!(status, SafetyStatus::Critical(ref msg) if msg.contains("gpu_temp_c")));
+        assert!(!is_sim);
+
+        let mut raw = fixtures::healthy_real();
+        raw.power_w = None;
+        let frame = assess(&raw, fixtures::NOW);
+        assert!(
+            matches!(warn_from_frame(&frame), Some(SafetyStatus::Critical(ref msg)) if msg.contains("power_w"))
+        );
+
+        // Warn-band temperature with missing power must not become Warn or Ok.
+        let mut frame = nvml_temp_power(78.0, 200.0);
+        frame.power_w.value = None;
+        frame.power_w.validity = SampleValidity::Missing;
+        assert!(
+            matches!(warn_from_frame(&frame), Some(SafetyStatus::Critical(ref msg)) if msg.contains("power_w"))
+        );
+        let (status, is_sim) = HardwareBridge::check_safety(&frame);
+        assert!(matches!(status, SafetyStatus::Critical(_)));
+        assert!(!matches!(status, SafetyStatus::Warn(_)));
+        assert!(!is_sim);
+
+        // Valid stamp with None value (invariant break) must not skip via `value?`.
+        let mut frame = nvml_temp_power(78.0, 200.0);
+        frame.gpu_temp_c.value = None;
+        assert_eq!(frame.gpu_temp_c.validity, SampleValidity::Valid);
+        assert!(
+            matches!(warn_from_frame(&frame), Some(SafetyStatus::Critical(ref msg)) if msg.contains("gpu_temp_c"))
+        );
     }
 
     #[test]

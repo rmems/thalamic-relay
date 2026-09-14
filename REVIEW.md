@@ -40,6 +40,7 @@ cargo test lock_guard         # single-instance lockfile tests
 | lib.rs | `test_safety_critical_on_high_power` | >350W critical threshold |
 | lib.rs | `test_safety_critical_on_non_finite_telemetry` | NaN/Inf telemetry handling |
 | lib.rs | `test_safety_critical_on_unknown_power_with_real_temperature` | Missing power with real temp |
+| lib.rs | `test_warn_from_frame_fail_closes_on_missing_temp_or_power` | Missing/None does not skip warn logic |
 | lib.rs | `test_safety_ok_on_normal_telemetry` | Normal readings pass |
 | lib.rs | `test_safety_critical_on_stale_and_out_of_range` | Stale/OOR fail closed |
 | lib.rs | `test_sensory_mapping_from_software_fallback_carries_provenance` | Mapping carries fallback source |
