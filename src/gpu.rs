@@ -44,10 +44,8 @@ impl HardwareBridge {
 
     /// Raw acquisition only — no validation, no silent zeros for missing sensors.
     pub fn acquire_raw(force_software: bool) -> RawTelemetry {
-        if !force_software {
-            if let Some(raw) = Self::read_nvml() {
-                return raw;
-            }
+        if !force_software && let Some(raw) = Self::read_nvml() {
+            return raw;
         }
         RawTelemetry::software_fallback(unix_now_ms())
     }
