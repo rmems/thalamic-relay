@@ -40,7 +40,8 @@ when no GPU is present, and hardware safety keeps functioning even when
 ## Features
 
 - **GPU Telemetry**: Real-time monitoring of GPU sensors via NVML (temperature,
-  power, clocks, fan, utilization) with a software fallback
+  power, clocks, fan, utilization) with an explicit software-fallback
+  provenance tag — missing sensors stay absent (`None`), never a silent `0.0`
 - **Deterministic Hardware Safety**: Thermal/power threshold checks with
   emergency brake and hysteresis-gated release, independent of any
   downstream neural runtime
@@ -79,14 +80,15 @@ While running it exposes (address configurable via CLI/env; see Configuration):
 
 It currently has no control/query IPC surface — the prior UDP protocol was
 removed along with the in-process SNN it existed to drive; see
-[`docs/ipc.md`](docs/ipc.md) for details and the planned `corpus-ipc`-based
-replacement (follow-up work).
+[`docs/ipc.md`](docs/ipc.md) for the retired UDP surface, the GH#41 mapping
+types, and the planned `corpus-ipc` transport (GH#40).
 
 ## Architecture
 
 ### Core Modules
 
-- **`gpu`**: Hardware bridge for GPU telemetry collection
+- **`telemetry`**: Typed sample contract (validity, freshness, provenance, normalization) and the corpus-ipc mapping surface
+- **`gpu`**: Raw NVML acquisition and safety evaluation against the typed frame
 - **`cpu`**: Telemetry initialization and metrics collection
 
 ### Key Components
@@ -100,7 +102,7 @@ replacement (follow-up work).
 ### Core Dependencies
 
 - `tokio`: Async runtime with full features
-- `serde`: Serialization framework (used by GPU telemetry types)
+- `serde`: Serialization framework (used by the typed telemetry contract)
 - `tracing` / `tracing-subscriber`: Structured logging and telemetry
 - `metrics` / `metrics-exporter-prometheus`: Metrics collection with Prometheus export
 
@@ -143,7 +145,28 @@ Structured logging via `tracing` with configurable output levels.
 - **Instance Protection**: Lockfile mechanism prevents multiple relay instances (lock acquired before port binding)
 - **GPU Safety Monitoring**: Main loop checks thermal (85°C) and power (350W) thresholds every ~1 second
 - **Emergency Brakes**: Automatically throttles GPU power limit to 50% via `nvidia-smi -pl` on critical threshold
-- **Graceful Degradation**: Continues in software-only mode without GPU; safety checks skip simulated values
+- **Graceful Degradation**: Continues in software-only mode without GPU.
+  Safety skips software-fallback frames via explicit
+  `TelemetrySource::SoftwareFallback`, not from magic numbers such as
+  `temperature <= 0 && power <= 25`
+
+## Telemetry contract
+
+Every GPU reading is a typed `TelemetrySample` with `value: Option<T>`,
+`observed_at`, `source`, `validity`, and `unit`. See
+[`docs/telemetry.md`](docs/telemetry.md) for the full inventory.
+
+| Signal | Class | Notes |
+| --- | --- | --- |
+| `gpu_temp_c`, `power_w` | safety + runtime-input | Missing/invalid/stale fail closed |
+| `gpu_clock_mhz`, `mem_util_pct` | runtime-input | Sensory mapping toward `#40` |
+| `vram_temp_c`, `mem_clock_mhz`, `fan_speed_pct` | observability-only | Raw preserved; not model input |
+| `vddcr_gfx_v` | observability-only (derived) | Estimated from power; not an NVML voltage sensor |
+
+A legitimate zero (for example 0% memory utilization) is distinct from a
+missing sensor. Simulated idle estimates are tagged
+`TelemetrySource::SoftwareFallback`. Normalization to `[0, 1]` is
+deterministic and is not applied to missing, invalid, or stale samples.
 
 ## License
 

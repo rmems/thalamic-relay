@@ -13,9 +13,12 @@ downstream neural runtime (`brainstem-daemon`) is present. It currently
 exposes no control/query IPC surface — only Prometheus metrics on
 `:9000/metrics`.
 
-A typed, normalized stimulus-egress contract (Thalamic → `corpus-ipc` →
-`brainstem-daemon`) is planned as separate follow-up work — see GH#40
-(`RM-1144`, emitting typed `corpus-ipc` stimuli) and GH#41 (`RM-1145`,
-defining the normalized stimulus contract with validity/staleness/
-provenance). This file will be replaced with that contract's normative
-reference once it lands.
+The typed validity / freshness / provenance / normalization contract
+(GH#41) now lives in [`docs/telemetry.md`](telemetry.md) and
+`thalamic_relay::telemetry`. `TelemetryFrame::to_sensory_mapping()` is the
+deterministic mapping surface toward `corpus-ipc`; it is **not** a second
+wire schema and does not implement transport.
+
+Transport (Thalamic → `corpus-ipc` → `brainstem-daemon`) remains follow-up
+work — see GH#40 (`RM-1144`). This file will be replaced with that contract's
+normative wire reference once it lands.

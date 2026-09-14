@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Breaking (internal):** Replaced numeric `GpuTelemetry` fields with a typed `TelemetrySample` contract (`Option` values, explicit source/validity/unit/freshness). Software-only mode is tagged `TelemetrySource::SoftwareFallback` and is no longer inferred from `temperature <= 0 && power <= 25`. Missing sensors stay `None` instead of silent `0.0`/`NaN`. See `docs/telemetry.md` (GH#41)
+- Added `TelemetryFrame::to_sensory_mapping()` as the deterministic mapping surface toward corpus-ipc (transport remains GH#40)
 - **Breaking:** Removed in-process SNN execution (`neuromod::SpikingNetwork`, `NeuroModulators`) and the UDP control surface it existed to drive (`Stimuli` / `LearningReward` / `GetNeuroState`, and the `--udp-addr`/`--num-channels`/`--num-lif`/`--num-izh` flags). Thalamic is now a sensory + deterministic hardware-safety relay only; neural execution lives in `brainstem-daemon`. `docs/ipc.md` now documents the removal and points to the planned `corpus-ipc`-based replacement (RM-1143 / GH#39)
 - Removed the `neuromod` and `serde_json` dependencies (no longer used)
 - Bumped MSRV from `1.97.1` to `1.98.1`

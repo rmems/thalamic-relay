@@ -1,63 +1,18 @@
 //! Hardware Bridge — GPU Telemetry & Voltage Rail Monitoring
 //!
-//! Reads real sensor data from the GPU via sysfs (Linux) or
-//! provides simulated values for development.
-//!
-//! CIRCUIT ANALOGY:
-//! - `GpuTelemetry` = The readings from an oscilloscope probed
-//!   onto the board's power delivery network.
-//! - Each rail is like a scope channel: 12V main, 1.8V I/O, VDDCR_GFX.
-//!
-//! ```text
-//!   ┌──────────────────────────────────────────────────┐
-//!   │  GPU Power Delivery Network                      │
-//!   │                                                  │
-//!   │  12V_IN ──[VRM]──> VDDCR_GFX (GPU Core)         │
-//!   │                 └──> MEM_VDD  (VRAM)             │
-//!   │  1.8V_IO ────────> I/O Ring                      │
-//!   └──────────────────────────────────────────────────┘
-//! ```
+//! Raw NVML acquisition lives here. Validation, normalization, freshness, and
+//! provenance live in [`crate::telemetry`]. Safety policy consumes the typed
+//! frame and never infers simulation from magic numeric values.
 
+use crate::telemetry::{
+    RawTelemetry, SampleValidity, TelemetryFrame, TelemetrySource, assess, unix_now_ms,
+};
 use lazy_static::lazy_static;
 use nvml_wrapper::Nvml;
 use nvml_wrapper::enum_wrappers::device::{Clock, TemperatureSensor};
-use serde::{Deserialize, Serialize};
 
 lazy_static! {
     static ref NVML: Option<Nvml> = Nvml::init().ok();
-}
-
-// ── GPU Telemetry Struct ────────────────────────────────────────────
-
-/// Real-time voltage and thermal readings from the GPU.
-///
-/// This is the "probe data" that feeds into the neuromorphic core
-/// and correlates with your EE 2320 Digital Logic coursework.
-///
-/// In a real deployment, these values come from:
-/// - `/sys/class/hwmon/hwmon*/temp*_input` (temps)
-/// - `/sys/class/drm/card*/device/power1_average` (power)
-/// - `nvidia-smi --query-gpu=...` (NVIDIA GPUs)
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct GpuTelemetry {
-    /// GPU core voltage in Volts, read from `nvidia-smi voltage.graphics` (mV → V).
-    /// This is the real VDDCR_GFX sensor, not a model. Expect ~0.7V idle, ~1.05V load.
-    pub vddcr_gfx_v: f32,
-    pub vram_temp_c: f32,
-    pub gpu_temp_c: f32,
-    pub power_w: f32,
-    pub gpu_clock_mhz: f32,
-    pub mem_clock_mhz: f32,
-    pub fan_speed_pct: f32,
-    pub mem_util_pct: f32,
-}
-
-impl GpuTelemetry {
-    /// Convert telemetry struct to the Vec<(String, f32)> format
-    /// expected by the neuromorphic inference engine.
-    pub fn to_rails(&self) -> Vec<(String, f32)> {
-        vec![("VDDCR_GFX".to_string(), self.vddcr_gfx_v)]
-    }
 }
 
 // ── Safety Status ───────────────────────────────────────────────────
@@ -74,38 +29,27 @@ pub enum SafetyStatus {
 pub struct HardwareBridge;
 
 impl HardwareBridge {
-    /// Reads real telemetry from the GPU via sysfs.
-    ///
-    /// Falls back to simulated values if sysfs paths aren't available
-    /// (e.g., running without NVIDIA drivers or on a dev machine).
-    pub fn read_telemetry() -> GpuTelemetry {
+    /// Acquire raw telemetry, then validate/normalize into a [`TelemetryFrame`].
+    pub fn read_telemetry() -> TelemetryFrame {
         Self::read_telemetry_force(false)
     }
 
     /// Read telemetry, but if `force_software` is true, always use the simulated
     /// fallback (never attempt real NVML/nvidia-smi). This implements the
-    /// --force-software-only CLI flag for #11.
-    pub fn read_telemetry_force(force_software: bool) -> GpuTelemetry {
+    /// `--force-software-only` CLI flag for #11.
+    pub fn read_telemetry_force(force_software: bool) -> TelemetryFrame {
+        let raw = Self::acquire_raw(force_software);
+        assess(&raw, unix_now_ms())
+    }
+
+    /// Raw acquisition only — no validation, no silent zeros for missing sensors.
+    pub fn acquire_raw(force_software: bool) -> RawTelemetry {
         if !force_software {
-            // Try reading real data from nvidia-smi first (unless forced software-only)
-            if let Some(telem) = Self::read_nvidia_smi() {
-                return telem;
+            if let Some(raw) = Self::read_nvml() {
+                return raw;
             }
         }
-
-        // Fallback / forced-sim: simulated "healthy idle" values
-        // These use the same correlation model as the real sensors
-        let power_w = 25.0;
-        GpuTelemetry {
-            vddcr_gfx_v: 0.7, // Idle estimate (real value comes from nvidia-smi)
-            vram_temp_c: 0.0,
-            gpu_temp_c: 0.0,
-            power_w,
-            gpu_clock_mhz: 210.0, // Idle clock
-            mem_clock_mhz: 405.0, // Idle clock
-            fan_speed_pct: 30.0,  // Idle fan
-            mem_util_pct: 0.0,
-        }
+        RawTelemetry::software_fallback(unix_now_ms())
     }
 
     /// Returns true if the NVIDIA driver is responsive and the GPU is healthy.
@@ -121,7 +65,7 @@ impl HardwareBridge {
         }
     }
 
-    fn read_nvidia_smi() -> Option<GpuTelemetry> {
+    fn read_nvml() -> Option<RawTelemetry> {
         use std::sync::atomic::{AtomicBool, Ordering};
         // Only log on the healthy -> unhealthy transition; the telemetry loop
         // calls this ~10x/sec, so an unconditional print would flood stdout
@@ -138,127 +82,54 @@ impl HardwareBridge {
 
         let nvml = NVML.as_ref()?;
         let device = nvml.device_by_index(0).ok()?;
+        let observed_at = unix_now_ms();
 
-        let gpu_temp = device.temperature(TemperatureSensor::Gpu).ok()? as f32;
-        // Some cards don't support memory temp via NVML (VRAM temp)
-        let vram_temp = device
+        let gpu_temp_c = device
             .temperature(TemperatureSensor::Gpu)
             .ok()
-            .map(|t| t as f32 + 8.0)
-            .unwrap_or(gpu_temp + 8.0);
+            .map(|t| t as f32);
+        let power_w = device.power_usage().ok().map(|mw| mw as f32 / 1000.0);
+        let gpu_clock_mhz = device.clock_info(Clock::Graphics).ok().map(|c| c as f32);
+        let mem_clock_mhz = device.clock_info(Clock::Memory).ok().map(|c| c as f32);
+        let fan_speed_pct = device.fan_speed(0).ok().map(|s| s as f32);
+        let mem_util_pct = device.utilization_rates().ok().map(|u| u.memory as f32);
+        let vddcr_gfx_v = power_w.map(derive_vddcr_gfx_v);
 
-        // Fail closed: do not fabricate a safe-looking power reading for safety decisions.
-        // Preserve any real temperature reading and mark power as invalid so check_safety()
-        // reports Critical instead of falling back to simulated Ok.
-        let Some(power_mw) = device.power_usage().ok() else {
-            return Some(GpuTelemetry {
-                gpu_temp_c: gpu_temp,
-                power_w: f32::NAN,
-                vram_temp_c: vram_temp,
-                ..Default::default()
-            });
-        };
-        let power = power_mw as f32 / 1000.0;
-
-        let gpu_clock = device
-            .clock_info(Clock::Graphics)
-            .ok()
-            .map(|c| c as f32)
-            .unwrap_or(210.0);
-        let mem_clock = device
-            .clock_info(Clock::Memory)
-            .ok()
-            .map(|c| c as f32)
-            .unwrap_or(405.0);
-        let fan_speed = device.fan_speed(0).ok().map(|s| s as f32).unwrap_or(30.0);
-        let mem_util = device
-            .utilization_rates()
-            .ok()
-            .map(|u| u.memory as f32)
-            .unwrap_or(0.0);
-
-        // NVML does not expose voltage.graphics on all architectures.
-        // Derive Vcore from real-time power using a generic linear model:
-        //   Vcore ≈ V_idle + (P - P_idle) / (P_tdp - P_idle) * (V_tdp - V_idle)
-        // Clamp to [V_idle, V_tdp] for safety.
-        // The actual idle/load values vary by GPU; these are typical for NVIDIA discrete GPUs.
-        let vddcr_v = {
-            let p_idle = 50.0_f32; // typical idle board power
-            let p_tdp = 300.0_f32; // generic high-end GPU TDP reference
-            let v_idle = 0.70_f32;
-            let v_tdp = 1.05_f32;
-            let t = ((power - p_idle) / (p_tdp - p_idle)).clamp(0.0, 1.0);
-            v_idle + t * (v_tdp - v_idle)
-        };
-
-        Some(GpuTelemetry {
-            vddcr_gfx_v: vddcr_v,
-            vram_temp_c: vram_temp,
-            gpu_temp_c: gpu_temp,
-            power_w: power,
-            gpu_clock_mhz: gpu_clock,
-            mem_clock_mhz: mem_clock,
-            fan_speed_pct: fan_speed,
-            mem_util_pct: mem_util,
+        Some(RawTelemetry {
+            observed_at,
+            source: TelemetrySource::Nvml,
+            gpu_temp_c,
+            // nvml-wrapper 0.10 only exposes TemperatureSensor::Gpu. Do not
+            // fabricate VRAM temp as gpu+8 — leave it missing.
+            vram_temp_c: None,
+            power_w,
+            vddcr_gfx_v,
+            gpu_clock_mhz,
+            mem_clock_mhz,
+            fan_speed_pct,
+            mem_util_pct,
         })
     }
 
-    /// Check GPU safety thresholds against telemetry readings.
-    /// Skips checks when no real GPU telemetry is available (simulated idle values).
-    /// Returns a (SafetyStatus, bool) where the bool indicates whether telemetry is simulated.
-    pub fn check_safety(telemetry: &GpuTelemetry) -> (SafetyStatus, bool) {
-        if let Some(status) = Self::critical_from_telemetry(telemetry) {
-            return (status, false);
-        }
-        // Simulated idle: temp=0, power<=25W — no real GPU present.
-        // Known limitation: a real GPU reporting exactly 0°C with ≤25W idle would be
-        // misclassified as simulated; NVIDIA cards normally report ambient+ temps.
-        let is_simulated = telemetry.gpu_temp_c <= 0.0 && telemetry.power_w <= 25.0;
-        if is_simulated {
+    /// Check GPU safety thresholds against a validated frame.
+    ///
+    /// Simulation is [`TelemetrySource::SoftwareFallback`], never inferred from
+    /// values such as `temperature <= 0 && power <= 25`. Missing, invalid, or
+    /// stale safety-critical signals fail closed.
+    ///
+    /// Returns `(SafetyStatus, is_simulated)`.
+    pub fn check_safety(frame: &TelemetryFrame) -> (SafetyStatus, bool) {
+        if frame.source == TelemetrySource::SoftwareFallback {
             return (SafetyStatus::Ok, true);
         }
-        if let Some(status) = Self::warn_from_telemetry(telemetry) {
+
+        if let Some(status) = critical_from_frame(frame) {
+            return (status, false);
+        }
+        if let Some(status) = warn_from_frame(frame) {
             return (status, false);
         }
         (SafetyStatus::Ok, false)
-    }
-
-    fn critical_from_telemetry(telemetry: &GpuTelemetry) -> Option<SafetyStatus> {
-        // Non-finite sensor values must not slip through as Ok (NaN comparisons are always false).
-        if !telemetry.gpu_temp_c.is_finite() || !telemetry.power_w.is_finite() {
-            return Some(SafetyStatus::Critical(
-                "Invalid telemetry: non-finite values".into(),
-            ));
-        }
-        if telemetry.gpu_temp_c > 85.0 {
-            return Some(SafetyStatus::Critical(format!(
-                "GPU thermal: {:.0}°C exceeds 85°C",
-                telemetry.gpu_temp_c
-            )));
-        }
-        if telemetry.power_w > 350.0 {
-            return Some(SafetyStatus::Critical(format!(
-                "GPU power: {:.0}W exceeds 350W safety limit",
-                telemetry.power_w
-            )));
-        }
-        None
-    }
-
-    fn warn_from_telemetry(telemetry: &GpuTelemetry) -> Option<SafetyStatus> {
-        if telemetry.gpu_temp_c > 75.0 {
-            return Some(SafetyStatus::Warn(format!(
-                "GPU thermal: {:.0}°C approaching 85°C limit",
-                telemetry.gpu_temp_c
-            )));
-        }
-        if telemetry.power_w > 300.0 {
-            return Some(SafetyStatus::Warn(format!(
-                "GPU power: {:.0}W approaching safety limit",
-                telemetry.power_w
-            )));
-        }
-        None
     }
 
     /// CLOSED LOOP CONTROL: The Emergency Brake.
@@ -366,149 +237,258 @@ impl HardwareBridge {
     }
 }
 
+/// Derive an observability-only Vcore estimate from board power.
+/// This is not an NVML voltage sensor; [`crate::telemetry::SignalOrigin::Derived`].
+fn derive_vddcr_gfx_v(power_w: f32) -> f32 {
+    let p_idle = 50.0_f32;
+    let p_tdp = 300.0_f32;
+    let v_idle = 0.70_f32;
+    let v_tdp = 1.05_f32;
+    let t = ((power_w - p_idle) / (p_tdp - p_idle)).clamp(0.0, 1.0);
+    v_idle + t * (v_tdp - v_idle)
+}
+
+fn safety_value(
+    name: &str,
+    sample: &crate::telemetry::TelemetrySample<f32>,
+) -> Result<f32, SafetyStatus> {
+    match sample.validity {
+        SampleValidity::Missing => Err(SafetyStatus::Critical(format!(
+            "Invalid telemetry: {name} missing"
+        ))),
+        SampleValidity::Invalid => Err(SafetyStatus::Critical(format!(
+            "Invalid telemetry: {name} invalid"
+        ))),
+        SampleValidity::Stale => Err(SafetyStatus::Critical(format!(
+            "Invalid telemetry: {name} stale"
+        ))),
+        SampleValidity::Valid => sample
+            .value
+            .ok_or_else(|| SafetyStatus::Critical(format!("Invalid telemetry: {name} missing"))),
+    }
+}
+
+fn critical_from_frame(frame: &TelemetryFrame) -> Option<SafetyStatus> {
+    let gpu_temp_c = match safety_value("gpu_temp_c", &frame.gpu_temp_c) {
+        Ok(v) => v,
+        Err(status) => return Some(status),
+    };
+    let power_w = match safety_value("power_w", &frame.power_w) {
+        Ok(v) => v,
+        Err(status) => return Some(status),
+    };
+
+    if gpu_temp_c > 85.0 {
+        return Some(SafetyStatus::Critical(format!(
+            "GPU thermal: {gpu_temp_c:.0}°C exceeds 85°C"
+        )));
+    }
+    if power_w > 350.0 {
+        return Some(SafetyStatus::Critical(format!(
+            "GPU power: {power_w:.0}W exceeds 350W safety limit"
+        )));
+    }
+    None
+}
+
+fn warn_from_frame(frame: &TelemetryFrame) -> Option<SafetyStatus> {
+    // Validity was already checked in critical_from_frame; these are Valid.
+    let gpu_temp_c = frame.gpu_temp_c.value?;
+    let power_w = frame.power_w.value?;
+    if gpu_temp_c > 75.0 {
+        return Some(SafetyStatus::Warn(format!(
+            "GPU thermal: {gpu_temp_c:.0}°C approaching 85°C limit"
+        )));
+    }
+    if power_w > 300.0 {
+        return Some(SafetyStatus::Warn(format!(
+            "GPU power: {power_w:.0}W approaching safety limit"
+        )));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::telemetry::{SampleValidity, TelemetrySource, assess, fixtures, software_fallback};
+
+    fn nvml_temp_power(temp_c: f32, power_w: f32) -> TelemetryFrame {
+        let mut raw = fixtures::healthy_real();
+        raw.gpu_temp_c = Some(temp_c);
+        raw.power_w = Some(power_w);
+        assess(&raw, fixtures::NOW)
+    }
 
     #[test]
-    fn test_telemetry_struct() {
-        let telem = GpuTelemetry::default();
-        assert_eq!(telem.power_w, 0.0);
+    fn test_raw_software_fallback_never_uses_silent_zero_for_missing_vram() {
+        let raw = RawTelemetry::software_fallback(fixtures::NOW);
+        assert_eq!(raw.source, TelemetrySource::SoftwareFallback);
+        assert_eq!(raw.vram_temp_c, None);
+        assert_eq!(raw.mem_util_pct, Some(0.0));
+        assert_eq!(raw.gpu_temp_c, Some(software_fallback::GPU_TEMP_C));
     }
 
     #[test]
     fn test_safety_ok_on_simulated_values() {
-        let telem = GpuTelemetry {
-            gpu_temp_c: 0.0,
-            power_w: 25.0,
-            ..Default::default()
-        };
-        let (status, is_sim) = HardwareBridge::check_safety(&telem);
+        let frame = assess(&fixtures::software_fallback(), fixtures::NOW);
+        let (status, is_sim) = HardwareBridge::check_safety(&frame);
         assert_eq!(status, SafetyStatus::Ok);
         assert!(is_sim);
     }
 
     #[test]
+    fn test_safety_does_not_infer_simulation_from_old_magic_values() {
+        let frame = assess(&fixtures::nvml_looks_like_old_magic(), fixtures::NOW);
+        let (status, is_sim) = HardwareBridge::check_safety(&frame);
+        assert_eq!(status, SafetyStatus::Ok);
+        assert!(!is_sim);
+        assert_eq!(frame.source, TelemetrySource::Nvml);
+        assert_eq!(frame.gpu_temp_c.value, Some(0.0));
+        assert_eq!(frame.power_w.value, Some(25.0));
+    }
+
+    #[test]
     fn test_safety_warn_on_elevated_temp() {
-        let telem = GpuTelemetry {
-            gpu_temp_c: 78.0,
-            power_w: 200.0,
-            ..Default::default()
-        };
-        let (status, is_sim) = HardwareBridge::check_safety(&telem);
+        let frame = nvml_temp_power(78.0, 200.0);
+        let (status, is_sim) = HardwareBridge::check_safety(&frame);
         assert!(matches!(status, SafetyStatus::Warn(_)));
         assert!(!is_sim);
     }
 
     #[test]
     fn test_safety_warn_on_elevated_power() {
-        let telem = GpuTelemetry {
-            gpu_temp_c: 70.0,
-            power_w: 320.0,
-            ..Default::default()
-        };
-        let (status, is_sim) = HardwareBridge::check_safety(&telem);
+        let frame = nvml_temp_power(70.0, 320.0);
+        let (status, is_sim) = HardwareBridge::check_safety(&frame);
         assert!(matches!(status, SafetyStatus::Warn(_)));
         assert!(!is_sim);
     }
 
     #[test]
     fn test_safety_critical_on_high_temp() {
-        let telem = GpuTelemetry {
-            gpu_temp_c: 90.0,
-            power_w: 200.0,
-            ..Default::default()
-        };
-        let (status, is_sim) = HardwareBridge::check_safety(&telem);
+        let frame = nvml_temp_power(90.0, 200.0);
+        let (status, is_sim) = HardwareBridge::check_safety(&frame);
         assert!(matches!(status, SafetyStatus::Critical(_)));
         assert!(!is_sim);
     }
 
     #[test]
     fn test_safety_critical_on_high_power() {
-        let telem = GpuTelemetry {
-            gpu_temp_c: 70.0,
-            power_w: 360.0,
-            ..Default::default()
-        };
-        let (status, is_sim) = HardwareBridge::check_safety(&telem);
+        let frame = nvml_temp_power(70.0, 360.0);
+        let (status, is_sim) = HardwareBridge::check_safety(&frame);
         assert!(matches!(status, SafetyStatus::Critical(_)));
         assert!(!is_sim);
     }
 
     #[test]
     fn test_safety_ok_on_normal_telemetry() {
-        let telem = GpuTelemetry {
-            gpu_temp_c: 65.0,
-            power_w: 200.0,
-            ..Default::default()
-        };
-        let (status, is_sim) = HardwareBridge::check_safety(&telem);
+        let frame = nvml_temp_power(65.0, 200.0);
+        let (status, is_sim) = HardwareBridge::check_safety(&frame);
         assert_eq!(status, SafetyStatus::Ok);
         assert!(!is_sim);
     }
 
     #[test]
     fn test_safety_critical_on_unknown_power_with_real_temperature() {
-        let telem = GpuTelemetry {
-            gpu_temp_c: 35.0,
-            power_w: f32::NAN,
-            ..Default::default()
-        };
-        let (status, is_sim) = HardwareBridge::check_safety(&telem);
-        assert!(matches!(status, SafetyStatus::Critical(_)));
+        let frame = assess(&fixtures::sensor_dropout(), fixtures::NOW);
+        let (status, is_sim) = HardwareBridge::check_safety(&frame);
+        assert!(matches!(status, SafetyStatus::Critical(ref msg) if msg.contains("power_w")));
         assert!(!is_sim);
+        assert_eq!(frame.power_w.validity, SampleValidity::Missing);
+        assert_eq!(frame.power_w.value, None);
     }
 
     #[test]
     fn test_safety_critical_on_non_finite_telemetry() {
-        let telem = GpuTelemetry {
-            gpu_temp_c: f32::NAN,
-            power_w: 200.0,
-            ..Default::default()
-        };
-        let (status, is_sim) = HardwareBridge::check_safety(&telem);
+        let frame = assess(&fixtures::non_finite(), fixtures::NOW);
+        let (status, is_sim) = HardwareBridge::check_safety(&frame);
         assert!(matches!(status, SafetyStatus::Critical(_)));
         assert!(!is_sim);
 
-        let telem_inf = GpuTelemetry {
-            gpu_temp_c: 70.0,
-            power_w: f32::INFINITY,
-            ..Default::default()
-        };
-        let (status, is_sim) = HardwareBridge::check_safety(&telem_inf);
+        let mut raw = fixtures::healthy_real();
+        raw.gpu_temp_c = Some(f32::NAN);
+        let frame = assess(&raw, fixtures::NOW);
+        let (status, is_sim) = HardwareBridge::check_safety(&frame);
+        assert!(matches!(status, SafetyStatus::Critical(_)));
+        assert!(!is_sim);
+
+        let mut raw = fixtures::healthy_real();
+        raw.power_w = Some(f32::INFINITY);
+        let frame = assess(&raw, fixtures::NOW);
+        let (status, is_sim) = HardwareBridge::check_safety(&frame);
         assert!(matches!(status, SafetyStatus::Critical(_)));
         assert!(!is_sim);
     }
 
     #[test]
-    fn test_telemetry_to_rails() {
-        let telem = GpuTelemetry {
-            vddcr_gfx_v: 0.85,
-            ..Default::default()
-        };
-        let rails = telem.to_rails();
-        assert_eq!(rails.len(), 1);
-        assert_eq!(rails[0].0, "VDDCR_GFX");
-        assert_eq!(rails[0].1, 0.85);
+    fn test_safety_critical_on_stale_and_out_of_range() {
+        let stale = assess(&fixtures::stale(), fixtures::NOW);
+        let (status, is_sim) = HardwareBridge::check_safety(&stale);
+        assert!(matches!(status, SafetyStatus::Critical(ref msg) if msg.contains("stale")));
+        assert!(!is_sim);
+
+        let oor = assess(&fixtures::out_of_range(), fixtures::NOW);
+        let (status, is_sim) = HardwareBridge::check_safety(&oor);
+        assert!(matches!(status, SafetyStatus::Critical(ref msg) if msg.contains("invalid")));
+        assert!(!is_sim);
     }
 
     #[test]
     fn test_read_telemetry_force_software_only() {
-        let telem = HardwareBridge::read_telemetry_force(true);
-        assert!(telem.power_w.is_finite());
-        assert_eq!(telem.power_w, 25.0);
-        assert_eq!(telem.vddcr_gfx_v, 0.7);
-        assert_eq!(telem.gpu_clock_mhz, 210.0);
-        assert_eq!(telem.mem_clock_mhz, 405.0);
-        assert_eq!(telem.fan_speed_pct, 30.0);
-        assert_eq!(telem.mem_util_pct, 0.0);
-        assert_eq!(telem.gpu_temp_c, 0.0);
+        let frame = HardwareBridge::read_telemetry_force(true);
+        assert_eq!(frame.source, TelemetrySource::SoftwareFallback);
+        assert_eq!(frame.power_w.value, Some(software_fallback::POWER_W));
+        assert_eq!(frame.gpu_temp_c.value, Some(software_fallback::GPU_TEMP_C));
+        assert_eq!(
+            frame.gpu_clock_mhz.value,
+            Some(software_fallback::GPU_CLOCK_MHZ)
+        );
+        assert_eq!(
+            frame.mem_clock_mhz.value,
+            Some(software_fallback::MEM_CLOCK_MHZ)
+        );
+        assert_eq!(
+            frame.fan_speed_pct.value,
+            Some(software_fallback::FAN_SPEED_PCT)
+        );
+        assert_eq!(
+            frame.mem_util_pct.value,
+            Some(software_fallback::MEM_UTIL_PCT)
+        );
+        assert_eq!(frame.vram_temp_c.value, None);
+        assert_eq!(frame.vram_temp_c.validity, SampleValidity::Missing);
+        let (status, is_sim) = HardwareBridge::check_safety(&frame);
+        assert_eq!(status, SafetyStatus::Ok);
+        assert!(is_sim);
     }
 
     #[test]
     fn test_is_gpu_healthy_does_not_panic() {
         let result = std::panic::catch_unwind(HardwareBridge::is_gpu_healthy);
         assert!(result.is_ok(), "is_gpu_healthy should not panic");
+    }
+
+    #[test]
+    fn test_sensory_mapping_from_software_fallback_carries_provenance() {
+        let frame = HardwareBridge::read_telemetry_force(true);
+        let mapping = frame.to_sensory_mapping();
+        assert_eq!(
+            mapping.acquisition_source,
+            TelemetrySource::SoftwareFallback
+        );
+        assert!(
+            mapping
+                .stimuli
+                .iter()
+                .all(|s| s.source == TelemetrySource::SoftwareFallback)
+        );
+        let util = mapping
+            .stimuli
+            .iter()
+            .find(|s| s.name == "mem_util_pct")
+            .unwrap();
+        assert_eq!(util.raw, Some(0.0));
+        assert_eq!(util.normalized, Some(0.0));
+        assert_eq!(util.validity, SampleValidity::Valid);
     }
 }

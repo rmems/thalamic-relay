@@ -3,10 +3,11 @@
 ## Running Tests
 
 ```bash
-cargo test                    # all tests (19 total)
-cargo test --lib              # src/lib.rs tests only (13: gpu + cpu)
+cargo test                    # all tests
+cargo test --lib              # src/lib.rs tests (telemetry + gpu + cpu)
 cargo test --bin thalamic-relay  # src/main.rs tests only (6)
-cargo test gpu                # gpu safety tests (12)
+cargo test telemetry          # typed contract / fixtures
+cargo test gpu                # gpu safety + acquisition tests
 cargo test cpu                # cpu metrics tests (1)
 cargo test test_safety        # safety-related tests
 cargo test lock_guard         # single-instance lockfile tests
@@ -16,11 +17,23 @@ cargo test lock_guard         # single-instance lockfile tests
 
 | Binary | Test | What it covers |
 |--------|------|----------------|
-| lib.rs | `test_telemetry_struct` | GpuTelemetry default values |
-| lib.rs | `test_telemetry_to_rails` | GpuTelemetry rail conversion |
+| lib.rs | `healthy_real_is_valid_nvml_with_legitimate_zero_util` | Healthy NVML fixture; 0% util ≠ missing |
+| lib.rs | `software_fallback_is_explicit_source_not_magic_values` | Software fallback provenance |
+| lib.rs | `nvml_matching_old_magic_is_not_simulated` | `0°C`/`25W` NVML is not simulated |
+| lib.rs | `stale_samples_keep_raw_but_are_not_valid` | Stale keeps raw, normalized `None` |
+| lib.rs | `sensor_dropout_is_missing_not_zero` | Dropout is `None`, not `0.0` |
+| lib.rs | `non_finite_is_invalid_with_none_value` | NaN → invalid + `None` |
+| lib.rs | `out_of_range_keeps_raw_and_is_invalid` | Out-of-range preserves raw |
+| lib.rs | `normalization_is_deterministic` | Linear `[0, 1]` mapping |
+| lib.rs | `sensory_mapping_omits_observability_only_without_filler` | corpus-ipc mapping surface |
+| lib.rs | `observability_snapshot_preserves_raw_independently_of_normalization` | Raw vs normalized split |
+| lib.rs | `missing_runtime_input_is_not_normalized_to_zero` | Missing ≠ normalized 0 |
+| lib.rs | `inventory_classifies_every_gpu_signal` | Signal class/unit/range inventory |
+| lib.rs | `test_raw_software_fallback_never_uses_silent_zero_for_missing_vram` | VRAM stays missing in fallback |
 | lib.rs | `test_read_telemetry_force_software_only` | Forced software-only telemetry read |
 | lib.rs | `test_is_gpu_healthy_does_not_panic` | GPU health check no-panic |
 | lib.rs | `test_safety_ok_on_simulated_values` | Simulated telemetry skips safety |
+| lib.rs | `test_safety_does_not_infer_simulation_from_old_magic_values` | No magic-value sim inference |
 | lib.rs | `test_safety_warn_on_elevated_temp` | 75-85°C warning threshold |
 | lib.rs | `test_safety_warn_on_elevated_power` | 300-350W warning threshold |
 | lib.rs | `test_safety_critical_on_high_temp` | >85°C critical threshold |
@@ -28,6 +41,8 @@ cargo test lock_guard         # single-instance lockfile tests
 | lib.rs | `test_safety_critical_on_non_finite_telemetry` | NaN/Inf telemetry handling |
 | lib.rs | `test_safety_critical_on_unknown_power_with_real_temperature` | Missing power with real temp |
 | lib.rs | `test_safety_ok_on_normal_telemetry` | Normal readings pass |
+| lib.rs | `test_safety_critical_on_stale_and_out_of_range` | Stale/OOR fail closed |
+| lib.rs | `test_sensory_mapping_from_software_fallback_carries_provenance` | Mapping carries fallback source |
 | lib.rs | `relay_metrics_default_values` | RelayMetrics defaults to 0 |
 | main.rs | `parses_custom_args_and_env_equiv` | CLI flag parsing |
 | main.rs | `parses_defaults` | CLI defaults |
@@ -45,7 +60,7 @@ with that code. See [`docs/ipc.md`](docs/ipc.md).
 
 ### Gaps closed (at the time, since partly superseded by RM-1143's UDP/SNN removal above)
 
-- Software-only GPU telemetry fallback (`HardwareBridge::read_telemetry_force(true)`, `GpuTelemetry::to_rails`, `is_gpu_healthy` no-panic).
+- Software-only GPU telemetry fallback (`HardwareBridge::read_telemetry_force(true)`, `TelemetryFrame::to_sensory_mapping`, `is_gpu_healthy` no-panic).
 - Single-instance lockfile lifecycle (`try_acquire_lock`, active PID rejection, stale lock reclamation, create/remove behavior).
 
 ### Gaps explicitly deferred

@@ -1,9 +1,10 @@
 use clap::Parser;
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use thalamic_relay::cpu::{self, RelayMetrics};
-use thalamic_relay::gpu::{GpuTelemetry, HardwareBridge, SafetyStatus};
+use thalamic_relay::gpu::{HardwareBridge, SafetyStatus};
+use thalamic_relay::telemetry::{TelemetryFrame, TelemetrySource, unix_now_ms};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
@@ -116,7 +117,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         step_count += 1;
-        let loop_start = Instant::now();
         let telemetry = HardwareBridge::read_telemetry_force(cli.force_software_only);
 
         let mut ok_count_updated_this_iter = false;
@@ -263,10 +263,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Update shared metrics
+        // Update shared metrics. Freshness is sample age, not loop elapsed time.
         {
             let mut metrics = relay_metrics.lock().unwrap();
-            metrics.telemetry_freshness_s = loop_start.elapsed().as_secs_f64();
+            metrics.telemetry_freshness_s =
+                unix_now_ms().saturating_sub(telemetry.acquired_at) as f64 / 1000.0;
         }
 
         print_dashboard(&telemetry, step_count);
@@ -275,11 +276,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn print_dashboard(telemetry: &GpuTelemetry, step: u64) {
-    print!(
-        "\r[Step {step}] Pwr: {:5.1}W | Vcore: {:.3}V   ",
-        telemetry.power_w, telemetry.vddcr_gfx_v
-    );
+fn print_dashboard(frame: &TelemetryFrame, step: u64) {
+    let pwr = match frame.power_w.value {
+        Some(w) => format!("{w:5.1}W"),
+        None => "  n/a".to_string(),
+    };
+    let vcore = match frame.vddcr_gfx_v.value {
+        Some(v) => format!("{v:.3}V"),
+        None => "n/a".to_string(),
+    };
+    let tag = match frame.source {
+        TelemetrySource::SoftwareFallback => " [sim]",
+        TelemetrySource::Nvml => "",
+    };
+    print!("\r[Step {step}] Pwr: {pwr} | Vcore: {vcore}{tag}   ");
     let _ = io::stdout().flush();
 }
 
