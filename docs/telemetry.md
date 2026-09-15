@@ -40,7 +40,7 @@ RawTelemetry          (optional engineering values + acquisition source)
 TelemetryFrame        (per-signal TelemetrySample)
         │
         ├─ SafetyMachine::evaluate()      isolated; no IPC  → GH#42
-        ├─ HardwareBridge::check_safety() instantaneous Ok/Warn/Critical
+        ├─ instant_status() / classify_frame()  instantaneous Ok/Warn/Critical
         ├─ to_sensory_mapping()            runtime-input / Both  → GH#40
         └─ to_observability_snapshot()      every signal, raw preserved
 ```
