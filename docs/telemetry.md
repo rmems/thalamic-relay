@@ -3,6 +3,13 @@
 This is the normative validity / freshness / normalization / provenance
 contract for `thalamic-relay` ([GH#41](https://github.com/rmems/thalamic-relay/issues/41)).
 
+The frozen **CSV interchange** consumed by corinth-canal
+(`timestamp_ms,gpu_temp_c,gpu_power_w,cpu_tctl_c,cpu_package_power_w`) is a
+separate contract in [`docs/telemetry_csv.md`](telemetry_csv.md) and
+`thalamic_relay::telemetry_csv` ([RM-629](https://linear.app/rpd-34/issue/RM-629)).
+Do not treat CSV columns as [`TelemetrySample`] values: CSV fields are
+required finite numbers, not `Option`.
+
 Invalid, missing, stale, and simulated data is **never** inferred from magic
 numeric values. Missing sensors stay `None`; they are never silently converted
 into a legitimate `0.0`.
