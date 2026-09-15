@@ -11,7 +11,7 @@
 //! semantics (thresholds, hysteresis, fail-closed policy) — those belong to
 //! [`crate::safety`].
 
-use crate::safety::{ActuatorError, BrakeMatch, SafetyActuator, instant_status};
+use crate::safety::{ActuatorError, SafetyActuator, instant_status};
 use crate::telemetry::{
     DEFAULT_ACQUISITION_CADENCE_MS, RawTelemetry, TelemetryFrame, TelemetrySource,
     assess_with_cadence, unix_now_ms,
@@ -198,24 +198,8 @@ impl SafetyActuator for NvmlActuator {
         set_power_limit_w(default_limit)
     }
 
-    /// Detect a leftover brake whose current limit matches this relay's
-    /// emergency-brake target. This avoids treating an operator-configured
-    /// sub-default cap as an app-owned brake to auto-release. Returns `None`
-    /// when both limits cannot be queried or the current limit does not match.
-    fn detect_engaged_brake(&self, pct: f32) -> Option<BrakeMatch> {
-        let current_w = query_power_limit_w()?;
-        let default_w = query_default_power_limit_w()?;
-        let expected_w = (default_w as f32 * pct.clamp(0.1, 1.0)) as u32;
-        let tolerance_w = 2;
-        if current_w.abs_diff(expected_w) <= tolerance_w {
-            Some(BrakeMatch {
-                current_w,
-                default_w,
-                expected_w,
-            })
-        } else {
-            None
-        }
+    fn query_power_limits_w(&self) -> (Option<u32>, Option<u32>) {
+        (query_power_limit_w(), query_default_power_limit_w())
     }
 }
 

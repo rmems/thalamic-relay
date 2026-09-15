@@ -7,6 +7,7 @@ use tracing::{Level, info};
 use tracing_subscriber::FmtSubscriber;
 
 use crate::safety::{SafetySnapshot, SafetyState};
+use crate::shutdown::ShutdownPlan;
 use crate::telemetry::{UnixMillis, unix_now_ms};
 
 /// Shared telemetry + safety state populated by the main loop.
@@ -18,6 +19,9 @@ pub struct RelayMetrics {
     pub policy_state: SafetyState,
     pub brake_engaged: bool,
     pub hysteresis_ok_count: u32,
+    pub shutdown_reason: Option<&'static str>,
+    pub shutdown_unresolved_brake: bool,
+    pub shutdown_unresolved_actuator: bool,
 }
 
 impl Default for RelayMetrics {
@@ -28,6 +32,9 @@ impl Default for RelayMetrics {
             policy_state: SafetyState::TelemetryMissing,
             brake_engaged: false,
             hysteresis_ok_count: 0,
+            shutdown_reason: None,
+            shutdown_unresolved_brake: false,
+            shutdown_unresolved_actuator: false,
         }
     }
 }
@@ -81,6 +88,17 @@ pub fn export_safety_gauges(
     gauge!("safety_hysteresis_ok_count").set(f64::from(hysteresis_ok_count));
 }
 
+/// Record shutdown reason and unresolved brake/actuator gauges.
+pub fn record_shutdown(metrics: &mut RelayMetrics, plan: &ShutdownPlan) {
+    metrics.shutdown_reason = Some(plan.reason.as_str());
+    metrics.shutdown_unresolved_brake = plan.unresolved_brake;
+    metrics.shutdown_unresolved_actuator = plan.unresolved_actuator;
+    counter!("shutdown_total", "reason" => plan.reason.as_str()).increment(1);
+    gauge!("shutdown_unresolved_brake").set(if plan.unresolved_brake { 1.0 } else { 0.0 });
+    gauge!("shutdown_unresolved_actuator").set(if plan.unresolved_actuator { 1.0 } else { 0.0 });
+    gauge!("shutdown_brake_left_engaged").set(if plan.leave_brake_engaged { 1.0 } else { 0.0 });
+}
+
 /// Sets up our logging and metrics engines.
 /// Binds the Prometheus HTTP listener on `metrics_addr`.
 /// RUST_LOG (or future log-level arg) still controls tracing via env filter where applicable.
@@ -107,12 +125,20 @@ pub fn init_telemetry(metrics_addr: std::net::SocketAddr) {
 }
 
 /// Spawns a background task to track relay telemetry metrics.
-/// Reads from shared state populated by the main loop.
-pub async fn run_metrics_collector(metrics: Arc<Mutex<RelayMetrics>>) {
+/// Reads from shared state populated by the main loop. Exits when `shutdown`
+/// is set to `true` (or the sender is dropped).
+pub async fn run_metrics_collector(
+    metrics: Arc<Mutex<RelayMetrics>>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
     info!("Starting Metrics Collector...");
 
     loop {
-        // Read from shared state populated by the main loop
+        if *shutdown.borrow() {
+            info!("Metrics collector stopping");
+            break;
+        }
+
         let snapshot = {
             let guard = metrics.lock().unwrap();
             guard.clone()
@@ -129,7 +155,15 @@ pub async fn run_metrics_collector(metrics: Arc<Mutex<RelayMetrics>>) {
             snapshot.hysteresis_ok_count,
         );
 
-        sleep(Duration::from_secs(2)).await;
+        tokio::select! {
+            result = shutdown.changed() => {
+                if result.is_err() || *shutdown.borrow() {
+                    info!("Metrics collector stopping");
+                    break;
+                }
+            }
+            _ = sleep(Duration::from_secs(2)) => {}
+        }
     }
 }
 
@@ -171,5 +205,23 @@ mod tests {
         assert_eq!(metrics.safety_state, SafetyState::CriticalBraked);
         assert!(!metrics.brake_engaged);
         assert_eq!(metrics.policy_state, SafetyState::CriticalBraked);
+    }
+
+    #[test]
+    fn record_shutdown_copies_unresolved_flags() {
+        use crate::shutdown::{InFlightActuation, ShutdownReason, plan_shutdown};
+
+        let mut machine = SafetyMachine::new();
+        machine.seed_brake_applied();
+        let plan = plan_shutdown(
+            ShutdownReason::Sigterm,
+            &machine.snapshot(),
+            InFlightActuation::None,
+        );
+        let mut metrics = RelayMetrics::default();
+        record_shutdown(&mut metrics, &plan);
+        assert_eq!(metrics.shutdown_reason, Some("sigterm"));
+        assert!(metrics.shutdown_unresolved_brake);
+        assert!(!metrics.shutdown_unresolved_actuator);
     }
 }

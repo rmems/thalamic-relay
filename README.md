@@ -51,7 +51,8 @@ no authority to override Thalamic hard-safety.
   of any IPC publisher.
 - **Metrics Collection**: Prometheus-compatible metrics export (freshness,
   safety state, brake state, transition and actuator-failure counters)
-- **Process Safety**: Single-instance protection via a lockfile mechanism
+- **Process Safety**: Single-instance protection via a lockfile mechanism;
+  SIGINT/SIGTERM orderly shutdown with fail-closed emergency-brake recovery
 
 ## Installation
 
@@ -127,6 +128,7 @@ rules, and [`docs/telemetry.md`](docs/telemetry.md) for the sample contract.
 - **`safety`**: Pure deterministic classification + hysteresis (`SafetyMachine`); no NVML, no IPC
 - **`gpu`**: Raw NVML acquisition and privileged power-limit actuation
 - **`publish`**: Non-blocking sensory publish stub (`AbsentPublisher`, `IsolatedPublishQueue`); transport is GH#40
+- **`shutdown`**: SIGINT/SIGTERM plan (never restores default PL just because the process is exiting); leftover-brake vs operator-cap classification at restart
 - **`cpu`**: Telemetry initialization and metrics collection
 
 ### Key Components
@@ -181,8 +183,12 @@ state is observable here; there is no neural-state query:
 - `safety_brake_engaged` — last successful brake still claimed
 - `safety_hysteresis_ok_count` — Ok streak while braked
 - `safety_transitions_total` / `safety_actuator_failures_total` — counters
+- `shutdown_total{reason}` / `shutdown_unresolved_brake` /
+  `shutdown_unresolved_actuator` / `shutdown_brake_left_engaged` — last
+  orderly shutdown (SIGINT/SIGTERM)
 
-See [`docs/safety.md`](docs/safety.md) for the label set and numeric ids.
+See [`docs/safety.md`](docs/safety.md) for the label set, numeric ids,
+and fail-closed shutdown/restart rules.
 
 ### Logging
 
@@ -194,6 +200,7 @@ Structured logging via `tracing` with configurable output levels.
 - **Independent safety loop**: `SafetyMachine::evaluate` has no publisher argument and is not awaited on IPC. Production uses `AbsentPublisher` until GH#40.
 - **GPU Safety Monitoring**: Safety cadence every ~1 second (every 10 ticks); named states for healthy-real, warning, critical/braked, recovering, missing/stale/invalid, simulated, actuator-failure
 - **Emergency Brakes**: Automatically throttles GPU power limit to 50% via `nvidia-smi -pl` on fail-closed or critical; 3 consecutive real Ok readings to release; warn immediately after release re-applies
+- **Fail-closed shutdown / restart**: Ctrl-C and SIGTERM stop the run loop, join background tasks with a timeout, and release `/tmp/thalamic_relay.lock`. Shutdown **does not** restore the default GPU power limit. A persistent relay-owned brake (current PL matching the 50% target) is adopted on the next start and released only through the same Ok-streak hysteresis. An operator-configured sub-default cap is left unchanged. Simulated/software-only telemetry cannot authorize release of a real brake. SIGKILL/power loss have no cleanup promise.
 - **Graceful Degradation**: Continues in software-only mode when
   `--force-software-only` is set (`TelemetrySource::SoftwareFallback`).
   NVML/driver failure without that flag is `NvmlUnavailable` and fail-closes

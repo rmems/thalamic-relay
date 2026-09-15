@@ -15,6 +15,8 @@ use std::sync::Mutex;
 pub const RELEASE_OK_STREAK: u32 = 3;
 /// Emergency-brake fraction of the device default power limit.
 pub const BRAKE_FRACTION: f32 = 0.5;
+/// Wattage tolerance when matching a leftover relay-owned brake target.
+pub const BRAKE_MATCH_TOLERANCE_W: u32 = 2;
 /// Thermal warning band (°C), inclusive of this threshold.
 pub const TEMP_WARN_C: f32 = 75.0;
 /// Thermal critical threshold (°C).
@@ -595,6 +597,81 @@ pub struct BrakeMatch {
     pub expected_w: u32,
 }
 
+/// Classification of the device power limit at process start (crash/restart).
+///
+/// Used to adopt a leftover **relay-owned** 50% brake without treating an
+/// operator-configured sub-default cap as something the relay may auto-release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerLimitObservation {
+    /// Current and/or default limit could not be read. Do not seed; first-frame
+    /// evaluation fail-closes if telemetry is also missing.
+    Unreadable,
+    /// At or above the device default (within [`BRAKE_MATCH_TOLERANCE_W`]).
+    AtOrAboveDefault { current_w: u32, default_w: u32 },
+    /// Current limit matches this relay's expected brake target. Adopt and
+    /// recover only through the normal Ok-streak hysteresis.
+    RelayOwnedBrake(BrakeMatch),
+    /// Below default but not the relay target. Leave unchanged; never auto-release.
+    ForeignSubDefaultCap {
+        current_w: u32,
+        default_w: u32,
+        expected_brake_w: u32,
+    },
+}
+
+impl PowerLimitObservation {
+    /// Stable log/metric label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unreadable => "unreadable",
+            Self::AtOrAboveDefault { .. } => "at_or_above_default",
+            Self::RelayOwnedBrake(_) => "relay_owned_brake",
+            Self::ForeignSubDefaultCap { .. } => "foreign_sub_default_cap",
+        }
+    }
+
+    /// Whether startup should call [`SafetyMachine::seed_brake_applied`].
+    #[must_use]
+    pub const fn should_seed_leftover_brake(self) -> bool {
+        matches!(self, Self::RelayOwnedBrake(_))
+    }
+}
+
+/// Classify current vs default power limits against this relay's brake fraction.
+///
+/// Pure function: no NVML, no mutation. `None` for either limit is unreadable.
+#[must_use]
+pub fn classify_power_limit(
+    current_w: Option<u32>,
+    default_w: Option<u32>,
+    brake_fraction: f32,
+) -> PowerLimitObservation {
+    let (Some(current_w), Some(default_w)) = (current_w, default_w) else {
+        return PowerLimitObservation::Unreadable;
+    };
+    let pct = brake_fraction.clamp(0.1, 1.0);
+    let expected_brake_w = (default_w as f32 * pct) as u32;
+    if current_w.abs_diff(expected_brake_w) <= BRAKE_MATCH_TOLERANCE_W {
+        return PowerLimitObservation::RelayOwnedBrake(BrakeMatch {
+            current_w,
+            default_w,
+            expected_w: expected_brake_w,
+        });
+    }
+    if current_w.saturating_add(BRAKE_MATCH_TOLERANCE_W) >= default_w {
+        return PowerLimitObservation::AtOrAboveDefault {
+            current_w,
+            default_w,
+        };
+    }
+    PowerLimitObservation::ForeignSubDefaultCap {
+        current_w,
+        default_w,
+        expected_brake_w,
+    }
+}
+
 /// The privileged hardware-safety actuation boundary.
 ///
 /// Implementations apply/release a hardware power-limit brake and detect a
@@ -615,10 +692,20 @@ pub trait SafetyActuator: Send + Sync {
     /// Release the emergency brake, restoring the device default power limit.
     fn release_emergency_brake(&self) -> Result<(), ActuatorError>;
 
+    /// Current and device-default power limits in watts, if the backend can
+    /// read them. Either side may be `None` (unreadable).
+    fn query_power_limits_w(&self) -> (Option<u32>, Option<u32>);
+
     /// Detect a leftover brake matching this relay's `pct` target (e.g. after a
     /// crash/restart), so the supervisor can adopt and later release it. Returns
     /// `None` when no matching brake is present or the limits cannot be queried.
-    fn detect_engaged_brake(&self, pct: f32) -> Option<BrakeMatch>;
+    fn detect_engaged_brake(&self, pct: f32) -> Option<BrakeMatch> {
+        let (current_w, default_w) = self.query_power_limits_w();
+        match classify_power_limit(current_w, default_w, pct) {
+            PowerLimitObservation::RelayOwnedBrake(m) => Some(m),
+            _ => None,
+        }
+    }
 }
 
 /// Deterministic in-memory [`SafetyActuator`] for tests.
@@ -637,7 +724,8 @@ struct FakeState {
     release_calls: u32,
     fail_apply: Option<ActuatorError>,
     fail_release: Option<ActuatorError>,
-    detected: Option<BrakeMatch>,
+    current_w: Option<u32>,
+    default_w: Option<u32>,
 }
 
 impl FakeActuator {
@@ -657,10 +745,21 @@ impl FakeActuator {
         self.state.lock().unwrap().fail_release = err;
     }
 
-    /// Configure the [`BrakeMatch`] returned by
-    /// [`SafetyActuator::detect_engaged_brake`].
+    /// Configure the current and default power limits reported by
+    /// [`SafetyActuator::query_power_limits_w`].
+    pub fn set_power_limits(&self, current_w: Option<u32>, default_w: Option<u32>) {
+        let mut state = self.state.lock().unwrap();
+        state.current_w = current_w;
+        state.default_w = default_w;
+    }
+
+    /// Configure limits so [`SafetyActuator::detect_engaged_brake`] returns
+    /// `detected` (a relay-owned match, or `None` for unreadable).
     pub fn set_detected_brake(&self, detected: Option<BrakeMatch>) {
-        self.state.lock().unwrap().detected = detected;
+        match detected {
+            Some(m) => self.set_power_limits(Some(m.current_w), Some(m.default_w)),
+            None => self.set_power_limits(None, None),
+        }
     }
 
     /// Whether the fake brake is currently engaged.
@@ -703,8 +802,9 @@ impl SafetyActuator for FakeActuator {
         Ok(())
     }
 
-    fn detect_engaged_brake(&self, _pct: f32) -> Option<BrakeMatch> {
-        self.state.lock().unwrap().detected
+    fn query_power_limits_w(&self) -> (Option<u32>, Option<u32>) {
+        let state = self.state.lock().unwrap();
+        (state.current_w, state.default_w)
     }
 }
 
@@ -755,6 +855,17 @@ mod actuator_tests {
         };
         fake.set_detected_brake(Some(m));
         assert_eq!(fake.detect_engaged_brake(BRAKE_FRACTION), Some(m));
+    }
+
+    #[test]
+    fn fake_actuator_foreign_cap_is_not_a_relay_owned_brake() {
+        let fake = FakeActuator::new();
+        fake.set_power_limits(Some(200), Some(300));
+        assert_eq!(fake.detect_engaged_brake(BRAKE_FRACTION), None);
+        assert_eq!(
+            classify_power_limit(Some(200), Some(300), BRAKE_FRACTION).as_str(),
+            "foreign_sub_default_cap"
+        );
     }
 
     #[test]
@@ -1110,6 +1221,21 @@ mod tests {
     }
 
     #[test]
+    fn leftover_brake_plus_simulated_never_releases() {
+        let mut machine = SafetyMachine::new();
+        machine.seed_brake_applied();
+        let sim = assess(&fixtures::software_fallback(), fixtures::NOW);
+        for _ in 0..RELEASE_OK_STREAK + 2 {
+            let snap = machine.evaluate(&sim);
+            assert_eq!(snap.state, SafetyState::SimulatedSoftwareOnly);
+            assert!(snap.brake_engaged);
+            assert!(snap.desired_brake);
+            assert_eq!(snap.intent, BrakeIntent::None);
+            assert_eq!(snap.hysteresis_ok_count, 0);
+        }
+    }
+
+    #[test]
     fn nvml_old_magic_is_healthy_real_not_simulated() {
         let snap = eval_once(fixtures::nvml_looks_like_old_magic());
         assert_eq!(snap.state, SafetyState::HealthyReal);
@@ -1189,5 +1315,63 @@ mod tests {
             assert_eq!(state.as_id() as usize, i);
         }
         assert_eq!(SafetyState::ActuatorFailure.as_str(), "actuator_failure");
+    }
+
+    #[test]
+    fn classify_power_limit_distinguishes_relay_owned_from_operator_cap() {
+        assert_eq!(
+            classify_power_limit(None, None, BRAKE_FRACTION),
+            PowerLimitObservation::Unreadable
+        );
+        assert_eq!(
+            classify_power_limit(Some(150), None, BRAKE_FRACTION),
+            PowerLimitObservation::Unreadable
+        );
+        assert_eq!(
+            classify_power_limit(None, Some(300), BRAKE_FRACTION),
+            PowerLimitObservation::Unreadable
+        );
+
+        let owned = classify_power_limit(Some(150), Some(300), BRAKE_FRACTION);
+        assert_eq!(
+            owned,
+            PowerLimitObservation::RelayOwnedBrake(BrakeMatch {
+                current_w: 150,
+                default_w: 300,
+                expected_w: 150,
+            })
+        );
+        assert!(owned.should_seed_leftover_brake());
+        assert_eq!(owned.as_str(), "relay_owned_brake");
+
+        let near = classify_power_limit(Some(149), Some(300), BRAKE_FRACTION);
+        assert!(matches!(near, PowerLimitObservation::RelayOwnedBrake(_)));
+
+        let foreign = classify_power_limit(Some(200), Some(300), BRAKE_FRACTION);
+        assert_eq!(
+            foreign,
+            PowerLimitObservation::ForeignSubDefaultCap {
+                current_w: 200,
+                default_w: 300,
+                expected_brake_w: 150,
+            }
+        );
+        assert!(!foreign.should_seed_leftover_brake());
+
+        let at_default = classify_power_limit(Some(300), Some(300), BRAKE_FRACTION);
+        assert_eq!(
+            at_default,
+            PowerLimitObservation::AtOrAboveDefault {
+                current_w: 300,
+                default_w: 300,
+            }
+        );
+        assert!(!at_default.should_seed_leftover_brake());
+
+        let slightly_under_default = classify_power_limit(Some(298), Some(300), BRAKE_FRACTION);
+        assert!(matches!(
+            slightly_under_default,
+            PowerLimitObservation::AtOrAboveDefault { .. }
+        ));
     }
 }
