@@ -82,14 +82,20 @@ SafetySnapshot (state, brake, intent)
       │
       ├─ spawn_blocking apply/release   (gpu, not on the eval path)
       └─ SensoryPublisher::try_publish   (best-effort, after eval)
-             IsolatedPublishQueue.try_enqueue  (drop on full)
+             IsolatedPublishQueue.try_enqueue  (bounded; policy on full)
 ```
 
-Production currently uses [`AbsentPublisher`](../src/publish.rs) (Brainstem
-absent). GH#40 should plug a `corpus-ipc` publisher into
-`IsolatedPublishQueue` (bounded `try_send`). A full or disconnected queue
-is `SlowConsumer` / `Disconnected` and **must not** be `recv`'d from the
-safety loop.
+Production uses a bounded [`IsolatedPublishQueue`](../src/publish.rs) with a
+validated capacity (`--sensory-queue-capacity`, default 32, range 1–4096) and
+an explicit full-queue policy (`--sensory-queue-full-policy`, default
+`drop-oldest`; also `reject-newest`). GH#40 should drain the consumer end
+into `corpus-ipc`. Until then the consumer is held but not drained: the
+queue fills, overflow follows the policy, and **safety evaluation continues**.
+A full or disconnected queue is `SlowConsumer` / `Disconnected` (or a
+successful enqueue that discarded the oldest frame) and **must not** be
+`recv`'d from the safety loop.
+
+`AbsentPublisher` remains as the “no transport configured” test double.
 
 ## Prometheus
 
@@ -105,6 +111,15 @@ Exported without querying Brainstem:
 | `safety_transitions_total` | counter | reported-state changes |
 | `safety_actuator_failures_total` | counter | apply/release errors |
 | `telemetry_freshness_s` | gauge | sample age at scrape time |
+| `sensory_queue_depth` | gauge | frames currently buffered |
+| `sensory_queue_capacity` | gauge | configured finite capacity |
+| `sensory_queue_enqueued_total` | counter | frames accepted into the queue |
+| `sensory_queue_dropped_total{reason}` | counter | closed reason set: `reject_newest`, `drop_oldest`, `absent`, `disconnected`, `send_failed` |
+| `sensory_queue_full_policy{policy}` | gauge 0/1 | one-hot `drop_oldest` / `reject_newest` |
+
+Drop `reason` is a closed vocabulary. Transport error strings and sensory
+payloads are **never** used as labels, so series cardinality cannot grow
+from input data.
 
 Numeric ids: 0 `healthy_real`, 1 `warning`, 2 `critical_braked`,
 3 `recovering`, 4 `telemetry_missing`, 5 `telemetry_stale`,

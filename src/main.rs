@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thalamic_relay::cpu::{self, RelayMetrics};
 use thalamic_relay::gpu::{HardwareBridge, NvmlActuator};
-use thalamic_relay::publish::{AbsentPublisher, SensoryPublisher, evaluate_then_try_publish};
+use thalamic_relay::publish::{
+    IsolatedPublishQueue, QueueConfig, QueueFullPolicy, SensoryPublisher, evaluate_then_try_publish,
+};
 use thalamic_relay::safety::{
     ActuatorError, ActuatorOutcome, BRAKE_FRACTION, BrakeIntent, SafetyActuator, SafetyMachine,
     SafetySnapshot, SafetyState,
@@ -102,7 +104,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut step_count: u64 = 0;
     let mut machine = SafetyMachine::new();
-    let publisher = AbsentPublisher;
+    let queue_config = QueueConfig::new(cli.sensory_queue_capacity, cli.sensory_queue_full_policy)
+        .expect("CLI parser already validated sensory queue capacity");
+    let (publisher, sensory_consumer) = IsolatedPublishQueue::new(queue_config)
+        .expect("CLI parser already validated sensory queue capacity");
+    // Held for process lifetime so overflow uses the configured policy instead
+    // of Disconnected. GH#40 will drain this consumer; until then frames age
+    // out (drop-oldest) or reject (reject-newest) and the counters move.
+    let _sensory_consumer = sensory_consumer;
+    println!(
+        "[relay] sensory queue capacity={} policy={} (drain is GH#40; overflow is visible in metrics)",
+        queue_config.capacity(),
+        queue_config.policy()
+    );
     let mut warned_brake_held_sim = false;
     let mut brake_task: Option<ActuationTask> = None;
     let mut release_task: Option<ActuationTask> = None;
@@ -215,8 +229,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
             spawn_intent(&snap, &actuator, &mut brake_task, &mut release_task);
         } else {
-            // Publication is outside the safety critical path and never awaited.
-            let _ = publisher.try_publish(&telemetry.to_sensory_mapping());
+            // Do not enqueue the older start-of-tick frame after a post-actuation
+            // re-evaluation already published a fresher sample.
+            enqueue_loop_start_if_unevaluated(evaluated_this_iter, &telemetry, &publisher);
         }
 
         {
@@ -227,6 +242,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         print_dashboard(&telemetry, step_count, machine.snapshot().state);
 
         sleep(Duration::from_millis(cli.step_interval_ms)).await;
+    }
+}
+
+/// Enqueue the loop-start telemetry frame unless this iteration already
+/// published a fresher post-actuation sample.
+fn enqueue_loop_start_if_unevaluated<P: SensoryPublisher>(
+    evaluated_this_iter: bool,
+    telemetry: &TelemetryFrame,
+    publisher: &P,
+) -> Option<Result<(), thalamic_relay::publish::PublishError>> {
+    if evaluated_this_iter {
+        None
+    } else {
+        Some(publisher.try_publish(&telemetry.to_sensory_mapping()))
     }
 }
 
@@ -359,12 +388,39 @@ struct Cli {
     /// value (`--force-software-only=false` / `THALAMIC_FORCE_SOFTWARE_ONLY=false`).
     #[arg(long, env = "THALAMIC_FORCE_SOFTWARE_ONLY", num_args = 0..=1, default_missing_value = "true", default_value_t = false, value_parser = clap::value_parser!(bool))]
     force_software_only: bool,
+
+    /// Outbound sensory-queue capacity (frames). Finite; never unbounded.
+    #[arg(
+        long,
+        default_value_t = QueueConfig::DEFAULT_CAPACITY,
+        env = "THALAMIC_SENSORY_QUEUE_CAPACITY",
+        value_parser = parse_sensory_queue_capacity
+    )]
+    sensory_queue_capacity: usize,
+
+    /// Full-queue policy: `drop-oldest` (keep newest) or `reject-newest`.
+    #[arg(
+        long,
+        default_value_t = QueueFullPolicy::DropOldest,
+        env = "THALAMIC_SENSORY_QUEUE_FULL_POLICY"
+    )]
+    sensory_queue_full_policy: QueueFullPolicy,
+}
+
+fn parse_sensory_queue_capacity(s: &str) -> Result<usize, String> {
+    let raw: u64 = s
+        .parse()
+        .map_err(|e| format!("invalid --sensory-queue-capacity: {e}"))?;
+    let capacity =
+        usize::try_from(raw).map_err(|_| "sensory-queue-capacity exceeds usize".to_string())?;
+    QueueConfig::validate_capacity(capacity).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
+    use thalamic_relay::telemetry::{assess, fixtures};
 
     #[test]
     fn parses_custom_args_and_env_equiv() {
@@ -395,6 +451,46 @@ mod tests {
         );
         assert_eq!(cli.step_interval_ms, 100);
         assert!(!cli.force_software_only);
+        assert_eq!(cli.sensory_queue_capacity, QueueConfig::DEFAULT_CAPACITY);
+        assert_eq!(cli.sensory_queue_full_policy, QueueFullPolicy::DropOldest);
+    }
+
+    #[test]
+    fn parses_sensory_queue_config() {
+        let cli = Cli::try_parse_from([
+            "thalamic-relay",
+            "--sensory-queue-capacity",
+            "8",
+            "--sensory-queue-full-policy",
+            "reject-newest",
+        ])
+        .unwrap();
+        assert_eq!(cli.sensory_queue_capacity, 8);
+        assert_eq!(cli.sensory_queue_full_policy, QueueFullPolicy::RejectNewest);
+    }
+
+    #[test]
+    fn rejects_zero_queue_capacity() {
+        assert!(Cli::try_parse_from(["thalamic-relay", "--sensory-queue-capacity", "0"]).is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_queue_capacity() {
+        assert!(
+            Cli::try_parse_from(["thalamic-relay", "--sensory-queue-capacity", "99999"]).is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_queue_policy() {
+        assert!(
+            Cli::try_parse_from([
+                "thalamic-relay",
+                "--sensory-queue-full-policy",
+                "drop-random"
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -440,8 +536,6 @@ mod tests {
 
     #[test]
     fn dashboard_shows_only_valid_present_as_live_hardware() {
-        use thalamic_relay::telemetry::{assess, fixtures};
-
         let live = assess(&fixtures::healthy_real(), fixtures::NOW);
         assert_eq!(
             format_live_reading(&live.power_w, |w| format!("{w:.0}W")),
@@ -465,5 +559,20 @@ mod tests {
             format_live_reading(&missing.power_w, |w| format!("{w:.0}W")),
             "n/a"
         );
+    }
+
+    #[test]
+    fn queue_skips_loop_start_frame_after_post_actuation_eval() {
+        let (queue, _rx) = IsolatedPublishQueue::bounded(4).unwrap();
+        let frame = assess(&fixtures::healthy_real(), fixtures::NOW);
+        assert!(enqueue_loop_start_if_unevaluated(true, &frame, &queue).is_none());
+        assert_eq!(queue.snapshot().depth, 0);
+        assert!(
+            enqueue_loop_start_if_unevaluated(false, &frame, &queue)
+                .unwrap()
+                .is_ok()
+        );
+        assert_eq!(queue.snapshot().depth, 1);
+        assert_eq!(queue.snapshot().enqueued_total, 1);
     }
 }

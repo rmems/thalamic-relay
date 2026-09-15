@@ -18,9 +18,12 @@ The typed validity / freshness / provenance / normalization contract
 (GH#41) now lives in [`docs/telemetry.md`](telemetry.md) and
 `thalamic_relay::telemetry`. `TelemetryFrame::to_sensory_mapping()` is the
 deterministic mapping surface toward `corpus-ipc`; it is **not** a second
-wire schema and does not implement transport. `publish::AbsentPublisher`
-and `IsolatedPublishQueue` are the GH#42 isolation stub so a future
-publisher cannot stall the safety loop.
+wire schema and does not implement transport. `publish::IsolatedPublishQueue`
+is the outbound sensory buffer: capacity is finite and configurable,
+full-queue policy is explicit (`drop-oldest` or `reject-newest`), and
+overflow is visible on Prometheus. `AbsentPublisher` remains the GH#42
+isolation stub for “no consumer at all”. A stalled or missing drain cannot
+stall the safety loop.
 
 Transport (Thalamic → `corpus-ipc` → `brainstem-daemon`) remains follow-up
 work — see GH#40 (`RM-1144`). This file will be replaced with that contract's

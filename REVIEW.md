@@ -5,12 +5,14 @@
 ```bash
 cargo test                    # all tests
 cargo test --lib              # src/lib.rs tests (telemetry + gpu + cpu)
-cargo test --bin thalamic-relay  # src/main.rs tests only (6)
+cargo test --bin thalamic-relay  # src/main.rs tests only (12)
 cargo test telemetry          # typed contract / fixtures
 cargo test gpu                # gpu acquisition + check_safety facade
 cargo test safety              # SafetyMachine + named states (no GPU)
-cargo test publish             # IPC isolation / failing publisher
+cargo test publish             # IPC isolation / failing publisher / bounded queue
 cargo test cpu                # cpu metrics tests
+cargo test queue              # bounded queue capacity, policy, overflow counters
+cargo test metrics            # metrics defaults, safety snapshot copy, queue exposition
 cargo test test_safety        # safety-related tests
 cargo test lock_guard         # single-instance lockfile tests
 ```
@@ -56,9 +58,12 @@ cargo test lock_guard         # single-instance lockfile tests
 | lib.rs | `record_safety_snapshot_copies_state_and_brake` | Shared metrics copy safety snapshot |
 | lib.rs | `healthy_real_is_named_state` … `transitions_are_counted` | `SafetyMachine` GPU-less transitions (`src/safety.rs`) |
 | lib.rs | `absent_brainstem_does_not_block_or_change_safety` … | IPC/Brainstem absence cannot stall safety (`src/publish.rs`) |
+| lib.rs | `queue_capacity_is_validated` … `queue_metrics_exposition_shows_forced_overflow` | Bounded queue, policies, drop-reason cardinality (`src/publish.rs`) |
+| lib.rs | `metrics_queue_snapshot_names_are_stable` | Queue Prometheus names under overflow (`src/cpu.rs`) |
 | main.rs | `dashboard_shows_only_valid_present_as_live_hardware` | Dashboard hides stale/invalid/missing |
 | main.rs | `parses_custom_args_and_env_equiv` | CLI flag parsing |
-| main.rs | `parses_defaults` | CLI defaults |
+| main.rs | `parses_defaults` | CLI defaults (including sensory-queue capacity/policy) |
+| main.rs | `parses_sensory_queue_config` / `rejects_zero_queue_capacity` / `rejects_unknown_queue_policy` | Queue CLI validation |
 | main.rs | `parses_force_software_only_false` | `--force-software-only=false` |
 | main.rs | `lock_guard_created_and_removed` | Lockfile create/drop lifecycle |
 | main.rs | `lock_guard_rejects_active_pid` | Second instance refused while PID alive |
