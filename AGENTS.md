@@ -41,12 +41,12 @@ in-process SNN it used to step was removed in RM-1143. Build with a plain
 
 ### Interfaces (used for end-to-end testing)
 
-- No control/query IPC surface currently — the prior UDP protocol
-  (`Stimuli`/`LearningReward`/`GetNeuroState`) was removed in RM-1143 along
-  with the in-process SNN it existed to drive. See [`docs/ipc.md`](docs/ipc.md)
-  for the removal note and the planned `corpus-ipc`-based replacement.
+- Sensory publish: fire-and-forget UDP `IpcMessage::Stimuli` JSON to
+  `127.0.0.1:9900` by default (`--ipc-endpoint`). This is not a control/query
+  surface — the retired UDP protocol (`Stimuli`/`LearningReward`/`GetNeuroState`)
+  was removed in RM-1143. See [`docs/ipc.md`](docs/ipc.md).
 - Prometheus metrics on `http://localhost:9000/metrics` (bind IP (Internet Protocol) configurable via --metrics-ip).
-- Binds on startup, so only one instance can run at a time.
+- Binds the Prometheus exporter on startup, so only one instance can run at a time.
 
 ### Responding to automated PR review bots
 
