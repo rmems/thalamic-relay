@@ -8,8 +8,9 @@ numeric values. Missing sensors stay `None`; they are never silently converted
 into a legitimate `0.0`.
 
 Acquisition (`src/gpu.rs`) is separate from validation / normalization / encoding
-(`src/telemetry.rs`). Safety policy consumes [`TelemetryFrame`] samples and
-does not depend on corpus-ipc transport ([GH#40](https://github.com/rmems/thalamic-relay/issues/40)).
+(`src/telemetry.rs`). Safety policy (`src/safety.rs`) consumes [`TelemetryFrame`]
+samples and does not depend on corpus-ipc transport ([GH#40](https://github.com/rmems/thalamic-relay/issues/40)).
+Named relay states and hysteresis: [`docs/safety.md`](safety.md) (GH#42).
 
 ## Typed sample
 
@@ -38,8 +39,9 @@ RawTelemetry          (optional engineering values + acquisition source)
         ▼  assess() / TelemetryFrame::from_raw()
 TelemetryFrame        (per-signal TelemetrySample)
         │
-        ├─ safety::classify()                 safety-only / Both
-        ├─ to_sensory_mapping()               runtime-input / Both  → GH#40
+        ├─ SafetyMachine::evaluate()      isolated; no IPC  → GH#42
+        ├─ HardwareBridge::check_safety() instantaneous Ok/Warn/Critical
+        ├─ to_sensory_mapping()            runtime-input / Both  → GH#40
         └─ to_observability_snapshot()      every signal, raw preserved
 ```
 

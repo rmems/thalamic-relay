@@ -1,16 +1,17 @@
-//! Hardware Bridge — GPU telemetry acquisition and privileged NVML actuation.
+//! Hardware Bridge — GPU telemetry acquisition & privileged NVML actuation.
 //!
-//! Raw NVML acquisition lives here. Validation, normalization, freshness, and
-//! provenance live in [`crate::telemetry`]. Pure safety policy — instantaneous
-//! classification, brake hysteresis, and the [`SafetyActuator`] boundary — lives
-//! in [`crate::safety`].
+//! Raw NVML acquisition lives on [`HardwareBridge`]; the `nvidia-smi`
+//! brake/release backend lives on [`NvmlActuator`]. Validation, normalization,
+//! freshness, and provenance live in [`crate::telemetry`]. Deterministic safety
+//! classification, hysteresis, and the [`SafetyActuator`] boundary live in
+//! [`crate::safety`].
 //!
-//! This module is a *backend*: [`NvmlActuator`] implements
-//! [`SafetyActuator`] against NVML / `nvidia-smi`, but it defines none of the
-//! generic safety semantics (thresholds, hysteresis, fail-closed rules). Those
-//! belong to [`crate::safety`].
+//! [`NvmlActuator`] is a hardware *adapter*: it implements [`SafetyActuator`]
+//! against NVML / `nvidia-smi`, but defines none of the generic safety
+//! semantics (thresholds, hysteresis, fail-closed policy) — those belong to
+//! [`crate::safety`].
 
-use crate::safety::{ActuatorError, BrakeMatch, SafetyActuator};
+use crate::safety::{ActuatorError, BrakeMatch, SafetyActuator, instant_status};
 use crate::telemetry::{
     DEFAULT_ACQUISITION_CADENCE_MS, RawTelemetry, TelemetryFrame, TelemetrySource,
     assess_with_cadence, unix_now_ms,
@@ -19,11 +20,13 @@ use lazy_static::lazy_static;
 use nvml_wrapper::Nvml;
 use nvml_wrapper::enum_wrappers::device::{Clock, TemperatureSensor};
 
+pub use crate::safety::SafetyStatus;
+
 lazy_static! {
     static ref NVML: Option<Nvml> = Nvml::init().ok();
 }
 
-// ── Hardware Bridge (telemetry acquisition) ─────────────────────────
+// ── Hardware Bridge ─────────────────────────────────────────────────
 
 pub struct HardwareBridge;
 
@@ -117,25 +120,27 @@ impl HardwareBridge {
             mem_util_pct,
         })
     }
+
+    /// Check GPU safety thresholds against a validated frame.
+    ///
+    /// Instantaneous Ok/Warn/Critical only — stateful hysteresis lives in
+    /// [`crate::safety::SafetyMachine`]. Simulation is
+    /// [`TelemetrySource::SoftwareFallback`] only (forced software-only).
+    /// [`TelemetrySource::NvmlUnavailable`] is **not** simulated: missing
+    /// safety samples fail closed.
+    ///
+    /// Returns `(SafetyStatus, is_simulated)`.
+    pub fn check_safety(frame: &TelemetryFrame) -> (SafetyStatus, bool) {
+        instant_status(frame)
+    }
 }
 
-/// Derive an observability-only Vcore estimate from board power.
-/// This is not an NVML voltage sensor; [`crate::telemetry::SignalOrigin::Derived`].
-fn derive_vddcr_gfx_v(power_w: f32) -> f32 {
-    let p_idle = 50.0_f32;
-    let p_tdp = 300.0_f32;
-    let v_idle = 0.70_f32;
-    let v_tdp = 1.05_f32;
-    let t = ((power_w - p_idle) / (p_tdp - p_idle)).clamp(0.0, 1.0);
-    v_idle + t * (v_tdp - v_idle)
-}
-
-// ── NVML / nvidia-smi safety actuator (privileged backend) ──────────
+// ── NVML / nvidia-smi safety actuator (privileged backend, GH#46) ───
 
 /// [`SafetyActuator`] backed by NVML (for reads) and `nvidia-smi` (for the
 /// privileged power-limit mutation).
 ///
-/// This is a hardware adapter only: the emergency-brake *policy* (when to brake,
+/// A hardware adapter only: the emergency-brake *policy* (when to brake,
 /// hysteresis, fail-closed rules) is owned by [`crate::safety`]. This type just
 /// applies/releases/detects a power-limit brake and reports typed
 /// [`ActuatorError`]s.
@@ -256,19 +261,172 @@ fn query_default_power_limit_w() -> Option<u32> {
     Some(limit_mw / 1000)
 }
 
+/// Derive an observability-only Vcore estimate from board power.
+/// This is not an NVML voltage sensor; [`crate::telemetry::SignalOrigin::Derived`].
+fn derive_vddcr_gfx_v(power_w: f32) -> f32 {
+    let p_idle = 50.0_f32;
+    let p_tdp = 300.0_f32;
+    let v_idle = 0.70_f32;
+    let v_tdp = 1.05_f32;
+    let t = ((power_w - p_idle) / (p_tdp - p_idle)).clamp(0.0, 1.0);
+    v_idle + t * (v_tdp - v_idle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::safety::{SafetyStatus, classify};
-    use crate::telemetry::{SampleValidity, TelemetrySource, software_fallback};
+    use crate::telemetry::{SampleValidity, TelemetrySource, assess, fixtures, software_fallback};
+
+    fn nvml_temp_power(temp_c: f32, power_w: f32) -> TelemetryFrame {
+        let mut raw = fixtures::healthy_real();
+        raw.gpu_temp_c = Some(temp_c);
+        raw.power_w = Some(power_w);
+        assess(&raw, fixtures::NOW)
+    }
 
     #[test]
     fn test_raw_software_fallback_never_uses_silent_zero_for_missing_vram() {
-        let raw = RawTelemetry::software_fallback(crate::telemetry::fixtures::NOW);
+        let raw = RawTelemetry::software_fallback(fixtures::NOW);
         assert_eq!(raw.source, TelemetrySource::SoftwareFallback);
         assert_eq!(raw.vram_temp_c, None);
         assert_eq!(raw.mem_util_pct, Some(0.0));
         assert_eq!(raw.gpu_temp_c, Some(software_fallback::GPU_TEMP_C));
+    }
+
+    #[test]
+    fn test_safety_ok_on_simulated_values() {
+        let frame = assess(&fixtures::software_fallback(), fixtures::NOW);
+        let (status, is_sim) = HardwareBridge::check_safety(&frame);
+        assert_eq!(status, SafetyStatus::Ok);
+        assert!(is_sim);
+    }
+
+    #[test]
+    fn test_safety_does_not_infer_simulation_from_old_magic_values() {
+        let frame = assess(&fixtures::nvml_looks_like_old_magic(), fixtures::NOW);
+        let (status, is_sim) = HardwareBridge::check_safety(&frame);
+        assert_eq!(status, SafetyStatus::Ok);
+        assert!(!is_sim);
+        assert_eq!(frame.source, TelemetrySource::Nvml);
+        assert_eq!(frame.gpu_temp_c.value, Some(0.0));
+        assert_eq!(frame.power_w.value, Some(25.0));
+    }
+
+    #[test]
+    fn test_safety_warn_on_elevated_temp() {
+        let frame = nvml_temp_power(78.0, 200.0);
+        let (status, is_sim) = HardwareBridge::check_safety(&frame);
+        assert!(matches!(status, SafetyStatus::Warn(_)));
+        assert!(!is_sim);
+    }
+
+    #[test]
+    fn test_safety_warn_on_elevated_power() {
+        let frame = nvml_temp_power(70.0, 320.0);
+        let (status, is_sim) = HardwareBridge::check_safety(&frame);
+        assert!(matches!(status, SafetyStatus::Warn(_)));
+        assert!(!is_sim);
+    }
+
+    #[test]
+    fn test_safety_critical_on_high_temp() {
+        let frame = nvml_temp_power(90.0, 200.0);
+        let (status, is_sim) = HardwareBridge::check_safety(&frame);
+        assert!(matches!(status, SafetyStatus::Critical(_)));
+        assert!(!is_sim);
+    }
+
+    #[test]
+    fn test_safety_critical_on_high_power() {
+        let frame = nvml_temp_power(70.0, 360.0);
+        let (status, is_sim) = HardwareBridge::check_safety(&frame);
+        assert!(matches!(status, SafetyStatus::Critical(_)));
+        assert!(!is_sim);
+    }
+
+    #[test]
+    fn test_safety_ok_on_normal_telemetry() {
+        let frame = nvml_temp_power(65.0, 200.0);
+        let (status, is_sim) = HardwareBridge::check_safety(&frame);
+        assert_eq!(status, SafetyStatus::Ok);
+        assert!(!is_sim);
+    }
+
+    #[test]
+    fn test_safety_critical_on_unknown_power_with_real_temperature() {
+        let frame = assess(&fixtures::sensor_dropout(), fixtures::NOW);
+        let (status, is_sim) = HardwareBridge::check_safety(&frame);
+        assert!(matches!(status, SafetyStatus::Critical(ref msg) if msg.contains("power_w")));
+        assert!(!is_sim);
+        assert_eq!(frame.power_w.validity, SampleValidity::Missing);
+        assert_eq!(frame.power_w.value, None);
+    }
+
+    #[test]
+    fn test_check_safety_fail_closes_on_missing_temp_or_power() {
+        let mut raw = fixtures::healthy_real();
+        raw.gpu_temp_c = None;
+        let frame = assess(&raw, fixtures::NOW);
+        let (status, is_sim) = HardwareBridge::check_safety(&frame);
+        assert!(matches!(status, SafetyStatus::Critical(ref msg) if msg.contains("gpu_temp_c")));
+        assert!(!is_sim);
+
+        let mut raw = fixtures::healthy_real();
+        raw.power_w = None;
+        let frame = assess(&raw, fixtures::NOW);
+        let (status, is_sim) = HardwareBridge::check_safety(&frame);
+        assert!(matches!(status, SafetyStatus::Critical(ref msg) if msg.contains("power_w")));
+        assert!(!is_sim);
+
+        // Warn-band temperature with missing power must not become Warn or Ok.
+        let mut frame = nvml_temp_power(78.0, 200.0);
+        frame.power_w.value = None;
+        frame.power_w.validity = SampleValidity::Missing;
+        let (status, is_sim) = HardwareBridge::check_safety(&frame);
+        assert!(matches!(status, SafetyStatus::Critical(_)));
+        assert!(!matches!(status, SafetyStatus::Warn(_)));
+        assert!(!is_sim);
+
+        let mut frame = nvml_temp_power(78.0, 200.0);
+        frame.gpu_temp_c.value = None;
+        assert_eq!(frame.gpu_temp_c.validity, SampleValidity::Valid);
+        let (status, _) = HardwareBridge::check_safety(&frame);
+        assert!(matches!(status, SafetyStatus::Critical(ref msg) if msg.contains("gpu_temp_c")));
+    }
+
+    #[test]
+    fn test_safety_critical_on_non_finite_telemetry() {
+        let frame = assess(&fixtures::non_finite(), fixtures::NOW);
+        let (status, is_sim) = HardwareBridge::check_safety(&frame);
+        assert!(matches!(status, SafetyStatus::Critical(_)));
+        assert!(!is_sim);
+
+        let mut raw = fixtures::healthy_real();
+        raw.gpu_temp_c = Some(f32::NAN);
+        let frame = assess(&raw, fixtures::NOW);
+        let (status, is_sim) = HardwareBridge::check_safety(&frame);
+        assert!(matches!(status, SafetyStatus::Critical(_)));
+        assert!(!is_sim);
+
+        let mut raw = fixtures::healthy_real();
+        raw.power_w = Some(f32::INFINITY);
+        let frame = assess(&raw, fixtures::NOW);
+        let (status, is_sim) = HardwareBridge::check_safety(&frame);
+        assert!(matches!(status, SafetyStatus::Critical(_)));
+        assert!(!is_sim);
+    }
+
+    #[test]
+    fn test_safety_critical_on_stale_and_out_of_range() {
+        let stale = assess(&fixtures::stale(), fixtures::NOW);
+        let (status, is_sim) = HardwareBridge::check_safety(&stale);
+        assert!(matches!(status, SafetyStatus::Critical(ref msg) if msg.contains("stale")));
+        assert!(!is_sim);
+
+        let oor = assess(&fixtures::out_of_range(), fixtures::NOW);
+        let (status, is_sim) = HardwareBridge::check_safety(&oor);
+        assert!(matches!(status, SafetyStatus::Critical(ref msg) if msg.contains("invalid")));
+        assert!(!is_sim);
     }
 
     #[test]
@@ -285,6 +443,17 @@ mod tests {
             unavail.source
         );
         assert_ne!(unavail.source, TelemetrySource::SoftwareFallback);
+    }
+
+    #[test]
+    fn test_nvml_unavailable_fail_closes_safety() {
+        let frame = assess(&fixtures::nvml_unavailable(), fixtures::NOW);
+        let (status, is_sim) = HardwareBridge::check_safety(&frame);
+        assert!(matches!(status, SafetyStatus::Critical(ref msg) if msg.contains("missing")));
+        assert!(!is_sim);
+        assert_eq!(frame.source, TelemetrySource::NvmlUnavailable);
+        assert_eq!(frame.gpu_temp_c.value, None);
+        assert_eq!(frame.power_w.value, None);
     }
 
     #[test]
@@ -318,16 +487,37 @@ mod tests {
         );
         assert_eq!(frame.vram_temp_c.value, None);
         assert_eq!(frame.vram_temp_c.validity, SampleValidity::Missing);
-        // Classification of a simulated frame belongs to `crate::safety`.
-        let assessment = classify(&frame);
-        assert_eq!(assessment.status, SafetyStatus::Ok);
-        assert!(assessment.simulated);
+        let (status, is_sim) = HardwareBridge::check_safety(&frame);
+        assert_eq!(status, SafetyStatus::Ok);
+        assert!(is_sim);
     }
 
     #[test]
     fn test_is_gpu_healthy_does_not_panic() {
         let result = std::panic::catch_unwind(HardwareBridge::is_gpu_healthy);
         assert!(result.is_ok(), "is_gpu_healthy should not panic");
+    }
+
+    /// Without a real GPU (no NVML), actuation must fail closed with a typed
+    /// [`ActuatorError`] rather than inventing a wattage or panicking.
+    #[test]
+    fn test_nvml_actuator_fails_closed_without_gpu() {
+        // In CI there is no NVIDIA device, so NVML queries return None and every
+        // actuation path must surface a typed error / no match.
+        if query_default_power_limit_w().is_some() || query_power_limit_w().is_some() {
+            // A real GPU is present (unusual in CI) — skip the fail-closed asserts.
+            return;
+        }
+        let actuator = NvmlActuator::new();
+        assert_eq!(
+            actuator.apply_emergency_brake(0.5),
+            Err(ActuatorError::PowerLimitUnavailable)
+        );
+        assert_eq!(
+            actuator.release_emergency_brake(),
+            Err(ActuatorError::PowerLimitUnavailable)
+        );
+        assert_eq!(actuator.detect_engaged_brake(0.5), None);
     }
 
     #[test]
@@ -352,27 +542,5 @@ mod tests {
         assert_eq!(util.raw, Some(0.0));
         assert_eq!(util.normalized, Some(0.0));
         assert_eq!(util.validity, SampleValidity::Valid);
-    }
-
-    /// Without a real GPU (no NVML), actuation must fail closed with a typed
-    /// [`ActuatorError`] rather than inventing a wattage or panicking.
-    #[test]
-    fn test_nvml_actuator_fails_closed_without_gpu() {
-        // These tests run in CI without an NVIDIA device, so NVML queries return
-        // None and every actuation path must surface a typed error / no match.
-        if query_default_power_limit_w().is_some() || query_power_limit_w().is_some() {
-            // A real GPU is present (unusual in CI) — skip the fail-closed asserts.
-            return;
-        }
-        let actuator = NvmlActuator::new();
-        assert_eq!(
-            actuator.apply_emergency_brake(0.5),
-            Err(ActuatorError::PowerLimitUnavailable)
-        );
-        assert_eq!(
-            actuator.release_emergency_brake(),
-            Err(ActuatorError::PowerLimitUnavailable)
-        );
-        assert_eq!(actuator.detect_engaged_brake(0.5), None);
     }
 }

@@ -4,42 +4,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thalamic_relay::cpu::{self, RelayMetrics};
 use thalamic_relay::gpu::{HardwareBridge, NvmlActuator};
+use thalamic_relay::publish::{AbsentPublisher, SensoryPublisher, evaluate_then_try_publish};
 use thalamic_relay::safety::{
-    self, ActuatorError, BRAKE_FRACTION, BrakeCommand, SafetyActuator, SafetyStateMachine,
-    SafetyStatus,
+    ActuatorError, ActuatorOutcome, BRAKE_FRACTION, BrakeIntent, SafetyActuator, SafetyMachine,
+    SafetySnapshot, SafetyState,
 };
 use thalamic_relay::telemetry::{SampleValidity, TelemetryFrame, TelemetrySample, TelemetrySource};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
-
-/// Handle to an in-flight privileged actuation attempt.
-type ActuationTask = JoinHandle<Result<(), ActuatorError>>;
-
-/// Dispatch a [`BrakeCommand`] onto a blocking worker so the telemetry loop is
-/// never stalled by `nvidia-smi`. The [`SafetyStateMachine`] already tracks
-/// in-flight actuation, so at most one apply and one release run concurrently.
-fn dispatch(
-    command: Option<BrakeCommand>,
-    actuator: &Arc<dyn SafetyActuator>,
-    brake_task: &mut Option<ActuationTask>,
-    release_task: &mut Option<ActuationTask>,
-) {
-    match command {
-        Some(BrakeCommand::Apply) if brake_task.is_none() => {
-            let actuator = Arc::clone(actuator);
-            *brake_task = Some(tokio::task::spawn_blocking(move || {
-                actuator.apply_emergency_brake(BRAKE_FRACTION)
-            }));
-        }
-        Some(BrakeCommand::Release) if release_task.is_none() => {
-            let actuator = Arc::clone(actuator);
-            *release_task = Some(tokio::task::spawn_blocking(move || {
-                actuator.release_emergency_brake()
-            }));
-        }
-        _ => {}
-    }
-}
 
 #[derive(Debug)]
 struct LockGuard(String);
@@ -129,132 +101,220 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut step_count: u64 = 0;
+    let mut machine = SafetyMachine::new();
+    let publisher = AbsentPublisher;
     let mut warned_brake_held_sim = false;
     let mut brake_task: Option<ActuationTask> = None;
     let mut release_task: Option<ActuationTask> = None;
 
     // Privileged NVML/nvidia-smi actuation backend. The supervisor only ever
-    // talks to it through the pure `SafetyStateMachine`; all safety semantics
-    // live in `thalamic_relay::safety`, never in the NVIDIA adapter.
+    // reaches hardware through this `SafetyActuator`; all safety semantics live
+    // in `thalamic_relay::safety`, never in the NVIDIA adapter (GH#46).
     let actuator: Arc<dyn SafetyActuator> = Arc::new(NvmlActuator::new());
 
     // Detect leftover throttle from a prior crash (hardware PL persists across process restarts).
-    // Only seed the engaged state when the current limit matches this relay's expected brake
+    // Only seed brake_applied when the current limit matches this relay's expected 50% brake
     // target, so deliberate operator-set sub-default caps are not auto-restored to default.
-    let mut machine = match actuator.detect_engaged_brake(BRAKE_FRACTION) {
-        Some(m) => {
-            eprintln!(
-                "[relay] WARNING: GPU power limit {}W matches expected emergency brake \
-                 target {}W (default {}W); will auto-release after Ok streak",
-                m.current_w, m.expected_w, m.default_w
-            );
-            SafetyStateMachine::with_brake_engaged()
+    if let Some(m) = actuator.detect_engaged_brake(BRAKE_FRACTION) {
+        eprintln!(
+            "[relay] WARNING: GPU power limit {}W matches expected emergency brake \
+             target {}W (default {}W); will auto-release after Ok streak",
+            m.current_w, m.expected_w, m.default_w
+        );
+        machine.seed_brake_applied();
+        let seed = machine.snapshot();
+        {
+            let mut metrics = relay_metrics.lock().unwrap();
+            cpu::record_safety_snapshot(&mut metrics, &seed);
         }
-        None => SafetyStateMachine::new(),
-    };
+    }
 
     loop {
         step_count += 1;
         let telemetry =
             HardwareBridge::read_telemetry_with(cli.force_software_only, cli.step_interval_ms);
 
-        // Reap any finished actuation, feed the outcome back into the pure state
-        // machine, then re-evaluate immediately so a completed apply/release does
-        // not wait a full safety cadence to be reconciled.
-        let mut reassessed_this_iter = false;
-        if brake_task.as_ref().is_some_and(JoinHandle::is_finished) {
+        let mut evaluated_this_iter = false;
+
+        if brake_task.as_ref().is_some_and(|task| task.is_finished()) {
             let task = brake_task.take().expect("finished brake task exists");
             match task.await {
-                Ok(Ok(())) => machine.on_apply_result(true),
+                Ok(Ok(())) => {
+                    let snap = machine.record_actuator(ActuatorOutcome::Applied);
+                    store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
+                    let force_software_only = cli.force_software_only;
+                    let cadence_ms = cli.step_interval_ms;
+                    let post_telemetry = tokio::task::spawn_blocking(move || {
+                        HardwareBridge::read_telemetry_with(force_software_only, cadence_ms)
+                    })
+                    .await
+                    .expect("post-brake telemetry read task panicked");
+                    let (snap, pub_res) =
+                        evaluate_then_try_publish(&mut machine, &post_telemetry, &publisher);
+                    let _ = pub_res;
+                    store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
+                    spawn_intent(&snap, &actuator, &mut brake_task, &mut release_task);
+                    evaluated_this_iter = true;
+                }
                 Ok(Err(e)) => {
                     eprintln!("[relay] Emergency brake failed: {e}");
-                    machine.on_apply_result(false);
+                    let snap = machine.record_actuator(ActuatorOutcome::ApplyFailed(e.to_string()));
+                    store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
+                    // Retry on the safety cadence / first-frame path, not every tick.
                 }
                 Err(e) => {
                     eprintln!("[relay] Brake task panicked: {e}");
-                    machine.on_apply_result(false);
+                    let snap = machine.record_actuator(ActuatorOutcome::ApplyFailed(e.to_string()));
+                    store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
                 }
             }
-            let assessment = safety::classify(&telemetry);
-            dispatch(
-                machine.observe(&assessment.status, assessment.simulated),
-                &actuator,
-                &mut brake_task,
-                &mut release_task,
-            );
-            reassessed_this_iter = true;
         }
-        if release_task.as_ref().is_some_and(JoinHandle::is_finished) {
+        if release_task.as_ref().is_some_and(|task| task.is_finished()) {
             let task = release_task.take().expect("finished release task exists");
             match task.await {
-                Ok(Ok(())) => machine.on_release_result(true),
+                Ok(Ok(())) => {
+                    let snap = machine.record_actuator(ActuatorOutcome::Released);
+                    store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
+                    let force_software_only = cli.force_software_only;
+                    let cadence_ms = cli.step_interval_ms;
+                    let post_telemetry = tokio::task::spawn_blocking(move || {
+                        HardwareBridge::read_telemetry_with(force_software_only, cadence_ms)
+                    })
+                    .await
+                    .expect("post-release telemetry read task panicked");
+                    let (snap, pub_res) =
+                        evaluate_then_try_publish(&mut machine, &post_telemetry, &publisher);
+                    let _ = pub_res;
+                    store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
+                    spawn_intent(&snap, &actuator, &mut brake_task, &mut release_task);
+                    evaluated_this_iter = true;
+                }
                 Ok(Err(e)) => {
                     eprintln!("[relay] Brake release failed: {e}");
-                    machine.on_release_result(false);
+                    let snap =
+                        machine.record_actuator(ActuatorOutcome::ReleaseFailed(e.to_string()));
+                    store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
+                    // Retry on the safety cadence / first-frame path, not every tick.
                 }
                 Err(e) => {
                     eprintln!("[relay] Brake release task panicked: {e}");
-                    machine.on_release_result(false);
+                    let snap =
+                        machine.record_actuator(ActuatorOutcome::ReleaseFailed(e.to_string()));
+                    store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
                 }
             }
-            let assessment = safety::classify(&telemetry);
-            if matches!(
-                assessment.status,
-                SafetyStatus::Critical(_) | SafetyStatus::Warn(_)
-            ) {
-                eprintln!("[relay] Safety not clear after brake release, re-evaluating brake");
-            }
-            dispatch(
-                machine.observe(&assessment.status, assessment.simulated),
-                &actuator,
-                &mut brake_task,
-                &mut release_task,
-            );
-            reassessed_this_iter = true;
         }
 
-        // Periodic safety check every 10 steps (rate scales with step_interval_ms).
-        if step_count.is_multiple_of(10) && !reassessed_this_iter {
-            let assessment = safety::classify(&telemetry);
-            match &assessment.status {
-                SafetyStatus::Critical(msg) => eprintln!("[relay] SAFETY CRITICAL: {msg}"),
-                SafetyStatus::Warn(msg) => eprintln!("[relay] SAFETY WARN: {msg}"),
-                SafetyStatus::Ok if assessment.simulated && machine.brake_engaged() => {
-                    // Hold the brake: simulated telemetry cannot confirm a safe
-                    // release. Log once per simulated episode to avoid flooding.
-                    if !warned_brake_held_sim {
-                        eprintln!(
-                            "[relay] SAFETY: brake held — telemetry is simulated (no real GPU readings to confirm safe release)"
-                        );
-                        warned_brake_held_sim = true;
-                    }
-                }
-                SafetyStatus::Ok => {}
-            }
-            if !assessment.simulated {
-                warned_brake_held_sim = false;
-            }
-            dispatch(
-                machine.observe(&assessment.status, assessment.simulated),
-                &actuator,
-                &mut brake_task,
-                &mut release_task,
-            );
+        // First acquired frame is evaluated immediately (fail-closed startup).
+        // Later evaluations keep the every-10-ticks cadence.
+        // Do not spawn from the pre-telemetry snapshot: SoftwareFallback holds
+        // rather than applies, which only classify_frame can decide.
+        if !evaluated_this_iter && (step_count == 1 || step_count.is_multiple_of(10)) {
+            let (snap, pub_res) = evaluate_then_try_publish(&mut machine, &telemetry, &publisher);
+            let _ = pub_res;
+            store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
+            spawn_intent(&snap, &actuator, &mut brake_task, &mut release_task);
+        } else {
+            // Publication is outside the safety critical path and never awaited.
+            let _ = publisher.try_publish(&telemetry.to_sensory_mapping());
         }
 
-        // Store acquired_at; collector computes freshness at scrape/export time.
         {
             let mut metrics = relay_metrics.lock().unwrap();
             metrics.telemetry_acquired_at = Some(telemetry.acquired_at);
         }
 
-        print_dashboard(&telemetry, step_count);
+        print_dashboard(&telemetry, step_count, machine.snapshot().state);
 
         sleep(Duration::from_millis(cli.step_interval_ms)).await;
     }
 }
 
-fn print_dashboard(frame: &TelemetryFrame, step: u64) {
+fn store_safety(
+    relay_metrics: &Arc<Mutex<RelayMetrics>>,
+    snap: &SafetySnapshot,
+    warned_brake_held_sim: &mut bool,
+) {
+    log_safety_snapshot(snap, warned_brake_held_sim);
+    let mut metrics = relay_metrics.lock().unwrap();
+    cpu::record_safety_snapshot(&mut metrics, snap);
+}
+
+fn log_safety_snapshot(snap: &SafetySnapshot, warned_brake_held_sim: &mut bool) {
+    if let Some((from, to)) = snap.transition {
+        eprintln!(
+            "[relay] safety {} → {} ({})",
+            from.as_str(),
+            to.as_str(),
+            snap.last_reason
+        );
+    }
+    match snap.state {
+        SafetyState::CriticalBraked
+        | SafetyState::TelemetryMissing
+        | SafetyState::TelemetryStale
+        | SafetyState::TelemetryInvalid => {
+            if snap.transition.is_some() {
+                eprintln!("[relay] SAFETY CRITICAL: {}", snap.last_reason);
+            }
+        }
+        SafetyState::Warning => {
+            if snap.transition.is_some() {
+                eprintln!("[relay] SAFETY WARN: {}", snap.last_reason);
+            }
+        }
+        SafetyState::SimulatedSoftwareOnly if snap.brake_engaged => {
+            if !*warned_brake_held_sim {
+                eprintln!(
+                    "[relay] SAFETY: brake held — telemetry is simulated (no real GPU readings to confirm safe release)"
+                );
+                *warned_brake_held_sim = true;
+            }
+        }
+        SafetyState::ActuatorFailure => {
+            if snap.actuator_failed
+                && let Some(err) = &snap.last_actuator_error
+            {
+                eprintln!("[relay] SAFETY actuator failure: {err}");
+            }
+        }
+        SafetyState::HealthyReal | SafetyState::Recovering | SafetyState::SimulatedSoftwareOnly => {
+            *warned_brake_held_sim = false;
+        }
+    }
+}
+
+/// Handle to an in-flight privileged actuation attempt.
+type ActuationTask = JoinHandle<Result<(), ActuatorError>>;
+
+/// Dispatch the machine's [`BrakeIntent`] onto a blocking worker so the
+/// telemetry loop is never stalled by `nvidia-smi`. Actuation always goes
+/// through the [`SafetyActuator`] boundary; the outcome is fed back into the
+/// pure [`SafetyMachine`] by the caller.
+fn spawn_intent(
+    snap: &SafetySnapshot,
+    actuator: &Arc<dyn SafetyActuator>,
+    brake_task: &mut Option<ActuationTask>,
+    release_task: &mut Option<ActuationTask>,
+) {
+    match snap.intent {
+        BrakeIntent::Apply if brake_task.is_none() && release_task.is_none() => {
+            let actuator = Arc::clone(actuator);
+            *brake_task = Some(tokio::task::spawn_blocking(move || {
+                actuator.apply_emergency_brake(BRAKE_FRACTION)
+            }));
+        }
+        BrakeIntent::Release if release_task.is_none() && brake_task.is_none() => {
+            let actuator = Arc::clone(actuator);
+            *release_task = Some(tokio::task::spawn_blocking(move || {
+                actuator.release_emergency_brake()
+            }));
+        }
+        _ => {}
+    }
+}
+
+fn print_dashboard(frame: &TelemetryFrame, step: u64, safety: SafetyState) {
     let pwr = format_live_reading(&frame.power_w, |w| format!("{w:5.1}W"));
     let vddcr = format_live_reading(&frame.vddcr_gfx_v, |v| format!("{v:.3}V"));
     let tag = match frame.source {
@@ -262,7 +322,10 @@ fn print_dashboard(frame: &TelemetryFrame, step: u64) {
         TelemetrySource::NvmlUnavailable => " [unavail]",
         TelemetrySource::Nvml => "",
     };
-    print!("\r[Step {step}] Pwr: {pwr} | Vddcr: {vddcr}{tag}   ");
+    print!(
+        "\r[Step {step}] Pwr: {pwr} | Vddcr: {vddcr}{tag} | safety: {}   ",
+        safety.as_str()
+    );
     let _ = io::stdout().flush();
 }
 

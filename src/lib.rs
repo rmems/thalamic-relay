@@ -1,12 +1,12 @@
 //! Thalamic Relay — sensory + hardware-safety library.
 //!
 //! Typed telemetry (validity, freshness, provenance, normalization) lives in
-//! [`telemetry`]. Pure safety policy — instantaneous classification, brake
-//! hysteresis, and the [`safety::SafetyActuator`] boundary — lives in
-//! [`safety`]. GPU telemetry acquisition and the privileged NVML/`nvidia-smi`
-//! actuation backend live in [`gpu`].
+//! [`telemetry`]. Pure safety evaluation lives in [`safety`]. GPU acquisition
+//! and privileged actuation live in [`gpu`]. Sensory publication is a
+//! non-blocking stub in [`publish`] (transport is GH#40).
 
 pub mod cpu;
 pub mod gpu;
+pub mod publish;
 pub mod safety;
 pub mod telemetry;

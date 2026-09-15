@@ -1,4 +1,4 @@
-use metrics::gauge;
+use metrics::{counter, gauge};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -6,13 +6,30 @@ use tokio::time::sleep;
 use tracing::{Level, info};
 use tracing_subscriber::FmtSubscriber;
 
+use crate::safety::{SafetySnapshot, SafetyState};
 use crate::telemetry::{UnixMillis, unix_now_ms};
 
-/// Shared telemetry state populated by the main loop.
+/// Shared telemetry + safety state populated by the main loop.
 /// Freshness is computed at scrape/export time from [`Self::telemetry_acquired_at`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RelayMetrics {
     pub telemetry_acquired_at: Option<UnixMillis>,
+    pub safety_state: SafetyState,
+    pub policy_state: SafetyState,
+    pub brake_engaged: bool,
+    pub hysteresis_ok_count: u32,
+}
+
+impl Default for RelayMetrics {
+    fn default() -> Self {
+        Self {
+            telemetry_acquired_at: None,
+            safety_state: SafetyState::TelemetryMissing,
+            policy_state: SafetyState::TelemetryMissing,
+            brake_engaged: false,
+            hysteresis_ok_count: 0,
+        }
+    }
 }
 
 /// Age of the last sample in seconds. `None` acquired_at is 0 (no sample yet).
@@ -21,6 +38,47 @@ pub fn freshness_seconds(acquired_at: Option<UnixMillis>, now: UnixMillis) -> f6
     acquired_at
         .map(|ts| now.saturating_sub(ts) as f64 / 1000.0)
         .unwrap_or(0.0)
+}
+
+/// Copy a safety snapshot into shared metrics and increment event counters.
+pub fn record_safety_snapshot(metrics: &mut RelayMetrics, snap: &SafetySnapshot) {
+    metrics.safety_state = snap.state;
+    metrics.policy_state = snap.policy_state;
+    metrics.brake_engaged = snap.brake_engaged;
+    metrics.hysteresis_ok_count = snap.hysteresis_ok_count;
+    export_safety_gauges(
+        snap.state,
+        snap.policy_state,
+        snap.brake_engaged,
+        snap.hysteresis_ok_count,
+    );
+    if snap.transition.is_some() {
+        counter!("safety_transitions_total").increment(1);
+    }
+    if snap.actuator_failed {
+        counter!("safety_actuator_failures_total").increment(1);
+    }
+}
+
+/// One-hot + numeric safety gauges. Safe to call from the collector refresh.
+pub fn export_safety_gauges(
+    state: SafetyState,
+    policy_state: SafetyState,
+    brake_engaged: bool,
+    hysteresis_ok_count: u32,
+) {
+    for s in SafetyState::ALL {
+        gauge!("safety_state", "state" => s.as_str()).set(if s == state { 1.0 } else { 0.0 });
+        gauge!("safety_policy_state", "state" => s.as_str()).set(if s == policy_state {
+            1.0
+        } else {
+            0.0
+        });
+    }
+    gauge!("safety_state_id").set(f64::from(state.as_id()));
+    gauge!("safety_policy_state_id").set(f64::from(policy_state.as_id()));
+    gauge!("safety_brake_engaged").set(if brake_engaged { 1.0 } else { 0.0 });
+    gauge!("safety_hysteresis_ok_count").set(f64::from(hysteresis_ok_count));
 }
 
 /// Sets up our logging and metrics engines.
@@ -64,8 +122,13 @@ pub async fn run_metrics_collector(metrics: Arc<Mutex<RelayMetrics>>) {
             snapshot.telemetry_acquired_at,
             unix_now_ms(),
         ));
+        export_safety_gauges(
+            snapshot.safety_state,
+            snapshot.policy_state,
+            snapshot.brake_engaged,
+            snapshot.hysteresis_ok_count,
+        );
 
-        // Simulate tick rate
         sleep(Duration::from_secs(2)).await;
     }
 }
@@ -73,11 +136,16 @@ pub async fn run_metrics_collector(metrics: Arc<Mutex<RelayMetrics>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::safety::{BrakeIntent, SafetyMachine, SafetyState};
+    use crate::telemetry::{assess, fixtures};
 
     #[test]
     fn relay_metrics_default_values() {
         let m = RelayMetrics::default();
         assert_eq!(m.telemetry_acquired_at, None);
+        assert_eq!(m.safety_state, SafetyState::TelemetryMissing);
+        assert_eq!(m.policy_state, SafetyState::TelemetryMissing);
+        assert!(!m.brake_engaged);
         assert_eq!(freshness_seconds(None, 1_000), 0.0);
     }
 
@@ -89,5 +157,19 @@ mod tests {
         assert!((early - 1.5).abs() < f64::EPSILON);
         assert!((later - 4.0).abs() < f64::EPSILON);
         assert!(later > early);
+    }
+
+    #[test]
+    fn record_safety_snapshot_copies_state_and_brake() {
+        let mut metrics = RelayMetrics::default();
+        let mut machine = SafetyMachine::new();
+        let mut raw = fixtures::healthy_real();
+        raw.gpu_temp_c = Some(90.0);
+        let snap = machine.evaluate(&assess(&raw, fixtures::NOW));
+        assert_eq!(snap.intent, BrakeIntent::Apply);
+        record_safety_snapshot(&mut metrics, &snap);
+        assert_eq!(metrics.safety_state, SafetyState::CriticalBraked);
+        assert!(!metrics.brake_engaged);
+        assert_eq!(metrics.policy_state, SafetyState::CriticalBraked);
     }
 }

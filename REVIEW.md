@@ -7,8 +7,10 @@ cargo test                    # all tests
 cargo test --lib              # src/lib.rs tests (telemetry + gpu + cpu)
 cargo test --bin thalamic-relay  # src/main.rs tests only (6)
 cargo test telemetry          # typed contract / fixtures
-cargo test gpu                # gpu safety + acquisition tests
-cargo test cpu                # cpu metrics tests (1)
+cargo test gpu                # gpu acquisition + check_safety facade
+cargo test safety              # SafetyMachine + named states (no GPU)
+cargo test publish             # IPC isolation / failing publisher
+cargo test cpu                # cpu metrics tests
 cargo test test_safety        # safety-related tests
 cargo test lock_guard         # single-instance lockfile tests
 ```
@@ -40,7 +42,7 @@ cargo test lock_guard         # single-instance lockfile tests
 | lib.rs | `test_safety_critical_on_high_power` | >350W critical threshold |
 | lib.rs | `test_safety_critical_on_non_finite_telemetry` | NaN/Inf telemetry handling |
 | lib.rs | `test_safety_critical_on_unknown_power_with_real_temperature` | Missing power with real temp |
-| lib.rs | `test_warn_from_frame_fail_closes_on_missing_temp_or_power` | Missing/None does not skip warn logic |
+| lib.rs | `test_check_safety_fail_closes_on_missing_temp_or_power` | Missing/None does not skip safety |
 | lib.rs | `test_nvml_unavailable_fail_closes_safety` | Unavailable NVML is not simulated |
 | lib.rs | `test_acquire_raw_force_software_is_fallback_not_unavailable` | force vs unavailable provenance |
 | lib.rs | `future_observed_at_is_invalid_not_valid` | Future timestamps are Invalid |
@@ -51,6 +53,9 @@ cargo test lock_guard         # single-instance lockfile tests
 | lib.rs | `test_safety_critical_on_stale_and_out_of_range` | Stale/OOR fail closed |
 | lib.rs | `test_sensory_mapping_from_software_fallback_carries_provenance` | Mapping carries fallback source |
 | lib.rs | `relay_metrics_default_values` | RelayMetrics default acquired_at |
+| lib.rs | `record_safety_snapshot_copies_state_and_brake` | Shared metrics copy safety snapshot |
+| lib.rs | `healthy_real_is_named_state` … `transitions_are_counted` | `SafetyMachine` GPU-less transitions (`src/safety.rs`) |
+| lib.rs | `absent_brainstem_does_not_block_or_change_safety` … | IPC/Brainstem absence cannot stall safety (`src/publish.rs`) |
 | main.rs | `dashboard_shows_only_valid_present_as_live_hardware` | Dashboard hides stale/invalid/missing |
 | main.rs | `parses_custom_args_and_env_equiv` | CLI flag parsing |
 | main.rs | `parses_defaults` | CLI defaults |
@@ -74,8 +79,8 @@ with that code. See [`docs/ipc.md`](docs/ipc.md).
 ### Gaps explicitly deferred
 
 - `cpu::init_telemetry` / `cpu::run_metrics_collector`: bind a network port and run an indefinite loop; not safely unit-testable without an integration harness.
-- `NvmlActuator` (`apply_emergency_brake` / `release_emergency_brake` / `detect_engaged_brake`): the NVML/`nvidia-smi` backend requires a real NVML-capable GPU and can mutate board power limits, so its hardware path is intentionally not exercised in software-only CI. It fails closed with a typed `ActuatorError` when NVML is unavailable (regression-tested), and the brake/release *policy* it serves is unit-tested via the pure `safety::SafetyStateMachine` + `safety::FakeActuator`.
-- The `main` async supervisor loop: covered by manual run instructions and end-to-end smoke tests rather than unit tests. Dashboard reading formatting is unit-tested, and the safety decisions the loop drives are unit-tested in `safety`.
+- `NvmlActuator` (`apply_emergency_brake` / `release_emergency_brake` / `detect_engaged_brake`, GH#46): the NVML/`nvidia-smi` backend requires a real NVML-capable GPU and can mutate board power limits, so its hardware path is intentionally not exercised in software-only CI. It fails closed with a typed `ActuatorError` when NVML is unavailable (regression-tested), and the brake/release *policy* it serves is unit-tested via `SafetyMachine` plus the in-memory `safety::FakeActuator`.
+- The `main` async supervisor loop: covered by manual run instructions and end-to-end smoke tests rather than unit tests. Dashboard reading formatting is unit-tested. Hysteresis and IPC isolation are unit-tested via `SafetyMachine` / `evaluate_then_try_publish` without driving `main`, and the actuation boundary is exercised through the `SafetyActuator` trait with `FakeActuator`.
 
 ## Linting
 
