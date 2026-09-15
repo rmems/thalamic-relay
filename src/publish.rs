@@ -24,7 +24,11 @@ pub enum PublishError {
 }
 
 /// Best-effort sensory publisher. Must not block the safety loop.
+///
+/// There is currently no `corpus-ipc` implementation of this trait in-tree.
+/// Production uses [`AbsentPublisher`].
 pub trait SensoryPublisher: Send + Sync {
+    /// Attempt to publish `mapping` without waiting on a consumer.
     fn try_publish(&self, mapping: &SensoryMapping) -> Result<(), PublishError>;
 }
 
@@ -41,10 +45,12 @@ impl SensoryPublisher for AbsentPublisher {
 /// Test double that fails every send without blocking.
 #[derive(Debug, Clone)]
 pub struct FailingPublisher {
+    /// Reason string copied into [`PublishError::SendFailed`].
     pub reason: String,
 }
 
 impl FailingPublisher {
+    /// Fail every publish with [`PublishError::SendFailed`].
     #[must_use]
     pub fn send_failed() -> Self {
         Self {
@@ -52,6 +58,7 @@ impl FailingPublisher {
         }
     }
 
+    /// Fail every publish with a disconnected-style [`PublishError::SendFailed`].
     #[must_use]
     pub fn disconnected() -> Self {
         Self {

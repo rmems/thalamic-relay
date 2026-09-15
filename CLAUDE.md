@@ -10,7 +10,7 @@ here too) — this file adds Claude-specific workflow notes and defers to
 `thalamic-relay` — a Rust CLI (binary `thalamic-relay`) that observes hardware
 telemetry and provides deterministic hardware safety (thermal/power emergency
 brake) for the Spikenaut runtime stack, exposing Prometheus metrics.
-Software-only; no FPGA/silicon-bridge dependency. It does **not** run any
+No FPGA/silicon-bridge dependency. It does **not** run any
 neural computation itself — the in-process SNN it used to step was removed
 in [RM-1143 / GH#39](https://github.com/rmems/thalamic-relay/issues/39);
 neural execution lives in `brainstem-daemon`.

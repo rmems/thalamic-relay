@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Docs:** Crate-level rustdoc, README, CLI help, and `docs/*.md` now describe
+  the sensory + deterministic safety boundary only (no in-process SNN).
+  Documented software-only vs `NvmlUnavailable`, GPU power-limit privilege
+  requirements (`sudo -n nvidia-smi`), deterministic vs best-effort guarantees,
+  and that `corpus-ipc` transport is not implemented. Added a GPU-less library
+  example (`examples/software_only.rs` and a rustdoc doctest). `docs.rs`
+  builds with `RUSTDOCFLAGS="-D warnings"`.
 - **Safety actuation boundary (GH#46):** Extracted privileged GPU actuation behind a `SafetyActuator` trait in `safety`, complementing the pure `SafetyMachine` policy (GH#42). The NVML/`nvidia-smi` backend is now `NvmlActuator` in `gpu` — a hardware adapter that implements the trait but defines no safety semantics. Actuator failures are typed and observable (`ActuatorError`) instead of stringly coupled to the supervisor, startup brake detection returns a typed `BrakeMatch`, and an in-memory `FakeActuator` enables deterministic apply/release tests with no GPU or subprocess. The supervisor drives actuation through `Arc<dyn SafetyActuator>`, preserving fail-closed behavior.
 - **Breaking (internal):** Replaced numeric `GpuTelemetry` fields with a typed `TelemetrySample` contract (`Option` values, explicit source/validity/unit/freshness). Software-only mode is tagged `TelemetrySource::SoftwareFallback` and is no longer inferred from `temperature <= 0 && power <= 25`. Missing sensors stay `None` instead of silent `0.0`/`NaN`. See `docs/telemetry.md` (GH#41)
 - Added `TelemetryFrame::to_sensory_mapping()` as the deterministic mapping surface toward corpus-ipc (transport remains GH#40)

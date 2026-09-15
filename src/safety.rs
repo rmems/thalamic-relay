@@ -6,7 +6,8 @@
 //! power-limit actuation stays in [`crate::gpu`]; sensory publication lives
 //! in [`crate::publish`] and must never be awaited on this path.
 //!
-//! Transition rules: [`docs/safety.md`](../../docs/safety.md).
+//! Named states and hysteresis are documented in the repository file
+//! `docs/safety.md`. This machine does not run neural computation.
 
 use crate::telemetry::{SampleValidity, TelemetryFrame, TelemetrySample, TelemetrySource};
 use std::sync::Mutex;
@@ -31,8 +32,11 @@ pub const POWER_CRITICAL_W: f32 = 350.0;
 /// real GPU to protect. Stateful relay names live in [`SafetyState`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum SafetyStatus {
+    /// Below warn thresholds (or simulated software-only).
     Ok,
+    /// Valid telemetry in the warn band.
     Warn(String),
+    /// Fail-closed or thermal/power critical.
     Critical(String),
 }
 
@@ -109,8 +113,11 @@ impl SafetyState {
 /// Brake command the supervisor may dispatch to the GPU actuator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrakeIntent {
+    /// No privileged command this step.
     None,
+    /// Supervisor should call [`SafetyActuator::apply_emergency_brake`].
     Apply,
+    /// Supervisor should call [`SafetyActuator::release_emergency_brake`].
     Release,
 }
 
@@ -118,28 +125,41 @@ pub enum BrakeIntent {
 /// the machine never executes the command itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActuatorOutcome {
+    /// Apply succeeded; brake is claimed engaged.
     Applied,
+    /// Apply failed; brake is not claimed engaged.
     ApplyFailed(String),
+    /// Release succeeded; brake is claimed disengaged.
     Released,
+    /// Release failed; previous engaged claim is kept.
     ReleaseFailed(String),
 }
 
 /// Stateless classification of one frame (no hysteresis, no actuator).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssessmentKind {
+    /// [`TelemetrySource::SoftwareFallback`] (forced software-only).
     Simulated,
+    /// Safety-critical sample missing.
     Missing,
+    /// Safety-critical sample non-finite or out of range.
     Invalid,
+    /// Safety-critical sample older than its stale threshold.
     Stale,
+    /// Valid telemetry above critical thermal/power limits.
     Critical,
+    /// Valid telemetry in the warn band.
     Warn,
+    /// Valid telemetry below warn thresholds.
     Ok,
 }
 
 /// Frame assessment with a human-readable reason for logs/metrics.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FrameAssessment {
+    /// Classification used by [`SafetyMachine`] policy.
     pub kind: AssessmentKind,
+    /// Human-readable reason for logs and snapshots.
     pub reason: String,
 }
 
@@ -150,18 +170,26 @@ pub struct SafetySnapshot {
     pub state: SafetyState,
     /// Policy classification ignoring actuator overlay.
     pub policy_state: SafetyState,
+    /// Last successful apply still claimed.
     pub brake_engaged: bool,
+    /// Whether policy wants the brake on after this step.
     pub desired_brake: bool,
+    /// Privileged command the supervisor may dispatch.
     pub intent: BrakeIntent,
+    /// Consecutive real Ok evaluations while braked.
     pub hysteresis_ok_count: u32,
+    /// Reason string from the last classification or actuator record.
     pub last_reason: String,
+    /// Last apply/release error, if any (drives the overlay).
     pub last_actuator_error: Option<String>,
+    /// Previous → current reported state when it changed this step.
     pub transition: Option<(SafetyState, SafetyState)>,
     /// True when this step recorded a new actuator failure.
     pub actuator_failed: bool,
 }
 
 impl SafetySnapshot {
+    /// Derive [`BrakeIntent`] from desired versus claimed brake.
     #[must_use]
     pub fn intent_from(desired_brake: bool, brake_engaged: bool) -> BrakeIntent {
         match (desired_brake, brake_engaged) {
@@ -219,11 +247,13 @@ impl SafetyMachine {
         self.last_reason = "leftover emergency brake detected at startup".to_string();
     }
 
+    /// Count of reported-state changes since construction.
     #[must_use]
     pub fn transitions_total(&self) -> u64 {
         self.transitions_total
     }
 
+    /// Count of apply/release errors recorded since construction.
     #[must_use]
     pub fn actuator_failures_total(&self) -> u64 {
         self.actuator_failures_total
@@ -590,8 +620,11 @@ impl std::error::Error for ActuatorError {}
 /// A detected engaged brake: the current, default, and expected-brake limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BrakeMatch {
+    /// Current power-management limit in watts.
     pub current_w: u32,
+    /// Device default power-management limit in watts.
     pub default_w: u32,
+    /// This relay's expected brake target (`default * pct`) in watts.
     pub expected_w: u32,
 }
 

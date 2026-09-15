@@ -1,3 +1,9 @@
+//! Daemon observability plumbing: Prometheus exporter and shared safety gauges.
+//!
+//! Used by the `thalamic-relay` binary. This module does not evaluate safety
+//! policy and does not publish sensory frames. Binding the metrics listener is
+//! a process-global side effect.
+
 use metrics::{counter, gauge};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use std::sync::{Arc, Mutex};
@@ -10,13 +16,19 @@ use crate::safety::{SafetySnapshot, SafetyState};
 use crate::telemetry::{UnixMillis, unix_now_ms};
 
 /// Shared telemetry + safety state populated by the main loop.
+///
 /// Freshness is computed at scrape/export time from [`Self::telemetry_acquired_at`].
 #[derive(Debug, Clone)]
 pub struct RelayMetrics {
+    /// Unix-ms timestamp of the last assessed frame, if any.
     pub telemetry_acquired_at: Option<UnixMillis>,
+    /// Reported safety state (actuator-failure overlay included).
     pub safety_state: SafetyState,
+    /// Policy classification before the actuator-failure overlay.
     pub policy_state: SafetyState,
+    /// Last successful brake apply still claimed by the machine.
     pub brake_engaged: bool,
+    /// Consecutive real Ok evaluations while the brake is engaged.
     pub hysteresis_ok_count: u32,
 }
 

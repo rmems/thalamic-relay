@@ -9,10 +9,11 @@ disconnect, or a slow consumer. Brainstem has **no** authority to override
 Thalamic hard-safety policy — there is no IPC command that can inhibit the
 brake.
 
-Privileged `nvidia-smi` actuation stays in `src/gpu.rs`. The state machine
-in `src/safety.rs` only emits **intents**. Full actuator-trait extraction
-is GH#46; this crate keeps that split as a hook (pure machine, side-effect
-actuation in the supervisor).
+Privileged `nvidia-smi` actuation stays in `src/gpu.rs` behind
+`SafetyActuator` (`NvmlActuator` in production, `FakeActuator` in tests).
+The state machine in `src/safety.rs` only emits **intents**. Apply/release
+is best-effort and requires Linux, NVML, and passwordless `sudo -n nvidia-smi`
+(see the crate README).
 
 ## Ownership
 
@@ -23,7 +24,7 @@ actuation in the supervisor).
 | Power-limit apply/release | Thalamic (`gpu` actuator) |
 | Safety/brake state and transition/error counters | Thalamic Prometheus (`:9000/metrics`) |
 | Sensory mapping types | Thalamic (`TelemetryFrame::to_sensory_mapping`) |
-| Sensory transport to Brainstem | `corpus-ipc` (GH#40, not required for safety) |
+| Sensory transport to Brainstem | `corpus-ipc` (GH#40, **not implemented**; not required for safety) |
 | SNN tick, neuromodulation, neural state | Brainstem |
 | Reward / plasticity | Brainstem (never Thalamic) |
 
@@ -86,10 +87,10 @@ SafetySnapshot (state, brake, intent)
 ```
 
 Production currently uses [`AbsentPublisher`](../src/publish.rs) (Brainstem
-absent). GH#40 should plug a `corpus-ipc` publisher into
-`IsolatedPublishQueue` (bounded `try_send`). A full or disconnected queue
-is `SlowConsumer` / `Disconnected` and **must not** be `recv`'d from the
-safety loop.
+absent; **no `corpus-ipc` client in this crate**). GH#40 should plug a
+`corpus-ipc` publisher into `IsolatedPublishQueue` (bounded `try_send`). A
+full or disconnected queue is `SlowConsumer` / `Disconnected` and **must not**
+be `recv`'d from the safety loop.
 
 ## Prometheus
 
