@@ -3,7 +3,7 @@
 //! Typed telemetry (validity, freshness, provenance, normalization) lives in
 //! [`telemetry`]. Pure safety evaluation lives in [`safety`]. GPU acquisition
 //! and privileged actuation live in [`gpu`]. Sensory publication is a
-//! non-blocking stub in [`publish`] (transport is GH#40).
+//! bounded, non-blocking queue in [`publish`] (transport is GH#40).
 
 pub mod cpu;
 pub mod gpu;

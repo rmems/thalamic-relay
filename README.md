@@ -50,7 +50,8 @@ no authority to override Thalamic hard-safety.
   emergency brake and hysteresis-gated release. Independent of Brainstem and
   of any IPC publisher.
 - **Metrics Collection**: Prometheus-compatible metrics export (freshness,
-  safety state, brake state, transition and actuator-failure counters)
+  safety state, brake state, transition and actuator-failure counters,
+  outbound sensory-queue depth / capacity / drops)
 - **Process Safety**: Single-instance protection via a lockfile mechanism
 
 ## Installation
@@ -101,7 +102,7 @@ thalamic-relay
   - SafetyMachine (never waits on IPC)
   - privileged brake actuator
   - Prometheus safety/brake state
-      ↓  best-effort try_publish (drop on full / absent)
+      ↓  best-effort try_publish into a bounded queue (drop on full / absent)
 corpus-ipc          (follow-up work — GH#40; not required for safety)
       ↓
 brainstem-daemon
@@ -126,7 +127,7 @@ rules, and [`docs/telemetry.md`](docs/telemetry.md) for the sample contract.
 - **`telemetry`**: Typed sample contract (validity, freshness, provenance, normalization) and the corpus-ipc mapping surface
 - **`safety`**: Pure deterministic classification + hysteresis (`SafetyMachine`); no NVML, no IPC
 - **`gpu`**: Raw NVML acquisition and privileged power-limit actuation
-- **`publish`**: Non-blocking sensory publish stub (`AbsentPublisher`, `IsolatedPublishQueue`); transport is GH#40
+- **`publish`**: Bounded non-blocking sensory queue (`IsolatedPublishQueue`) with an explicit full-queue policy; `AbsentPublisher` remains for “no transport” tests. Drain/transport is GH#40
 - **`cpu`**: Telemetry initialization and metrics collection
 
 ### Key Components
@@ -134,7 +135,7 @@ rules, and [`docs/telemetry.md`](docs/telemetry.md) for the sample contract.
 1. **Hardware Bridge**: GPU acquisition and privileged emergency-brake actuator
 2. **Safety machine**: Named relay states, hysteresis, actuator-failure overlay
 3. **Telemetry System**: Real-time metrics collection and export
-4. **Publish sink**: Best-effort, never on the `evaluate` path
+4. **Publish sink**: Bounded, never on the `evaluate` path; overflow is counted
 
 ## Dependencies
 
@@ -160,11 +161,15 @@ Key options (with env var equivalent):
 - `--metrics-ip` / `THALAMIC_METRICS_IP` (default: 127.0.0.1; port is always 9000)
 - `--step-interval-ms` / `THALAMIC_STEP_INTERVAL_MS` (default: 100) — relay loop tick interval
 - `--force-software-only` / `THALAMIC_FORCE_SOFTWARE_ONLY`
+- `--sensory-queue-capacity` / `THALAMIC_SENSORY_QUEUE_CAPACITY` (default: 32, range 1–4096)
+- `--sensory-queue-full-policy` / `THALAMIC_SENSORY_QUEUE_FULL_POLICY` (default: `drop-oldest`; also `reject-newest`)
 - `RUST_LOG` (standard for tracing; or --log-level in future extensions)
 
 Example with env + flag:
 ```bash
 THALAMIC_METRICS_IP=0.0.0.0 \
+  THALAMIC_SENSORY_QUEUE_CAPACITY=16 \
+  THALAMIC_SENSORY_QUEUE_FULL_POLICY=reject-newest \
   cargo run --bin thalamic-relay -- --force-software-only --step-interval-ms 50
 ```
 
@@ -181,8 +186,12 @@ state is observable here; there is no neural-state query:
 - `safety_brake_engaged` — last successful brake still claimed
 - `safety_hysteresis_ok_count` — Ok streak while braked
 - `safety_transitions_total` / `safety_actuator_failures_total` — counters
+- `sensory_queue_depth` / `sensory_queue_capacity` — current vs configured outbound queue size
+- `sensory_queue_enqueued_total` — frames accepted into the queue
+- `sensory_queue_dropped_total{reason=...}` — drops with a **closed** reason set (`reject_newest`, `drop_oldest`, `absent`, `disconnected`, `send_failed`); never a payload string
+- `sensory_queue_full_policy{policy=drop_oldest|reject_newest}` — one-hot configured overflow policy
 
-See [`docs/safety.md`](docs/safety.md) for the label set and numeric ids.
+See [`docs/safety.md`](docs/safety.md) for the safety label set and numeric ids, and the sensory-queue policy notes.
 
 ### Logging
 
@@ -191,7 +200,7 @@ Structured logging via `tracing` with configurable output levels.
 ## Safety Features
 
 - **Instance Protection**: Lockfile mechanism prevents multiple relay instances (lock acquired before port binding)
-- **Independent safety loop**: `SafetyMachine::evaluate` has no publisher argument and is not awaited on IPC. Production uses `AbsentPublisher` until GH#40.
+- **Independent safety loop**: `SafetyMachine::evaluate` has no publisher argument and is not awaited on IPC. Production enqueues into a bounded `IsolatedPublishQueue` (default `drop-oldest`); a stalled or absent consumer cannot stall evaluation. GH#40 will drain the queue.
 - **GPU Safety Monitoring**: Safety cadence every ~1 second (every 10 ticks); named states for healthy-real, warning, critical/braked, recovering, missing/stale/invalid, simulated, actuator-failure
 - **Emergency Brakes**: Automatically throttles GPU power limit to 50% via `nvidia-smi -pl` on fail-closed or critical; 3 consecutive real Ok readings to release; warn immediately after release re-applies
 - **Graceful Degradation**: Continues in software-only mode when
