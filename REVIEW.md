@@ -5,7 +5,8 @@
 ```bash
 cargo test                    # all tests
 cargo test --lib              # src/lib.rs tests (telemetry + gpu + cpu)
-cargo test --bin thalamic-relay  # src/main.rs tests only (6)
+cargo test --bin thalamic-relay  # src/main.rs tests (CLI/lock/spawn_intent)
+cargo test --test software_only  # GPU-less integration harness (RM-1217)
 cargo test telemetry          # typed contract / fixtures
 cargo test gpu                # gpu acquisition + check_safety facade
 cargo test safety              # SafetyMachine + named states (no GPU)
