@@ -211,12 +211,13 @@ impl fmt::Display for QueueConfigError {
 impl std::error::Error for QueueConfigError {}
 
 /// Validated outbound sensory-queue configuration.
+///
+/// Fields are private so a caller cannot assemble an invalid capacity and
+/// pass it to [`IsolatedPublishQueue::new`]. Use [`QueueConfig::new`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueueConfig {
-    /// Maximum frames retained. Finite; see [`Self::MIN_CAPACITY`] / [`Self::MAX_CAPACITY`].
-    pub capacity: usize,
-    /// Deterministic behavior when `capacity` is reached.
-    pub policy: QueueFullPolicy,
+    capacity: usize,
+    policy: QueueFullPolicy,
 }
 
 impl QueueConfig {
@@ -248,6 +249,18 @@ impl QueueConfig {
             });
         }
         Ok(capacity)
+    }
+
+    /// Maximum frames retained.
+    #[must_use]
+    pub const fn capacity(self) -> usize {
+        self.capacity
+    }
+
+    /// Deterministic behavior when [`Self::capacity`] is reached.
+    #[must_use]
+    pub const fn policy(self) -> QueueFullPolicy {
+        self.policy
     }
 }
 
@@ -358,6 +371,10 @@ impl QueueInner {
         self.enqueued_total = self.enqueued_total.saturating_add(1);
         counter!("sensory_queue_enqueued_total").increment(1);
     }
+
+    fn emit_gauges(&self) {
+        export_queue_gauges(self.buf.len(), self.capacity, self.policy);
+    }
 }
 
 /// Bounded non-blocking enqueue with an explicit full-queue policy.
@@ -378,33 +395,33 @@ pub struct SensoryQueueConsumer {
 
 impl IsolatedPublishQueue {
     /// Construct a validated bounded queue plus its consumer.
-    #[must_use]
-    pub fn new(config: QueueConfig) -> (Self, SensoryQueueConsumer) {
+    ///
+    /// Re-validates `config` so an in-module struct literal cannot bypass
+    /// [`QueueConfig::new`].
+    pub fn new(config: QueueConfig) -> Result<(Self, SensoryQueueConsumer), QueueConfigError> {
+        QueueConfig::validate_capacity(config.capacity())?;
         let inner = Arc::new(Mutex::new(QueueInner {
-            buf: VecDeque::with_capacity(config.capacity),
-            capacity: config.capacity,
-            policy: config.policy,
+            buf: VecDeque::with_capacity(config.capacity()),
+            capacity: config.capacity(),
+            policy: config.policy(),
             connected: true,
             enqueued_total: 0,
             dropped_by_reason: [0; DropReason::ALL.len()],
         }));
-        export_queue_gauges(0, config.capacity, config.policy);
+        export_queue_gauges(0, config.capacity(), config.policy());
         register_drop_reason_series();
         counter!("sensory_queue_enqueued_total").increment(0);
-        (
+        Ok((
             Self {
                 inner: Arc::clone(&inner),
             },
             SensoryQueueConsumer { inner },
-        )
+        ))
     }
 
     /// Bounded queue with [`QueueFullPolicy::RejectNewest`] (legacy `try_send`).
     pub fn bounded(capacity: usize) -> Result<(Self, SensoryQueueConsumer), QueueConfigError> {
-        Ok(Self::new(QueueConfig::new(
-            capacity,
-            QueueFullPolicy::RejectNewest,
-        )?))
+        Self::new(QueueConfig::new(capacity, QueueFullPolicy::RejectNewest)?)
     }
 
     /// Bounded queue with an explicit full-queue policy.
@@ -412,7 +429,7 @@ impl IsolatedPublishQueue {
         capacity: usize,
         policy: QueueFullPolicy,
     ) -> Result<(Self, SensoryQueueConsumer), QueueConfigError> {
-        Ok(Self::new(QueueConfig::new(capacity, policy)?))
+        Self::new(QueueConfig::new(capacity, policy)?)
     }
 
     /// Non-blocking enqueue. Never waits on a consumer.
@@ -420,25 +437,19 @@ impl IsolatedPublishQueue {
         let mut inner = self.inner.lock().expect("sensory queue mutex poisoned");
         if !inner.connected {
             inner.record_drop(DropReason::Disconnected);
-            let snap = inner.snapshot();
-            drop(inner);
-            export_queue_snapshot_gauges(&snap);
+            inner.emit_gauges();
             return Err(PublishError::Disconnected);
         }
         if inner.buf.len() < inner.capacity {
             inner.buf.push_back(mapping);
             inner.record_enqueue();
-            let snap = inner.snapshot();
-            drop(inner);
-            export_queue_snapshot_gauges(&snap);
+            inner.emit_gauges();
             return Ok(());
         }
         match inner.policy {
             QueueFullPolicy::RejectNewest => {
                 inner.record_drop(DropReason::RejectNewest);
-                let snap = inner.snapshot();
-                drop(inner);
-                export_queue_snapshot_gauges(&snap);
+                inner.emit_gauges();
                 Err(PublishError::SlowConsumer)
             }
             QueueFullPolicy::DropOldest => {
@@ -446,9 +457,7 @@ impl IsolatedPublishQueue {
                 inner.record_drop(DropReason::DropOldest);
                 inner.buf.push_back(mapping);
                 inner.record_enqueue();
-                let snap = inner.snapshot();
-                drop(inner);
-                export_queue_snapshot_gauges(&snap);
+                inner.emit_gauges();
                 Ok(())
             }
         }
@@ -475,9 +484,7 @@ impl SensoryQueueConsumer {
     pub fn try_recv(&self) -> Option<SensoryMapping> {
         let mut inner = self.inner.lock().expect("sensory queue mutex poisoned");
         let item = inner.buf.pop_front();
-        let snap = inner.snapshot();
-        drop(inner);
-        export_queue_snapshot_gauges(&snap);
+        inner.emit_gauges();
         item
     }
 }
@@ -491,9 +498,7 @@ impl Drop for SensoryQueueConsumer {
         while inner.buf.pop_front().is_some() {
             inner.record_drop(DropReason::Disconnected);
         }
-        let snap = inner.snapshot();
-        drop(inner);
-        export_queue_snapshot_gauges(&snap);
+        inner.emit_gauges();
     }
 }
 
@@ -517,10 +522,6 @@ fn export_queue_gauges(depth: usize, capacity: usize, policy: QueueFullPolicy) {
             0.0
         });
     }
-}
-
-fn export_queue_snapshot_gauges(snap: &QueueSnapshot) {
-    export_queue_gauges(snap.depth, snap.capacity, snap.policy);
 }
 
 /// Evaluate safety first, then attempt publish. Publish cannot change the snapshot.
@@ -642,8 +643,16 @@ mod tests {
             })
         ));
         let ok = QueueConfig::new(8, QueueFullPolicy::DropOldest).unwrap();
-        assert_eq!(ok.capacity, 8);
-        assert_eq!(ok.policy, QueueFullPolicy::DropOldest);
+        assert_eq!(ok.capacity(), 8);
+        assert_eq!(ok.policy(), QueueFullPolicy::DropOldest);
+        let invalid = QueueConfig {
+            capacity: 0,
+            policy: QueueFullPolicy::DropOldest,
+        };
+        assert!(matches!(
+            IsolatedPublishQueue::new(invalid),
+            Err(QueueConfigError::CapacityTooSmall { capacity: 0, .. })
+        ));
     }
 
     #[test]

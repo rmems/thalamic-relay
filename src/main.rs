@@ -106,14 +106,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut machine = SafetyMachine::new();
     let queue_config = QueueConfig::new(cli.sensory_queue_capacity, cli.sensory_queue_full_policy)
         .expect("CLI parser already validated sensory queue capacity");
-    let (publisher, sensory_consumer) = IsolatedPublishQueue::new(queue_config);
+    let (publisher, sensory_consumer) = IsolatedPublishQueue::new(queue_config)
+        .expect("CLI parser already validated sensory queue capacity");
     // Held for process lifetime so overflow uses the configured policy instead
     // of Disconnected. GH#40 will drain this consumer; until then frames age
     // out (drop-oldest) or reject (reject-newest) and the counters move.
     let _sensory_consumer = sensory_consumer;
     println!(
         "[relay] sensory queue capacity={} policy={} (drain is GH#40; overflow is visible in metrics)",
-        queue_config.capacity, queue_config.policy
+        queue_config.capacity(),
+        queue_config.policy()
     );
     let mut warned_brake_held_sim = false;
     let mut brake_task: Option<ActuationTask> = None;
