@@ -46,10 +46,15 @@ pub enum SampleValidity {
 /// Engineering unit of a sample's `value`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Unit {
+    /// Degrees Celsius.
     Celsius,
+    /// Watts.
     Watt,
+    /// Volts.
     Volt,
+    /// Megahertz.
     Megahertz,
+    /// Percent (0–100).
     Percent,
 }
 
@@ -83,7 +88,9 @@ impl SignalClass {
 /// Whether the engineering value is measured or computed from another signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SignalOrigin {
+    /// Read from a hardware sensor.
     Measured,
+    /// Computed from another signal (not a sensor reading).
     Derived,
 }
 
@@ -93,7 +100,12 @@ pub enum Normalization {
     /// Pass-through of the engineering value (not used for current GPU signals).
     Identity,
     /// `(value - min) / (max - min)` clamped to `[0, 1]`.
-    Linear { min: f32, max: f32 },
+    Linear {
+        /// Lower bound of the linear mapping (engineering units).
+        min: f32,
+        /// Upper bound of the linear mapping (engineering units).
+        max: f32,
+    },
 }
 
 impl Normalization {
@@ -118,13 +130,21 @@ impl Normalization {
 /// Stable signal identifiers. Names are the corpus-ipc mapping keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SignalId {
+    /// GPU die temperature (`gpu_temp_c`).
     GpuTempC,
+    /// VRAM temperature when the sensor exists (`vram_temp_c`).
     VramTempC,
+    /// Board power (`power_w`).
     PowerW,
+    /// Derived Vcore estimate (`vddcr_gfx_v`); not an NVML voltage sensor.
     VddcrGfxV,
+    /// Graphics clock (`gpu_clock_mhz`).
     GpuClockMhz,
+    /// Memory clock (`mem_clock_mhz`).
     MemClockMhz,
+    /// Fan speed (`fan_speed_pct`).
     FanSpeedPct,
+    /// Memory utilization (`mem_util_pct`).
     MemUtilPct,
 }
 
@@ -160,15 +180,25 @@ pub const OBSERVABILITY_STALE_AFTER_MS: u64 = 5_000;
 /// Per-signal contract: unit, range, origin, class, normalization, cadence, stale.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SignalSpec {
+    /// Stable identifier for this signal.
     pub id: SignalId,
+    /// Canonical snake_case name (corpus-ipc mapping key).
     pub name: &'static str,
+    /// Engineering unit of [`TelemetrySample::value`].
     pub unit: Unit,
+    /// Inclusive engineering-range minimum; below this is [`SampleValidity::Invalid`].
     pub min: f32,
+    /// Inclusive engineering-range maximum; above this is [`SampleValidity::Invalid`].
     pub max: f32,
+    /// Measured vs derived.
     pub origin: SignalOrigin,
+    /// How the signal may be consumed.
     pub class: SignalClass,
+    /// Model-input mapping applied only to [`SampleValidity::Valid`] values.
     pub normalization: Normalization,
+    /// Documented acquisition cadence (ms). Actual cadence is on the frame.
     pub cadence_ms: u64,
+    /// Age after which a finite value becomes [`SampleValidity::Stale`].
     pub stale_after_ms: u64,
 }
 
@@ -301,10 +331,15 @@ pub const fn signal_spec(id: SignalId) -> SignalSpec {
 pub mod software_fallback {
     /// Typical idle die temperature estimate (°C). Not a magic "no GPU" flag.
     pub const GPU_TEMP_C: f32 = 35.0;
+    /// Typical idle board power estimate (W).
     pub const POWER_W: f32 = 25.0;
+    /// Typical idle Vcore estimate (V). Derived, not measured.
     pub const VDDCR_GFX_V: f32 = 0.7;
+    /// Typical idle graphics clock estimate (MHz).
     pub const GPU_CLOCK_MHZ: f32 = 210.0;
+    /// Typical idle memory clock estimate (MHz).
     pub const MEM_CLOCK_MHZ: f32 = 405.0;
+    /// Typical idle fan speed estimate (%).
     pub const FAN_SPEED_PCT: f32 = 30.0;
     /// Legitimate idle utilization of 0%, distinguishable from [`None`] missing.
     pub const MEM_UTIL_PCT: f32 = 0.0;
@@ -325,11 +360,17 @@ pub fn unix_now_ms() -> UnixMillis {
 /// stale readings keep the raw number for observability but are not [`SampleValidity::Valid`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TelemetrySample<T> {
+    /// Which inventory signal this sample belongs to.
     pub signal: SignalId,
+    /// Engineering-unit value. `None` for missing and non-finite readings.
     pub value: Option<T>,
+    /// Acquisition timestamp (unix ms).
     pub observed_at: UnixMillis,
+    /// Provenance of the acquisition path.
     pub source: TelemetrySource,
+    /// Validity after range/freshness checks.
     pub validity: SampleValidity,
+    /// Engineering unit of `value`.
     pub unit: Unit,
 }
 
@@ -405,15 +446,25 @@ impl TelemetrySample<f32> {
 /// must not write `0.0` or `NaN` as a stand-in for "no data".
 #[derive(Debug, Clone, PartialEq)]
 pub struct RawTelemetry {
+    /// Acquisition timestamp (unix ms).
     pub observed_at: UnixMillis,
+    /// Provenance of this raw bag.
     pub source: TelemetrySource,
+    /// GPU die temperature (°C), if read.
     pub gpu_temp_c: Option<f32>,
+    /// VRAM temperature (°C), if the sensor exists and was read.
     pub vram_temp_c: Option<f32>,
+    /// Board power (W), if read.
     pub power_w: Option<f32>,
+    /// Derived Vcore estimate (V), if computed.
     pub vddcr_gfx_v: Option<f32>,
+    /// Graphics clock (MHz), if read.
     pub gpu_clock_mhz: Option<f32>,
+    /// Memory clock (MHz), if read.
     pub mem_clock_mhz: Option<f32>,
+    /// Fan speed (%), if read.
     pub fan_speed_pct: Option<f32>,
+    /// Memory utilization (%), if read.
     pub mem_util_pct: Option<f32>,
 }
 
@@ -469,18 +520,28 @@ impl RawTelemetry {
 /// Validated frame: per-signal [`TelemetrySample`] plus frame-level provenance.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TelemetryFrame {
+    /// Frame acquisition timestamp (unix ms).
     pub acquired_at: UnixMillis,
+    /// Provenance shared by every sample in this frame.
     pub source: TelemetrySource,
     /// Actual supervisor acquisition interval (`--step-interval-ms`), not the
     /// documented default in [`signal_spec`].
     pub acquisition_cadence_ms: u64,
+    /// GPU die temperature sample.
     pub gpu_temp_c: TelemetrySample<f32>,
+    /// VRAM temperature sample (often [`SampleValidity::Missing`]).
     pub vram_temp_c: TelemetrySample<f32>,
+    /// Board power sample.
     pub power_w: TelemetrySample<f32>,
+    /// Derived Vcore estimate sample.
     pub vddcr_gfx_v: TelemetrySample<f32>,
+    /// Graphics clock sample.
     pub gpu_clock_mhz: TelemetrySample<f32>,
+    /// Memory clock sample.
     pub mem_clock_mhz: TelemetrySample<f32>,
+    /// Fan speed sample.
     pub fan_speed_pct: TelemetrySample<f32>,
+    /// Memory utilization sample.
     pub mem_util_pct: TelemetrySample<f32>,
 }
 
@@ -594,11 +655,17 @@ pub fn assess_with_cadence(raw: &RawTelemetry, now: UnixMillis, cadence_ms: u64)
 /// One channel in the corpus-ipc mapping surface (not a wire type).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MappedStimulus {
+    /// Inventory identifier.
     pub signal: SignalId,
+    /// Canonical snake_case name.
     pub name: String,
+    /// How this signal may be consumed.
     pub classification: SignalClass,
+    /// Engineering unit of `raw`.
     pub unit: Unit,
+    /// Acquisition provenance.
     pub source: TelemetrySource,
+    /// Validity at mapping time.
     pub validity: SampleValidity,
     /// Engineering-unit raw value. `None` if missing or non-finite.
     pub raw: Option<f32>,
@@ -631,18 +698,26 @@ impl MappedStimulus {
 /// Typed mapping hook for `#40`. Not a `corpus-ipc` schema duplicate.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SensoryMapping {
+    /// Frame acquisition timestamp (unix ms).
     pub observed_at_unix_ms: UnixMillis,
+    /// Provenance of the underlying frame.
     pub acquisition_source: TelemetrySource,
+    /// Actual acquisition cadence for this frame.
     pub acquisition_cadence_ms: u64,
+    /// Runtime-input / Both stimuli only (no observability-only filler).
     pub stimuli: Vec<MappedStimulus>,
 }
 
 /// Raw-preserving observability view of an entire frame.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ObservabilitySnapshot {
+    /// Frame acquisition timestamp (unix ms).
     pub observed_at_unix_ms: UnixMillis,
+    /// Provenance of the underlying frame.
     pub acquisition_source: TelemetrySource,
+    /// Actual acquisition cadence for this frame.
     pub acquisition_cadence_ms: u64,
+    /// Every inventory signal, raw preserved independently of normalization.
     pub samples: Vec<MappedStimulus>,
 }
 

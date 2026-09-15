@@ -1,5 +1,8 @@
 //! Hardware Bridge — GPU telemetry acquisition & privileged NVML actuation.
 //!
+//! Crate-private: the `thalamic-relay` executable uses this adapter; it is not
+//! public library API.
+//!
 //! Raw NVML acquisition lives on [`HardwareBridge`]; the `nvidia-smi`
 //! brake/release backend lives on [`NvmlActuator`]. Validation, normalization,
 //! freshness, and provenance live in [`crate::telemetry`]. Deterministic safety
@@ -11,16 +14,17 @@
 //! semantics (thresholds, hysteresis, fail-closed policy) — those belong to
 //! [`crate::safety`].
 
-use crate::safety::{ActuatorError, BrakeMatch, SafetyActuator, instant_status};
+use crate::safety::{ActuatorError, BrakeMatch, SafetyActuator};
+#[cfg(test)]
+use crate::safety::{SafetyStatus, instant_status};
+#[cfg(test)]
+use crate::telemetry::DEFAULT_ACQUISITION_CADENCE_MS;
 use crate::telemetry::{
-    DEFAULT_ACQUISITION_CADENCE_MS, RawTelemetry, TelemetryFrame, TelemetrySource,
-    assess_with_cadence, unix_now_ms,
+    RawTelemetry, TelemetryFrame, TelemetrySource, assess_with_cadence, unix_now_ms,
 };
 use lazy_static::lazy_static;
 use nvml_wrapper::Nvml;
 use nvml_wrapper::enum_wrappers::device::{Clock, TemperatureSensor};
-
-pub use crate::safety::SafetyStatus;
 
 lazy_static! {
     static ref NVML: Option<Nvml> = Nvml::init().ok();
@@ -31,14 +35,10 @@ lazy_static! {
 pub struct HardwareBridge;
 
 impl HardwareBridge {
-    /// Acquire raw telemetry, then validate/normalize into a [`TelemetryFrame`].
-    pub fn read_telemetry() -> TelemetryFrame {
-        Self::read_telemetry_with(false, DEFAULT_ACQUISITION_CADENCE_MS)
-    }
-
     /// Read telemetry, but if `force_software` is true, always use the simulated
     /// fallback (never attempt real NVML/nvidia-smi). This implements the
     /// `--force-software-only` CLI flag for #11.
+    #[cfg(test)]
     pub fn read_telemetry_force(force_software: bool) -> TelemetryFrame {
         Self::read_telemetry_with(force_software, DEFAULT_ACQUISITION_CADENCE_MS)
     }
@@ -130,6 +130,7 @@ impl HardwareBridge {
     /// safety samples fail closed.
     ///
     /// Returns `(SafetyStatus, is_simulated)`.
+    #[cfg(test)]
     pub fn check_safety(frame: &TelemetryFrame) -> (SafetyStatus, bool) {
         instant_status(frame)
     }

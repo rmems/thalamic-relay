@@ -1,3 +1,7 @@
+//! Prometheus / tracing init and scrape-time gauges for the supervisor.
+//!
+//! Crate-private process plumbing: not part of the public `thalamic_relay` API.
+
 use metrics::{counter, gauge};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use std::sync::{Arc, Mutex};
