@@ -109,11 +109,18 @@ cargo run -- --step-interval-ms 50           # faster tick interval
 
 ## CI Checks
 
-The CI workflow (`.github/workflows/ci.yml`) pins Rust 1.98.1:
+The CI workflow (`.github/workflows/ci.yml`) reads `package.rust-version`
+from `Cargo.toml` (currently 1.98.1) and installs **that** toolchain. It
+asserts `rustc` and `rust-toolchain.toml` `channel` equal the declared MSRV.
+Edition 2024 is independent of that pin (usable since rustc 1.85).
 
 1. `cargo fmt --check`
 2. `cargo clippy --all-targets --all-features -- -D warnings`
 3. `cargo build --all-features`
 4. `cargo test --all-features`
+
+crates.io packaging jobs (`cargo package`, rustdoc `-D warnings`, exact-MSRV
+as a separate job) belong to GH#50 / RM-1224 if present; this crate’s
+toolchain contract is the Cargo.toml value, not a duplicate literal in YAML.
 
 Bot reviewers: Codacy, CodeRabbit, Codex, Kilo, Devin, Gitar, Cursor Bugbot.

@@ -1,0 +1,5 @@
+# Must match package.rust-version in Cargo.toml (authoritative MSRV).
+# CI asserts the two strings are equal. Edition 2024 is separate (see README).
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
