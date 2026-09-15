@@ -34,18 +34,23 @@ It collects GPU telemetry, runs deterministic thermal/power safety
 checks, and exposes observability over Prometheus metrics. It does **not**
 run any neural computation itself — that lives in `brainstem-daemon`. The
 relay is platform-agnostic: it degrades gracefully to a software-only mode
-when no GPU is present, and hardware safety keeps functioning even when
-`brainstem-daemon` is absent or crashed.
+when no GPU is present, and **hardware safety is an isolated failure domain**:
+it keeps evaluating with `brainstem-daemon` absent or crashed, and IPC
+send/disconnect/slow-consumer cannot stall the safety loop. Brainstem has
+no authority to override Thalamic hard-safety.
 
 ## Features
 
 - **GPU Telemetry**: Real-time monitoring of GPU sensors via NVML (temperature,
   power, clocks, fan, utilization) with an explicit software-fallback
   provenance tag — missing sensors stay absent (`None`), never a silent `0.0`
-- **Deterministic Hardware Safety**: Thermal/power threshold checks with
-  emergency brake and hysteresis-gated release, independent of any
-  downstream neural runtime
-- **Metrics Collection**: Prometheus-compatible metrics export
+- **Deterministic Hardware Safety**: Isolated state machine (healthy-real,
+  warning, critical/braked, recovering/hysteresis, telemetry
+  missing/stale/invalid, simulated/software-only, actuator-failure) with
+  emergency brake and hysteresis-gated release. Independent of Brainstem and
+  of any IPC publisher.
+- **Metrics Collection**: Prometheus-compatible metrics export (freshness,
+  safety state, brake state, transition and actuator-failure counters)
 - **Process Safety**: Single-instance protection via a lockfile mechanism
 
 ## Installation
@@ -85,17 +90,51 @@ types, and the planned `corpus-ipc` transport (GH#40).
 
 ## Architecture
 
+Thalamic is a sensory + **independent hard-safety** process. Brainstem is
+the neural runtime. They do not share a fate:
+
+```text
+hardware telemetry
+      ↓
+thalamic-relay
+  - sensing / validation / freshness
+  - SafetyMachine (never waits on IPC)
+  - privileged brake actuator
+  - Prometheus safety/brake state
+      ↓  best-effort try_publish (drop on full / absent)
+corpus-ipc          (follow-up work — GH#40; not required for safety)
+      ↓
+brainstem-daemon
+  - SpikingNetwork
+  - neuromodulation
+  - tick loop
+```
+
+### What Thalamic guarantees vs Brainstem
+
+| Owner | Guarantees |
+| --- | --- |
+| **Thalamic** | Hardware telemetry contract; fail-closed protection on missing/stale/invalid telemetry; brake apply/release; observable safety/brake state **without** querying neural state; continues with Brainstem absent |
+| **Brainstem** | SNN execution, neural state, reward/plasticity. Consumes sensory mappings if transport exists. **Cannot** inhibit or override the Thalamic brake |
+| **corpus-ipc** | Transport only. Send failure is not a safety pause |
+
+See [`docs/safety.md`](docs/safety.md) for named states and hysteresis
+rules, and [`docs/telemetry.md`](docs/telemetry.md) for the sample contract.
+
 ### Core Modules
 
 - **`telemetry`**: Typed sample contract (validity, freshness, provenance, normalization) and the corpus-ipc mapping surface
-- **`gpu`**: Raw NVML acquisition and safety evaluation against the typed frame
+- **`safety`**: Pure deterministic classification + hysteresis (`SafetyMachine`); no NVML, no IPC
+- **`gpu`**: Raw NVML acquisition and privileged power-limit actuation
+- **`publish`**: Non-blocking sensory publish stub (`AbsentPublisher`, `IsolatedPublishQueue`); transport is GH#40
 - **`cpu`**: Telemetry initialization and metrics collection
 
 ### Key Components
 
-1. **Hardware Bridge**: Abstract interface for GPU communication
-2. **Telemetry System**: Real-time metrics collection and export
-3. **Emergency Brakes**: Safety mechanisms for hardware protection
+1. **Hardware Bridge**: GPU acquisition and privileged emergency-brake actuator
+2. **Safety machine**: Named relay states, hysteresis, actuator-failure overlay
+3. **Telemetry System**: Real-time metrics collection and export
+4. **Publish sink**: Best-effort, never on the `evaluate` path
 
 ## Dependencies
 
@@ -133,8 +172,17 @@ THALAMIC_METRICS_IP=0.0.0.0 \
 
 ### Prometheus Metrics
 
-The relay exports metrics compatible with Prometheus monitoring — currently
-just hardware telemetry freshness (`telemetry_freshness_s`).
+The relay exports metrics compatible with Prometheus monitoring. Safety
+state is observable here; there is no neural-state query:
+
+- `telemetry_freshness_s` — sample age at scrape time
+- `safety_state{state=...}` / `safety_state_id` — current named safety state
+- `safety_policy_state{state=...}` — policy classification before the ActuatorFailure overlay (`safety_state` is the overlay)
+- `safety_brake_engaged` — last successful brake still claimed
+- `safety_hysteresis_ok_count` — Ok streak while braked
+- `safety_transitions_total` / `safety_actuator_failures_total` — counters
+
+See [`docs/safety.md`](docs/safety.md) for the label set and numeric ids.
 
 ### Logging
 
@@ -143,8 +191,9 @@ Structured logging via `tracing` with configurable output levels.
 ## Safety Features
 
 - **Instance Protection**: Lockfile mechanism prevents multiple relay instances (lock acquired before port binding)
-- **GPU Safety Monitoring**: Main loop checks thermal (85°C) and power (350W) thresholds every ~1 second
-- **Emergency Brakes**: Automatically throttles GPU power limit to 50% via `nvidia-smi -pl` on critical threshold
+- **Independent safety loop**: `SafetyMachine::evaluate` has no publisher argument and is not awaited on IPC. Production uses `AbsentPublisher` until GH#40.
+- **GPU Safety Monitoring**: Safety cadence every ~1 second (every 10 ticks); named states for healthy-real, warning, critical/braked, recovering, missing/stale/invalid, simulated, actuator-failure
+- **Emergency Brakes**: Automatically throttles GPU power limit to 50% via `nvidia-smi -pl` on fail-closed or critical; 3 consecutive real Ok readings to release; warn immediately after release re-applies
 - **Graceful Degradation**: Continues in software-only mode when
   `--force-software-only` is set (`TelemetrySource::SoftwareFallback`).
   NVML/driver failure without that flag is `NvmlUnavailable` and fail-closes

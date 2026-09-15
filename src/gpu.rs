@@ -1,28 +1,22 @@
-//! Hardware Bridge — GPU Telemetry & Voltage Rail Monitoring
+//! Hardware Bridge — GPU Telemetry & privileged power-limit actuation
 //!
-//! Raw NVML acquisition lives here. Validation, normalization, freshness, and
-//! provenance live in [`crate::telemetry`]. Safety policy consumes the typed
-//! frame and never infers simulation from magic numeric values.
+//! Raw NVML acquisition and `nvidia-smi` brake/release live here. Validation,
+//! normalization, freshness, and provenance live in [`crate::telemetry`].
+//! Deterministic safety classification and hysteresis live in [`crate::safety`].
 
+use crate::safety::instant_status;
 use crate::telemetry::{
-    DEFAULT_ACQUISITION_CADENCE_MS, RawTelemetry, SampleValidity, TelemetryFrame, TelemetrySource,
+    DEFAULT_ACQUISITION_CADENCE_MS, RawTelemetry, TelemetryFrame, TelemetrySource,
     assess_with_cadence, unix_now_ms,
 };
 use lazy_static::lazy_static;
 use nvml_wrapper::Nvml;
 use nvml_wrapper::enum_wrappers::device::{Clock, TemperatureSensor};
 
+pub use crate::safety::SafetyStatus;
+
 lazy_static! {
     static ref NVML: Option<Nvml> = Nvml::init().ok();
-}
-
-// ── Safety Status ───────────────────────────────────────────────────
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum SafetyStatus {
-    Ok,
-    Warn(String),
-    Critical(String),
 }
 
 // ── Hardware Bridge ─────────────────────────────────────────────────
@@ -122,23 +116,15 @@ impl HardwareBridge {
 
     /// Check GPU safety thresholds against a validated frame.
     ///
-    /// Simulation is [`TelemetrySource::SoftwareFallback`] only (forced
-    /// software-only). [`TelemetrySource::NvmlUnavailable`] is **not** simulated:
-    /// missing safety samples fail closed.
+    /// Instantaneous Ok/Warn/Critical only — stateful hysteresis lives in
+    /// [`crate::safety::SafetyMachine`]. Simulation is
+    /// [`TelemetrySource::SoftwareFallback`] only (forced software-only).
+    /// [`TelemetrySource::NvmlUnavailable`] is **not** simulated: missing
+    /// safety samples fail closed.
     ///
     /// Returns `(SafetyStatus, is_simulated)`.
     pub fn check_safety(frame: &TelemetryFrame) -> (SafetyStatus, bool) {
-        if frame.source == TelemetrySource::SoftwareFallback {
-            return (SafetyStatus::Ok, true);
-        }
-
-        if let Some(status) = critical_from_frame(frame) {
-            return (status, false);
-        }
-        if let Some(status) = warn_from_frame(frame) {
-            return (status, false);
-        }
-        (SafetyStatus::Ok, false)
+        instant_status(frame)
     }
 
     /// CLOSED LOOP CONTROL: The Emergency Brake.
@@ -257,72 +243,6 @@ fn derive_vddcr_gfx_v(power_w: f32) -> f32 {
     v_idle + t * (v_tdp - v_idle)
 }
 
-fn safety_value(
-    name: &str,
-    sample: &crate::telemetry::TelemetrySample<f32>,
-) -> Result<f32, SafetyStatus> {
-    match sample.validity {
-        SampleValidity::Missing => Err(SafetyStatus::Critical(format!(
-            "Invalid telemetry: {name} missing"
-        ))),
-        SampleValidity::Invalid => Err(SafetyStatus::Critical(format!(
-            "Invalid telemetry: {name} invalid"
-        ))),
-        SampleValidity::Stale => Err(SafetyStatus::Critical(format!(
-            "Invalid telemetry: {name} stale"
-        ))),
-        SampleValidity::Valid => sample
-            .value
-            .ok_or_else(|| SafetyStatus::Critical(format!("Invalid telemetry: {name} missing"))),
-    }
-}
-
-/// Require both safety-critical samples to be valid and present.
-/// Missing, invalid, and stale fail closed — never a silent `None`.
-fn safety_readings(frame: &TelemetryFrame) -> Result<(f32, f32), SafetyStatus> {
-    Ok((
-        safety_value("gpu_temp_c", &frame.gpu_temp_c)?,
-        safety_value("power_w", &frame.power_w)?,
-    ))
-}
-
-fn critical_from_frame(frame: &TelemetryFrame) -> Option<SafetyStatus> {
-    let (gpu_temp_c, power_w) = match safety_readings(frame) {
-        Ok(v) => v,
-        Err(status) => return Some(status),
-    };
-
-    if gpu_temp_c > 85.0 {
-        return Some(SafetyStatus::Critical(format!(
-            "GPU thermal: {gpu_temp_c:.0}°C exceeds 85°C"
-        )));
-    }
-    if power_w > 350.0 {
-        return Some(SafetyStatus::Critical(format!(
-            "GPU power: {power_w:.0}W exceeds 350W safety limit"
-        )));
-    }
-    None
-}
-
-fn warn_from_frame(frame: &TelemetryFrame) -> Option<SafetyStatus> {
-    let (gpu_temp_c, power_w) = match safety_readings(frame) {
-        Ok(v) => v,
-        Err(status) => return Some(status),
-    };
-    if gpu_temp_c > 75.0 {
-        return Some(SafetyStatus::Warn(format!(
-            "GPU thermal: {gpu_temp_c:.0}°C approaching 85°C limit"
-        )));
-    }
-    if power_w > 300.0 {
-        return Some(SafetyStatus::Warn(format!(
-            "GPU power: {power_w:.0}W approaching safety limit"
-        )));
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -414,16 +334,10 @@ mod tests {
     }
 
     #[test]
-    fn test_warn_from_frame_fail_closes_on_missing_temp_or_power() {
-        // Direct call: `?` on Option would return None and skip warn logic.
-        // Missing safety-critical samples must fail closed as Critical, same as
-        // critical_from_frame / check_safety.
+    fn test_check_safety_fail_closes_on_missing_temp_or_power() {
         let mut raw = fixtures::healthy_real();
         raw.gpu_temp_c = None;
         let frame = assess(&raw, fixtures::NOW);
-        assert!(
-            matches!(warn_from_frame(&frame), Some(SafetyStatus::Critical(ref msg)) if msg.contains("gpu_temp_c"))
-        );
         let (status, is_sim) = HardwareBridge::check_safety(&frame);
         assert!(matches!(status, SafetyStatus::Critical(ref msg) if msg.contains("gpu_temp_c")));
         assert!(!is_sim);
@@ -431,29 +345,24 @@ mod tests {
         let mut raw = fixtures::healthy_real();
         raw.power_w = None;
         let frame = assess(&raw, fixtures::NOW);
-        assert!(
-            matches!(warn_from_frame(&frame), Some(SafetyStatus::Critical(ref msg)) if msg.contains("power_w"))
-        );
+        let (status, is_sim) = HardwareBridge::check_safety(&frame);
+        assert!(matches!(status, SafetyStatus::Critical(ref msg) if msg.contains("power_w")));
+        assert!(!is_sim);
 
         // Warn-band temperature with missing power must not become Warn or Ok.
         let mut frame = nvml_temp_power(78.0, 200.0);
         frame.power_w.value = None;
         frame.power_w.validity = SampleValidity::Missing;
-        assert!(
-            matches!(warn_from_frame(&frame), Some(SafetyStatus::Critical(ref msg)) if msg.contains("power_w"))
-        );
         let (status, is_sim) = HardwareBridge::check_safety(&frame);
         assert!(matches!(status, SafetyStatus::Critical(_)));
         assert!(!matches!(status, SafetyStatus::Warn(_)));
         assert!(!is_sim);
 
-        // Valid stamp with None value (invariant break) must not skip via `value?`.
         let mut frame = nvml_temp_power(78.0, 200.0);
         frame.gpu_temp_c.value = None;
         assert_eq!(frame.gpu_temp_c.validity, SampleValidity::Valid);
-        assert!(
-            matches!(warn_from_frame(&frame), Some(SafetyStatus::Critical(ref msg)) if msg.contains("gpu_temp_c"))
-        );
+        let (status, _) = HardwareBridge::check_safety(&frame);
+        assert!(matches!(status, SafetyStatus::Critical(ref msg) if msg.contains("gpu_temp_c")));
     }
 
     #[test]
