@@ -38,7 +38,7 @@ RawTelemetry          (optional engineering values + acquisition source)
         ▼  assess() / TelemetryFrame::from_raw()
 TelemetryFrame        (per-signal TelemetrySample)
         │
-        ├─ HardwareBridge::check_safety()     safety-only / Both
+        ├─ safety::classify()                 safety-only / Both
         ├─ to_sensory_mapping()               runtime-input / Both  → GH#40
         └─ to_observability_snapshot()      every signal, raw preserved
 ```
