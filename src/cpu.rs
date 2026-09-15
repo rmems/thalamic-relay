@@ -6,10 +6,21 @@ use tokio::time::sleep;
 use tracing::{Level, info};
 use tracing_subscriber::FmtSubscriber;
 
-/// Shared telemetry state populated by the main loop
+use crate::telemetry::{UnixMillis, unix_now_ms};
+
+/// Shared telemetry state populated by the main loop.
+/// Freshness is computed at scrape/export time from [`Self::telemetry_acquired_at`].
 #[derive(Debug, Clone, Default)]
 pub struct RelayMetrics {
-    pub telemetry_freshness_s: f64,
+    pub telemetry_acquired_at: Option<UnixMillis>,
+}
+
+/// Age of the last sample in seconds. `None` acquired_at is 0 (no sample yet).
+#[must_use]
+pub fn freshness_seconds(acquired_at: Option<UnixMillis>, now: UnixMillis) -> f64 {
+    acquired_at
+        .map(|ts| now.saturating_sub(ts) as f64 / 1000.0)
+        .unwrap_or(0.0)
 }
 
 /// Sets up our logging and metrics engines.
@@ -49,7 +60,10 @@ pub async fn run_metrics_collector(metrics: Arc<Mutex<RelayMetrics>>) {
             guard.clone()
         };
 
-        gauge!("telemetry_freshness_s").set(snapshot.telemetry_freshness_s);
+        gauge!("telemetry_freshness_s").set(freshness_seconds(
+            snapshot.telemetry_acquired_at,
+            unix_now_ms(),
+        ));
 
         // Simulate tick rate
         sleep(Duration::from_secs(2)).await;
@@ -63,6 +77,17 @@ mod tests {
     #[test]
     fn relay_metrics_default_values() {
         let m = RelayMetrics::default();
-        assert_eq!(m.telemetry_freshness_s, 0.0);
+        assert_eq!(m.telemetry_acquired_at, None);
+        assert_eq!(freshness_seconds(None, 1_000), 0.0);
+    }
+
+    #[test]
+    fn freshness_seconds_grows_when_export_time_advances() {
+        let acquired = Some(1_000);
+        let early = freshness_seconds(acquired, 2_500);
+        let later = freshness_seconds(acquired, 5_000);
+        assert!((early - 1.5).abs() < f64::EPSILON);
+        assert!((later - 4.0).abs() < f64::EPSILON);
+        assert!(later > early);
     }
 }
