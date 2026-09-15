@@ -60,6 +60,14 @@ wrong, and don't let a "fix" overstate a guarantee the code doesn't actually
 provide. See `CLAUDE.md` for more detail and the concrete lessons from PR
 #38 (`docs/ipc.md`).
 
+## Packaging
+
+`Cargo.toml` uses an `include` allowlist for crates.io. Do not add
+contributor-only files (`AGENTS.md`, `CLAUDE.md`, `REVIEW.md`, CI, local
+tool configs) to `include`. After changing packaged paths, run
+`cargo package --list` and `cargo publish --dry-run --locked`. Never run the
+real `cargo publish` without explicit maintainer approval (#44 / #48).
+
 ## Boundaries
 
 - **Owns**: `src/`, `Cargo.toml`, `README.md`, `AGENTS.md`, `docs/`
