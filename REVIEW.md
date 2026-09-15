@@ -109,11 +109,27 @@ cargo run -- --step-interval-ms 50           # faster tick interval
 
 ## CI Checks
 
-The CI workflow (`.github/workflows/ci.yml`) pins Rust 1.98.1:
+The CI workflow (`.github/workflows/ci.yml`) installs the declared
+`package.rust-version` (currently 1.98.1) and runs three jobs. None of them
+perform a real `cargo publish`. `cargo-semver-checks` is deferred until a
+crates.io API baseline exists (GH#45).
+
+**Build & Test**
 
 1. `cargo fmt --check`
 2. `cargo clippy --all-targets --all-features -- -D warnings`
 3. `cargo build --all-features`
 4. `cargo test --all-features`
+
+**Exact MSRV** — `cargo test --locked --all-features` on the rustc version
+exactly equal to `package.rust-version`.
+
+**crates.io qualification** (software-only; no GPU, NVIDIA driver, or extra
+`sudo` packages):
+
+1. `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features`
+2. `cargo package --locked`
+3. Packaged-manifest path-dependency check, then `cargo test --locked --all-features` from the unpacked `.crate` outside the repository
+4. `cargo publish --dry-run --locked` (token-free; aborts before upload)
 
 Bot reviewers: Codacy, CodeRabbit, Codex, Kilo, Devin, Gitar, Cursor Bugbot.
