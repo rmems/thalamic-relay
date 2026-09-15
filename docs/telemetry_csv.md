@@ -75,6 +75,6 @@ Those stay in corinth-canal.
 
 Point exporters at this document and `thalamic_relay::telemetry_csv`:
 
-- [rmems/gaming-telemetry](https://github.com/rmems/gaming-telemetry) — CSV export currently appends `session_label`; that fails exact header match here
-- [rmems/Theseus-Quarry](https://github.com/rmems/Theseus-Quarry) — JSONL producer; any CSV projection for corinth must use this header
-- [rmems/spikenaut-telemetry-etl](https://github.com/rmems/spikenaut-telemetry-etl) — cleaning/validation between collectors and published datasets
+- [rmems/gaming-telemetry#50](https://github.com/rmems/gaming-telemetry/issues/50) — CSV export currently appends `session_label`; that fails exact header match here
+- [rmems/Theseus-Quarry#24](https://github.com/rmems/Theseus-Quarry/issues/24) — JSONL producer; any CSV projection for corinth must use this header
+- [rmems/spikenaut-telemetry-etl#27](https://github.com/rmems/spikenaut-telemetry-etl/issues/27) — cleaning/validation between collectors and published datasets
