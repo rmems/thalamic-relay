@@ -2,10 +2,14 @@
 name = "thalamic-relay"
 version = "0.1.0"
 edition = "2024"
-description = "Lightweight CLI relay that observes hardware telemetry and provides deterministic hardware safety (software-only, no built-in FPGA bridge)."
+description = "Sensory + deterministic hardware-safety relay for GPU telemetry. Does not run neural computation."
 repository = "https://github.com/rmems/thalamic-relay"
 license = "MIT OR Apache-2.0"
 rust-version = "1.98.1"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["-D", "warnings"]
 
 
 [dependencies]

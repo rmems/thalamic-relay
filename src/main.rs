@@ -95,9 +95,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("[relay] --- Thalamic Relay ---");
     if cli.force_software_only {
-        println!("[relay] running in software-only mode (forced via --force-software-only)");
+        println!(
+            "[relay] software-only telemetry (--force-software-only): documented idle estimates, not real GPU sensors"
+        );
     } else {
-        println!("[relay] running in software-only mode (no FPGA/silicon-bridge)");
+        println!(
+            "[relay] sensory + hardware-safety relay (NVML when available; NvmlUnavailable fail-closes)"
+        );
     }
 
     let mut step_count: u64 = 0;
@@ -343,7 +347,8 @@ fn format_live_reading(sample: &TelemetrySample<f32>, fmt_val: impl Fn(f32) -> S
 #[command(
     name = "thalamic-relay",
     version,
-    about = "Thalamic Relay - sensory + hardware-safety relay for hardware telemetry (software-only)"
+    about = "Sensory + deterministic hardware-safety relay (does not run neural computation)",
+    long_about = "thalamic-relay observes GPU telemetry, validates it, and evaluates an isolated thermal/power safety policy. It does not run a spiking neural network or own neural state.\n\nWithout --force-software-only it attempts NVML. Driver/device failure is NvmlUnavailable (fail-closed), not simulated idle. --force-software-only uses documented idle estimates tagged SoftwareFallback.\n\nBrake apply/release is best-effort: timeout + sudo -n nvidia-smi -pl on Linux (passwordless sudo for nvidia-smi). There is no control IPC and no corpus-ipc transport; Prometheus is served on :9000/metrics."
 )]
 struct Cli {
     /// Prometheus metrics listen IP (port is always 9000 per compliance)
@@ -354,9 +359,10 @@ struct Cli {
     #[arg(long, default_value_t = 100, env = "THALAMIC_STEP_INTERVAL_MS", value_parser = clap::value_parser!(u64).range(1..))]
     step_interval_ms: u64,
 
-    /// Force software-only mode (skip real GPU telemetry attempts, use sim).
+    /// Force simulated idle telemetry (skip NVML). Documented estimates, not real sensors.
     /// Usable as a bare flag (`--force-software-only`) or with an explicit
     /// value (`--force-software-only=false` / `THALAMIC_FORCE_SOFTWARE_ONLY=false`).
+    /// Distinct from NVML/driver failure, which is fail-closed `NvmlUnavailable`.
     #[arg(long, env = "THALAMIC_FORCE_SOFTWARE_ONLY", num_args = 0..=1, default_missing_value = "true", default_value_t = false, value_parser = clap::value_parser!(bool))]
     force_software_only: bool,
 }
