@@ -155,12 +155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("[relay] Emergency brake failed: {e}");
                     let snap = machine.record_actuator(ActuatorOutcome::ApplyFailed(e));
                     store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
-                    let (snap, pub_res) =
-                        evaluate_then_try_publish(&mut machine, &telemetry, &publisher);
-                    let _ = pub_res;
-                    store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
-                    spawn_intent(&snap, &mut brake_task, &mut release_task);
-                    evaluated_this_iter = true;
+                    // Retry on the safety cadence / first-frame path, not every tick.
                 }
                 Err(e) => {
                     eprintln!("[relay] Brake task panicked: {e}");
@@ -193,12 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("[relay] Brake release failed: {e}");
                     let snap = machine.record_actuator(ActuatorOutcome::ReleaseFailed(e));
                     store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
-                    let (snap, pub_res) =
-                        evaluate_then_try_publish(&mut machine, &telemetry, &publisher);
-                    let _ = pub_res;
-                    store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
-                    spawn_intent(&snap, &mut brake_task, &mut release_task);
-                    evaluated_this_iter = true;
+                    // Retry on the safety cadence / first-frame path, not every tick.
                 }
                 Err(e) => {
                     eprintln!("[relay] Brake release task panicked: {e}");
@@ -209,8 +199,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Safety check every 10 steps (rate scales with step_interval_ms)
-        if step_count.is_multiple_of(10) && !evaluated_this_iter {
+        // First acquired frame is evaluated immediately (fail-closed startup).
+        // Later evaluations keep the every-10-ticks cadence.
+        // Do not spawn from the pre-telemetry snapshot: SoftwareFallback holds
+        // rather than applies, which only classify_frame can decide.
+        if !evaluated_this_iter && (step_count == 1 || step_count.is_multiple_of(10)) {
             let (snap, pub_res) = evaluate_then_try_publish(&mut machine, &telemetry, &publisher);
             let _ = pub_res;
             store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);

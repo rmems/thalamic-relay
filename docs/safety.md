@@ -64,9 +64,13 @@ worst fault wins: **missing > invalid > stale**. Equal rank prefers
 6. Actuator failure does not freeze evaluation: the next frame still
    classifies and the intent is retried.
 
-The supervisor evaluates on the safety cadence (every 10 ticks) and again
-after an actuator task completes, using a fresh frame. `SafetyMachine::evaluate`
-never publishes and never calls `nvidia-smi`.
+The supervisor evaluates the first acquired frame immediately, then on
+the safety cadence (every 10 ticks) and again after an actuator task
+completes, using a fresh frame. Failed apply/release is recorded and retried
+on that cadence rather than every tick. `SafetyMachine::evaluate`
+never publishes and never calls `nvidia-smi`. Pre-telemetry snapshots are
+not dispatched as hardware commands: `--force-software-only` must be
+classified first (hold, do not apply).
 
 ## IPC isolation
 
@@ -95,7 +99,7 @@ Exported without querying Brainstem:
 | --- | --- | --- |
 | `safety_state{state=...}` | gauge 0/1 | one-hot reported state |
 | `safety_state_id` | gauge 0–8 | stable numeric id |
-| `safety_policy_state{state=...}` | gauge 0/1 | classification under actuator overlay |
+| `safety_policy_state{state=...}` | gauge 0/1 | policy classification before ActuatorFailure overlay |
 | `safety_brake_engaged` | gauge 0/1 | last successful apply still claimed |
 | `safety_hysteresis_ok_count` | gauge | Ok streak while braked |
 | `safety_transitions_total` | counter | reported-state changes |

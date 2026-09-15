@@ -24,8 +24,8 @@ impl Default for RelayMetrics {
     fn default() -> Self {
         Self {
             telemetry_acquired_at: None,
-            safety_state: SafetyState::HealthyReal,
-            policy_state: SafetyState::HealthyReal,
+            safety_state: SafetyState::TelemetryMissing,
+            policy_state: SafetyState::TelemetryMissing,
             brake_engaged: false,
             hysteresis_ok_count: 0,
         }
@@ -143,7 +143,8 @@ mod tests {
     fn relay_metrics_default_values() {
         let m = RelayMetrics::default();
         assert_eq!(m.telemetry_acquired_at, None);
-        assert_eq!(m.safety_state, SafetyState::HealthyReal);
+        assert_eq!(m.safety_state, SafetyState::TelemetryMissing);
+        assert_eq!(m.policy_state, SafetyState::TelemetryMissing);
         assert!(!m.brake_engaged);
         assert_eq!(freshness_seconds(None, 1_000), 0.0);
     }

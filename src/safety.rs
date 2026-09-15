@@ -14,11 +14,11 @@ use crate::telemetry::{SampleValidity, TelemetryFrame, TelemetrySample, Telemetr
 pub const RELEASE_OK_STREAK: u32 = 3;
 /// Emergency-brake fraction of the device default power limit.
 pub const BRAKE_FRACTION: f32 = 0.5;
-/// Thermal warning band (°C), exclusive of the critical threshold.
+/// Thermal warning band (°C), inclusive of this threshold.
 pub const TEMP_WARN_C: f32 = 75.0;
 /// Thermal critical threshold (°C).
 pub const TEMP_CRITICAL_C: f32 = 85.0;
-/// Power warning band (W), exclusive of the critical threshold.
+/// Power warning band (W), inclusive of this threshold.
 pub const POWER_WARN_W: f32 = 300.0;
 /// Power critical threshold (W).
 pub const POWER_CRITICAL_W: f32 = 350.0;
@@ -192,7 +192,7 @@ impl Default for SafetyMachine {
 }
 
 impl SafetyMachine {
-    /// Idle machine: no brake claimed, no sample evaluated yet.
+    /// Fail-closed until the first frame is evaluated: missing telemetry.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -200,9 +200,9 @@ impl SafetyMachine {
             ok_count: 0,
             just_released: false,
             last_actuator_error: None,
-            last_policy_state: SafetyState::HealthyReal,
-            state: SafetyState::HealthyReal,
-            last_reason: "uninitialized".to_string(),
+            last_policy_state: SafetyState::TelemetryMissing,
+            state: SafetyState::TelemetryMissing,
+            last_reason: "no telemetry evaluated yet".to_string(),
             transitions_total: 0,
             actuator_failures_total: 0,
         }
@@ -242,6 +242,10 @@ impl SafetyMachine {
         self.just_released = false;
 
         let (policy_state, desired_brake) = self.policy_for(&assessment, just_released);
+        if policy_state == SafetyState::HealthyReal && !desired_brake {
+            // Healthy Ok must not keep a stale ActuatorFailure overlay forever.
+            self.last_actuator_error = None;
+        }
         self.last_policy_state = policy_state;
         self.last_reason = assessment.reason;
         self.compose_and_store(desired_brake, false)
@@ -432,7 +436,7 @@ pub fn classify_frame(frame: &TelemetryFrame) -> FrameAssessment {
             reason: format!("GPU power: {power_w:.0}W exceeds {POWER_CRITICAL_W:.0}W safety limit"),
         };
     }
-    if gpu_temp_c > TEMP_WARN_C {
+    if gpu_temp_c >= TEMP_WARN_C {
         return FrameAssessment {
             kind: AssessmentKind::Warn,
             reason: format!(
@@ -440,7 +444,7 @@ pub fn classify_frame(frame: &TelemetryFrame) -> FrameAssessment {
             ),
         };
     }
-    if power_w > POWER_WARN_W {
+    if power_w >= POWER_WARN_W {
         return FrameAssessment {
             kind: AssessmentKind::Warn,
             reason: format!("GPU power: {power_w:.0}W approaching safety limit"),
@@ -570,6 +574,17 @@ mod tests {
     }
 
     #[test]
+    fn new_is_fail_closed_telemetry_missing() {
+        let snap = SafetyMachine::new().snapshot();
+        assert_eq!(snap.state, SafetyState::TelemetryMissing);
+        assert_eq!(snap.policy_state, SafetyState::TelemetryMissing);
+        assert!(snap.desired_brake);
+        assert!(!snap.brake_engaged);
+        assert_eq!(snap.intent, BrakeIntent::Apply);
+        assert_eq!(snap.last_reason, "no telemetry evaluated yet");
+    }
+
+    #[test]
     fn healthy_real_is_named_state() {
         let snap = eval_once(fixtures::healthy_real());
         assert_eq!(snap.state, SafetyState::HealthyReal);
@@ -589,6 +604,31 @@ mod tests {
         assert_eq!(snap.state, SafetyState::Warning);
         assert!(!snap.desired_brake);
         assert_eq!(snap.intent, BrakeIntent::None);
+    }
+
+    #[test]
+    fn warn_band_includes_exact_thresholds() {
+        let at_temp = eval_once({
+            let mut raw = fixtures::healthy_real();
+            raw.gpu_temp_c = Some(TEMP_WARN_C);
+            raw
+        });
+        assert_eq!(at_temp.state, SafetyState::Warning);
+
+        let at_power = eval_once({
+            let mut raw = fixtures::healthy_real();
+            raw.power_w = Some(POWER_WARN_W);
+            raw
+        });
+        assert_eq!(at_power.state, SafetyState::Warning);
+
+        let just_below = eval_once({
+            let mut raw = fixtures::healthy_real();
+            raw.gpu_temp_c = Some(74.9);
+            raw.power_w = Some(299.9);
+            raw
+        });
+        assert_eq!(just_below.state, SafetyState::HealthyReal);
     }
 
     #[test]
@@ -760,6 +800,25 @@ mod tests {
         assert_eq!(after.state, SafetyState::CriticalBraked);
         assert!(after.brake_engaged);
         assert_eq!(after.intent, BrakeIntent::None);
+    }
+
+    #[test]
+    fn healthy_evaluate_clears_stale_actuator_failure_overlay() {
+        let mut machine = SafetyMachine::new();
+        let critical = nvml_temp_power(90.0, 200.0);
+        let _ = machine.evaluate(&critical);
+        let _ = machine.record_actuator(ActuatorOutcome::ApplyFailed(
+            "nvidia-smi -pl failed".to_string(),
+        ));
+        assert_eq!(machine.snapshot().state, SafetyState::ActuatorFailure);
+
+        let healthy = machine.evaluate(&nvml_temp_power(65.0, 200.0));
+        assert_eq!(healthy.policy_state, SafetyState::HealthyReal);
+        assert!(!healthy.desired_brake);
+        assert_eq!(healthy.state, SafetyState::HealthyReal);
+        assert_eq!(healthy.last_actuator_error, None);
+        assert_eq!(healthy.intent, BrakeIntent::None);
+        assert_eq!(machine.actuator_failures_total(), 1);
     }
 
     #[test]

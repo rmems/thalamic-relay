@@ -177,7 +177,7 @@ state is observable here; there is no neural-state query:
 
 - `telemetry_freshness_s` — sample age at scrape time
 - `safety_state{state=...}` / `safety_state_id` — current named safety state
-- `safety_policy_state{state=...}` — classification under actuator-failure overlay
+- `safety_policy_state{state=...}` — policy classification before the ActuatorFailure overlay (`safety_state` is the overlay)
 - `safety_brake_engaged` — last successful brake still claimed
 - `safety_hysteresis_ok_count` — Ok streak while braked
 - `safety_transitions_total` / `safety_actuator_failures_total` — counters
