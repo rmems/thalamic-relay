@@ -5,7 +5,8 @@
 //! transitions, CLI/process lifecycle, and IPC isolation. Typed `corpus-ipc`
 //! round-trips remain GH#40 / RM-1144.
 
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 use thalamic_relay::gpu::HardwareBridge;
 use thalamic_relay::publish::{
     AbsentPublisher, FailingPublisher, IsolatedPublishQueue, PublishError,
@@ -48,17 +49,18 @@ fn binary_software_only_starts_without_nvidia() {
     let lock_path = "/tmp/thalamic_relay.lock";
     let _ = std::fs::remove_file(lock_path);
 
-    let output = Command::new("timeout")
-        .args([
-            "2s",
-            bin,
-            "--force-software-only",
-            "--step-interval-ms",
-            "50",
-        ])
-        .output()
-        .expect("run thalamic-relay under timeout");
+    let mut child = Command::new(bin)
+        .args(["--force-software-only", "--step-interval-ms", "50"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn thalamic-relay");
 
+    // Stop the supervisor ourselves so this test does not depend on coreutils
+    // `timeout` (missing on some CI images / non-GNU hosts).
+    std::thread::sleep(Duration::from_secs(1));
+    let _ = child.kill();
+    let output = child.wait_with_output().expect("collect relay output");
     let _ = std::fs::remove_file(lock_path);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
