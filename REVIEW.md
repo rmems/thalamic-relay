@@ -79,8 +79,8 @@ with that code. See [`docs/ipc.md`](docs/ipc.md).
 ### Gaps explicitly deferred
 
 - `cpu::init_telemetry` / `cpu::run_metrics_collector`: bind a network port and run an indefinite loop; not safely unit-testable without an integration harness.
-- `HardwareBridge::apply_emergency_brake` / `release_emergency_brake` / `power_limit_matches_emergency_brake`: require a real NVML-capable GPU and can mutate board power limits, so they are intentionally not exercised in software-only CI.
-- The `main` async supervisor loop: covered by manual run instructions and end-to-end smoke tests rather than unit tests. Dashboard reading formatting is unit-tested. Hysteresis and IPC isolation are unit-tested via `SafetyMachine` / `evaluate_then_try_publish` without driving `main`.
+- `NvmlActuator` (`apply_emergency_brake` / `release_emergency_brake` / `detect_engaged_brake`, GH#46): the NVML/`nvidia-smi` backend requires a real NVML-capable GPU and can mutate board power limits, so its hardware path is intentionally not exercised in software-only CI. It fails closed with a typed `ActuatorError` when NVML is unavailable (regression-tested), and the brake/release *policy* it serves is unit-tested via `SafetyMachine` plus the in-memory `safety::FakeActuator`.
+- The `main` async supervisor loop: covered by manual run instructions and end-to-end smoke tests rather than unit tests. Dashboard reading formatting is unit-tested. Hysteresis and IPC isolation are unit-tested via `SafetyMachine` / `evaluate_then_try_publish` without driving `main`, and the actuation boundary is exercised through the `SafetyActuator` trait with `FakeActuator`.
 
 ## Linting
 

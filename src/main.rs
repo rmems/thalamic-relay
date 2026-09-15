@@ -3,10 +3,11 @@ use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thalamic_relay::cpu::{self, RelayMetrics};
-use thalamic_relay::gpu::HardwareBridge;
+use thalamic_relay::gpu::{HardwareBridge, NvmlActuator};
 use thalamic_relay::publish::{AbsentPublisher, SensoryPublisher, evaluate_then_try_publish};
 use thalamic_relay::safety::{
-    ActuatorOutcome, BRAKE_FRACTION, BrakeIntent, SafetyMachine, SafetySnapshot, SafetyState,
+    ActuatorError, ActuatorOutcome, BRAKE_FRACTION, BrakeIntent, SafetyActuator, SafetyMachine,
+    SafetySnapshot, SafetyState,
 };
 use thalamic_relay::telemetry::{SampleValidity, TelemetryFrame, TelemetrySample, TelemetrySource};
 use tokio::task::JoinHandle;
@@ -103,18 +104,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut machine = SafetyMachine::new();
     let publisher = AbsentPublisher;
     let mut warned_brake_held_sim = false;
-    let mut brake_task: Option<JoinHandle<Result<(), String>>> = None;
-    let mut release_task: Option<JoinHandle<Result<(), String>>> = None;
+    let mut brake_task: Option<ActuationTask> = None;
+    let mut release_task: Option<ActuationTask> = None;
+
+    // Privileged NVML/nvidia-smi actuation backend. The supervisor only ever
+    // reaches hardware through this `SafetyActuator`; all safety semantics live
+    // in `thalamic_relay::safety`, never in the NVIDIA adapter (GH#46).
+    let actuator: Arc<dyn SafetyActuator> = Arc::new(NvmlActuator::new());
 
     // Detect leftover throttle from a prior crash (hardware PL persists across process restarts).
     // Only seed brake_applied when the current limit matches this relay's expected 50% brake
     // target, so deliberate operator-set sub-default caps are not auto-restored to default.
-    if let Some((current_w, default_w, expected_w)) =
-        HardwareBridge::power_limit_matches_emergency_brake(BRAKE_FRACTION)
-    {
+    if let Some(m) = actuator.detect_engaged_brake(BRAKE_FRACTION) {
         eprintln!(
-            "[relay] WARNING: GPU power limit {current_w}W matches expected emergency brake \
-             target {expected_w}W (default {default_w}W); will auto-release after Ok streak"
+            "[relay] WARNING: GPU power limit {}W matches expected emergency brake \
+             target {}W (default {}W); will auto-release after Ok streak",
+            m.current_w, m.expected_w, m.default_w
         );
         machine.seed_brake_applied();
         let seed = machine.snapshot();
@@ -148,12 +153,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         evaluate_then_try_publish(&mut machine, &post_telemetry, &publisher);
                     let _ = pub_res;
                     store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
-                    spawn_intent(&snap, &mut brake_task, &mut release_task);
+                    spawn_intent(&snap, &actuator, &mut brake_task, &mut release_task);
                     evaluated_this_iter = true;
                 }
                 Ok(Err(e)) => {
                     eprintln!("[relay] Emergency brake failed: {e}");
-                    let snap = machine.record_actuator(ActuatorOutcome::ApplyFailed(e));
+                    let snap = machine.record_actuator(ActuatorOutcome::ApplyFailed(e.to_string()));
                     store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
                     // Retry on the safety cadence / first-frame path, not every tick.
                 }
@@ -181,12 +186,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         evaluate_then_try_publish(&mut machine, &post_telemetry, &publisher);
                     let _ = pub_res;
                     store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
-                    spawn_intent(&snap, &mut brake_task, &mut release_task);
+                    spawn_intent(&snap, &actuator, &mut brake_task, &mut release_task);
                     evaluated_this_iter = true;
                 }
                 Ok(Err(e)) => {
                     eprintln!("[relay] Brake release failed: {e}");
-                    let snap = machine.record_actuator(ActuatorOutcome::ReleaseFailed(e));
+                    let snap =
+                        machine.record_actuator(ActuatorOutcome::ReleaseFailed(e.to_string()));
                     store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
                     // Retry on the safety cadence / first-frame path, not every tick.
                 }
@@ -207,7 +213,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (snap, pub_res) = evaluate_then_try_publish(&mut machine, &telemetry, &publisher);
             let _ = pub_res;
             store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
-            spawn_intent(&snap, &mut brake_task, &mut release_task);
+            spawn_intent(&snap, &actuator, &mut brake_task, &mut release_task);
         } else {
             // Publication is outside the safety critical path and never awaited.
             let _ = publisher.try_publish(&telemetry.to_sensory_mapping());
@@ -278,21 +284,31 @@ fn log_safety_snapshot(snap: &SafetySnapshot, warned_brake_held_sim: &mut bool) 
     }
 }
 
+/// Handle to an in-flight privileged actuation attempt.
+type ActuationTask = JoinHandle<Result<(), ActuatorError>>;
+
+/// Dispatch the machine's [`BrakeIntent`] onto a blocking worker so the
+/// telemetry loop is never stalled by `nvidia-smi`. Actuation always goes
+/// through the [`SafetyActuator`] boundary; the outcome is fed back into the
+/// pure [`SafetyMachine`] by the caller.
 fn spawn_intent(
     snap: &SafetySnapshot,
-    brake_task: &mut Option<JoinHandle<Result<(), String>>>,
-    release_task: &mut Option<JoinHandle<Result<(), String>>>,
+    actuator: &Arc<dyn SafetyActuator>,
+    brake_task: &mut Option<ActuationTask>,
+    release_task: &mut Option<ActuationTask>,
 ) {
     match snap.intent {
         BrakeIntent::Apply if brake_task.is_none() && release_task.is_none() => {
-            *brake_task = Some(tokio::task::spawn_blocking(|| {
-                HardwareBridge::apply_emergency_brake(BRAKE_FRACTION)
+            let actuator = Arc::clone(actuator);
+            *brake_task = Some(tokio::task::spawn_blocking(move || {
+                actuator.apply_emergency_brake(BRAKE_FRACTION)
             }));
         }
         BrakeIntent::Release if release_task.is_none() && brake_task.is_none() => {
-            *release_task = Some(tokio::task::spawn_blocking(
-                HardwareBridge::release_emergency_brake,
-            ));
+            let actuator = Arc::clone(actuator);
+            *release_task = Some(tokio::task::spawn_blocking(move || {
+                actuator.release_emergency_brake()
+            }));
         }
         _ => {}
     }

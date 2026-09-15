@@ -1,10 +1,17 @@
-//! Hardware Bridge — GPU Telemetry & privileged power-limit actuation
+//! Hardware Bridge — GPU telemetry acquisition & privileged NVML actuation.
 //!
-//! Raw NVML acquisition and `nvidia-smi` brake/release live here. Validation,
-//! normalization, freshness, and provenance live in [`crate::telemetry`].
-//! Deterministic safety classification and hysteresis live in [`crate::safety`].
+//! Raw NVML acquisition lives on [`HardwareBridge`]; the `nvidia-smi`
+//! brake/release backend lives on [`NvmlActuator`]. Validation, normalization,
+//! freshness, and provenance live in [`crate::telemetry`]. Deterministic safety
+//! classification, hysteresis, and the [`SafetyActuator`] boundary live in
+//! [`crate::safety`].
+//!
+//! [`NvmlActuator`] is a hardware *adapter*: it implements [`SafetyActuator`]
+//! against NVML / `nvidia-smi`, but defines none of the generic safety
+//! semantics (thresholds, hysteresis, fail-closed policy) — those belong to
+//! [`crate::safety`].
 
-use crate::safety::instant_status;
+use crate::safety::{ActuatorError, BrakeMatch, SafetyActuator, instant_status};
 use crate::telemetry::{
     DEFAULT_ACQUISITION_CADENCE_MS, RawTelemetry, TelemetryFrame, TelemetrySource,
     assess_with_cadence, unix_now_ms,
@@ -126,23 +133,42 @@ impl HardwareBridge {
     pub fn check_safety(frame: &TelemetryFrame) -> (SafetyStatus, bool) {
         instant_status(frame)
     }
+}
 
+// ── NVML / nvidia-smi safety actuator (privileged backend, GH#46) ───
+
+/// [`SafetyActuator`] backed by NVML (for reads) and `nvidia-smi` (for the
+/// privileged power-limit mutation).
+///
+/// A hardware adapter only: the emergency-brake *policy* (when to brake,
+/// hysteresis, fail-closed rules) is owned by [`crate::safety`]. This type just
+/// applies/releases/detects a power-limit brake and reports typed
+/// [`ActuatorError`]s.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NvmlActuator;
+
+impl NvmlActuator {
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl SafetyActuator for NvmlActuator {
     /// CLOSED LOOP CONTROL: The Emergency Brake.
-    /// Throttles GPU power to the given fraction of the device's *default* power limit
+    /// Throttles GPU power to `pct` of the device's *default* power limit
     /// (not the current limit) to avoid compounding throttle across restarts.
     /// Fails closed if NVML cannot report a real limit — never invents a hardcoded wattage.
-    pub fn apply_emergency_brake(pct: f32) -> Result<(), String> {
+    fn apply_emergency_brake(&self, pct: f32) -> Result<(), ActuatorError> {
         // Prefer default PL as base so restarts cannot stack 50% on an already-braked limit.
-        let base_limit = Self::query_default_power_limit_w()
-            .or_else(Self::query_power_limit_w)
-            .ok_or_else(|| {
-                "Cannot query GPU power limit via NVML; refusing arbitrary fallback".to_string()
-            })?;
+        let base_limit = query_default_power_limit_w()
+            .or_else(query_power_limit_w)
+            .ok_or(ActuatorError::PowerLimitUnavailable)?;
         let pct = pct.clamp(0.1, 1.0);
         let target_pl = (base_limit as f32 * pct) as u32;
 
         // Already at or below target (e.g. leftover brake from a previous process).
-        if let Some(current) = Self::query_power_limit_w().filter(|&c| c <= target_pl) {
+        if let Some(current) = query_power_limit_w().filter(|&c| c <= target_pl) {
             println!(
                 "[hardware_bridge] EMERGENCY BRAKE: already at or below target {target_pl}W (current {current}W)"
             );
@@ -156,80 +182,83 @@ impl HardwareBridge {
             base_limit
         );
 
-        Self::set_power_limit_w(target_pl)
+        set_power_limit_w(target_pl)
     }
 
     /// Release the emergency brake — restore GPU power limit to its default.
     /// Fails closed if the default cannot be queried (never restores a fabricated wattage).
-    pub fn release_emergency_brake() -> Result<(), String> {
-        let default_limit = Self::query_default_power_limit_w().ok_or_else(|| {
-            "Cannot query default power limit via NVML; refusing to restore an arbitrary value"
-                .to_string()
-        })?;
+    fn release_emergency_brake(&self) -> Result<(), ActuatorError> {
+        let default_limit =
+            query_default_power_limit_w().ok_or(ActuatorError::PowerLimitUnavailable)?;
         println!(
             "[hardware_bridge] RELEASING BRAKE: Restoring PL to {}W (device default)",
             default_limit
         );
 
-        Self::set_power_limit_w(default_limit)
+        set_power_limit_w(default_limit)
     }
 
-    /// Returns `(current_w, default_w, expected_brake_w)` only when both limits are known
-    /// and the current limit matches this relay's emergency-brake target. This avoids
-    /// treating an operator-configured sub-default cap as an app-owned brake to auto-release.
-    pub fn power_limit_matches_emergency_brake(pct: f32) -> Option<(u32, u32, u32)> {
-        let current = Self::query_power_limit_w()?;
-        let default = Self::query_default_power_limit_w()?;
-        let expected = (default as f32 * pct.clamp(0.1, 1.0)) as u32;
+    /// Detect a leftover brake whose current limit matches this relay's
+    /// emergency-brake target. This avoids treating an operator-configured
+    /// sub-default cap as an app-owned brake to auto-release. Returns `None`
+    /// when both limits cannot be queried or the current limit does not match.
+    fn detect_engaged_brake(&self, pct: f32) -> Option<BrakeMatch> {
+        let current_w = query_power_limit_w()?;
+        let default_w = query_default_power_limit_w()?;
+        let expected_w = (default_w as f32 * pct.clamp(0.1, 1.0)) as u32;
         let tolerance_w = 2;
-        if current.abs_diff(expected) <= tolerance_w {
-            Some((current, default, expected))
+        if current_w.abs_diff(expected_w) <= tolerance_w {
+            Some(BrakeMatch {
+                current_w,
+                default_w,
+                expected_w,
+            })
         } else {
             None
         }
     }
+}
 
-    /// Set GPU power limit via `timeout` + non-interactive `sudo -n` so a password
-    /// prompt or wedged nvidia-smi cannot stall the relay loop indefinitely.
-    fn set_power_limit_w(limit_w: u32) -> Result<(), String> {
-        // -k 2: escalate SIGTERM -> SIGKILL so a wedged nvidia-smi cannot stall forever.
-        let status = std::process::Command::new("timeout")
-            .args([
-                "-k",
-                "2",
-                "5s",
-                "sudo",
-                "-n",
-                "nvidia-smi",
-                "-pl",
-                &limit_w.to_string(),
-            ])
-            .status()
-            .map_err(|e| format!("Failed to exec nvidia-smi: {e}"))?;
+/// Set GPU power limit via `timeout` + non-interactive `sudo -n` so a password
+/// prompt or wedged nvidia-smi cannot stall the relay loop indefinitely.
+fn set_power_limit_w(limit_w: u32) -> Result<(), ActuatorError> {
+    // -k 2: escalate SIGTERM -> SIGKILL so a wedged nvidia-smi cannot stall forever.
+    let status = std::process::Command::new("timeout")
+        .args([
+            "-k",
+            "2",
+            "5s",
+            "sudo",
+            "-n",
+            "nvidia-smi",
+            "-pl",
+            &limit_w.to_string(),
+        ])
+        .status()
+        .map_err(|e| ActuatorError::CommandFailed(format!("Failed to exec nvidia-smi: {e}")))?;
 
-        if !status.success() {
-            return Err(format!(
-                "nvidia-smi -pl {limit_w} failed (timeout, missing passwordless sudo, or command error)"
-            ));
-        }
-        Ok(())
+    if !status.success() {
+        return Err(ActuatorError::CommandFailed(format!(
+            "nvidia-smi -pl {limit_w} failed (timeout, missing passwordless sudo, or command error)"
+        )));
     }
+    Ok(())
+}
 
-    /// Query the GPU's current power management limit in watts via NVML.
-    fn query_power_limit_w() -> Option<u32> {
-        let nvml = NVML.as_ref()?;
-        let device = nvml.device_by_index(0).ok()?;
-        let limit_mw = device.power_management_limit().ok()?;
-        Some(limit_mw / 1000)
-    }
+/// Query the GPU's current power management limit in watts via NVML.
+fn query_power_limit_w() -> Option<u32> {
+    let nvml = NVML.as_ref()?;
+    let device = nvml.device_by_index(0).ok()?;
+    let limit_mw = device.power_management_limit().ok()?;
+    Some(limit_mw / 1000)
+}
 
-    /// Query the GPU's default (enforced) power management limit in watts via NVML.
-    fn query_default_power_limit_w() -> Option<u32> {
-        let nvml = NVML.as_ref()?;
-        let device = nvml.device_by_index(0).ok()?;
-        let limit_mw = device.power_management_limit_default().ok()?;
-        Some(limit_mw / 1000)
-    }
+/// Query the GPU's default (enforced) power management limit in watts via NVML.
+fn query_default_power_limit_w() -> Option<u32> {
+    let nvml = NVML.as_ref()?;
+    let device = nvml.device_by_index(0).ok()?;
+    let limit_mw = device.power_management_limit_default().ok()?;
+    Some(limit_mw / 1000)
 }
 
 /// Derive an observability-only Vcore estimate from board power.
@@ -467,6 +496,28 @@ mod tests {
     fn test_is_gpu_healthy_does_not_panic() {
         let result = std::panic::catch_unwind(HardwareBridge::is_gpu_healthy);
         assert!(result.is_ok(), "is_gpu_healthy should not panic");
+    }
+
+    /// Without a real GPU (no NVML), actuation must fail closed with a typed
+    /// [`ActuatorError`] rather than inventing a wattage or panicking.
+    #[test]
+    fn test_nvml_actuator_fails_closed_without_gpu() {
+        // In CI there is no NVIDIA device, so NVML queries return None and every
+        // actuation path must surface a typed error / no match.
+        if query_default_power_limit_w().is_some() || query_power_limit_w().is_some() {
+            // A real GPU is present (unusual in CI) — skip the fail-closed asserts.
+            return;
+        }
+        let actuator = NvmlActuator::new();
+        assert_eq!(
+            actuator.apply_emergency_brake(0.5),
+            Err(ActuatorError::PowerLimitUnavailable)
+        );
+        assert_eq!(
+            actuator.release_emergency_brake(),
+            Err(ActuatorError::PowerLimitUnavailable)
+        );
+        assert_eq!(actuator.detect_engaged_brake(0.5), None);
     }
 
     #[test]

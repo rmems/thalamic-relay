@@ -9,6 +9,7 @@
 //! Transition rules: [`docs/safety.md`](../../docs/safety.md).
 
 use crate::telemetry::{SampleValidity, TelemetryFrame, TelemetrySample, TelemetrySource};
+use std::sync::Mutex;
 
 /// Consecutive real [`AssessmentKind::Ok`] evaluations required before a release intent.
 pub const RELEASE_OK_STREAK: u32 = 3;
@@ -553,6 +554,265 @@ fn worst_safety_fault(frame: &TelemetryFrame) -> Option<FrameAssessment> {
                 Some(ap)
             }
         }
+    }
+}
+
+// ── Actuation boundary (GH#46) ──────────────────────────────────────
+
+/// Typed, observable failure of a privileged actuation attempt.
+///
+/// Represented explicitly (never a bare `String` at the actuator boundary) so
+/// the supervisor can surface actuator failures — the `SafetyMachine` feeds
+/// these into the [`SafetyState::ActuatorFailure`] observability path (GH#42).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActuatorError {
+    /// A real power limit could not be queried; refusing an arbitrary fallback.
+    PowerLimitUnavailable,
+    /// The actuation command failed (subprocess spawn error, timeout, missing
+    /// passwordless sudo, or a non-zero exit).
+    CommandFailed(String),
+}
+
+impl std::fmt::Display for ActuatorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PowerLimitUnavailable => write!(
+                f,
+                "power limit unavailable via backend; refusing arbitrary fallback"
+            ),
+            Self::CommandFailed(msg) => write!(f, "actuation command failed: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for ActuatorError {}
+
+/// A detected engaged brake: the current, default, and expected-brake limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrakeMatch {
+    pub current_w: u32,
+    pub default_w: u32,
+    pub expected_w: u32,
+}
+
+/// The privileged hardware-safety actuation boundary.
+///
+/// Implementations apply/release a hardware power-limit brake and detect a
+/// leftover brake at startup. The NVML/`nvidia-smi` backend lives in
+/// [`crate::gpu`]; [`FakeActuator`] provides a deterministic test double. This
+/// trait is the actuation half of GH#46: the [`SafetyMachine`] decides *intent*
+/// ([`BrakeIntent`]) and never actuates, while implementations here perform the
+/// privileged side effect and report typed [`ActuatorError`]s.
+///
+/// Implementations must be `Send + Sync` so the supervisor can drive them from
+/// blocking worker tasks without stalling the telemetry loop.
+pub trait SafetyActuator: Send + Sync {
+    /// Engage the emergency brake, throttling to `pct` of the device *default*
+    /// power limit. Must fail closed with [`ActuatorError`] rather than
+    /// inventing a hardcoded wattage.
+    fn apply_emergency_brake(&self, pct: f32) -> Result<(), ActuatorError>;
+
+    /// Release the emergency brake, restoring the device default power limit.
+    fn release_emergency_brake(&self) -> Result<(), ActuatorError>;
+
+    /// Detect a leftover brake matching this relay's `pct` target (e.g. after a
+    /// crash/restart), so the supervisor can adopt and later release it. Returns
+    /// `None` when no matching brake is present or the limits cannot be queried.
+    fn detect_engaged_brake(&self, pct: f32) -> Option<BrakeMatch>;
+}
+
+/// Deterministic in-memory [`SafetyActuator`] for tests.
+///
+/// Records apply/release call counts, tracks engaged state, and can be
+/// configured to fail apply and/or release to exercise fail-closed paths.
+#[derive(Debug, Default)]
+pub struct FakeActuator {
+    state: Mutex<FakeState>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct FakeState {
+    engaged: bool,
+    apply_calls: u32,
+    release_calls: u32,
+    fail_apply: Option<ActuatorError>,
+    fail_release: Option<ActuatorError>,
+    detected: Option<BrakeMatch>,
+}
+
+impl FakeActuator {
+    /// A fake with no brake engaged and no injected failures.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Configure [`SafetyActuator::apply_emergency_brake`] to fail with `err`.
+    pub fn set_apply_failure(&self, err: Option<ActuatorError>) {
+        self.state.lock().unwrap().fail_apply = err;
+    }
+
+    /// Configure [`SafetyActuator::release_emergency_brake`] to fail with `err`.
+    pub fn set_release_failure(&self, err: Option<ActuatorError>) {
+        self.state.lock().unwrap().fail_release = err;
+    }
+
+    /// Configure the [`BrakeMatch`] returned by
+    /// [`SafetyActuator::detect_engaged_brake`].
+    pub fn set_detected_brake(&self, detected: Option<BrakeMatch>) {
+        self.state.lock().unwrap().detected = detected;
+    }
+
+    /// Whether the fake brake is currently engaged.
+    #[must_use]
+    pub fn is_engaged(&self) -> bool {
+        self.state.lock().unwrap().engaged
+    }
+
+    /// Number of apply calls received.
+    #[must_use]
+    pub fn apply_calls(&self) -> u32 {
+        self.state.lock().unwrap().apply_calls
+    }
+
+    /// Number of release calls received.
+    #[must_use]
+    pub fn release_calls(&self) -> u32 {
+        self.state.lock().unwrap().release_calls
+    }
+}
+
+impl SafetyActuator for FakeActuator {
+    fn apply_emergency_brake(&self, _pct: f32) -> Result<(), ActuatorError> {
+        let mut state = self.state.lock().unwrap();
+        state.apply_calls += 1;
+        if let Some(err) = state.fail_apply.clone() {
+            return Err(err);
+        }
+        state.engaged = true;
+        Ok(())
+    }
+
+    fn release_emergency_brake(&self) -> Result<(), ActuatorError> {
+        let mut state = self.state.lock().unwrap();
+        state.release_calls += 1;
+        if let Some(err) = state.fail_release.clone() {
+            return Err(err);
+        }
+        state.engaged = false;
+        Ok(())
+    }
+
+    fn detect_engaged_brake(&self, _pct: f32) -> Option<BrakeMatch> {
+        self.state.lock().unwrap().detected
+    }
+}
+
+#[cfg(test)]
+mod actuator_tests {
+    use super::*;
+
+    #[test]
+    fn fake_actuator_tracks_engage_release() {
+        let fake = FakeActuator::new();
+        assert!(!fake.is_engaged());
+        fake.apply_emergency_brake(BRAKE_FRACTION).unwrap();
+        assert!(fake.is_engaged());
+        assert_eq!(fake.apply_calls(), 1);
+        fake.release_emergency_brake().unwrap();
+        assert!(!fake.is_engaged());
+        assert_eq!(fake.release_calls(), 1);
+    }
+
+    #[test]
+    fn fake_actuator_injects_failures() {
+        let fake = FakeActuator::new();
+        fake.set_apply_failure(Some(ActuatorError::PowerLimitUnavailable));
+        assert_eq!(
+            fake.apply_emergency_brake(BRAKE_FRACTION),
+            Err(ActuatorError::PowerLimitUnavailable)
+        );
+        assert!(!fake.is_engaged());
+        assert_eq!(fake.apply_calls(), 1);
+
+        fake.set_apply_failure(None);
+        fake.apply_emergency_brake(BRAKE_FRACTION).unwrap();
+        assert!(fake.is_engaged());
+
+        fake.set_release_failure(Some(ActuatorError::CommandFailed("boom".into())));
+        assert!(fake.release_emergency_brake().is_err());
+        assert!(fake.is_engaged());
+    }
+
+    #[test]
+    fn fake_actuator_reports_detected_brake() {
+        let fake = FakeActuator::new();
+        assert_eq!(fake.detect_engaged_brake(BRAKE_FRACTION), None);
+        let m = BrakeMatch {
+            current_w: 150,
+            default_w: 300,
+            expected_w: 150,
+        };
+        fake.set_detected_brake(Some(m));
+        assert_eq!(fake.detect_engaged_brake(BRAKE_FRACTION), Some(m));
+    }
+
+    #[test]
+    fn actuator_error_display_is_stable() {
+        assert!(
+            ActuatorError::PowerLimitUnavailable
+                .to_string()
+                .contains("power limit unavailable")
+        );
+        assert!(
+            ActuatorError::CommandFailed("x".into())
+                .to_string()
+                .contains("x")
+        );
+    }
+
+    /// End-to-end: the pure `SafetyMachine` policy driving a `FakeActuator`,
+    /// with no GPU and no subprocess.
+    #[test]
+    fn machine_drives_fake_actuator_critical_then_recovery() {
+        use crate::telemetry::{assess, fixtures};
+
+        fn frame(temp_c: f32, power_w: f32) -> TelemetryFrame {
+            let mut raw = fixtures::healthy_real();
+            raw.gpu_temp_c = Some(temp_c);
+            raw.power_w = Some(power_w);
+            assess(&raw, fixtures::NOW)
+        }
+
+        let fake = FakeActuator::new();
+        let mut machine = SafetyMachine::new();
+
+        // Overheat → Apply intent → drive the fake actuator.
+        let snap = machine.evaluate(&frame(95.0, 200.0));
+        assert_eq!(snap.intent, BrakeIntent::Apply);
+        let outcome = match fake.apply_emergency_brake(BRAKE_FRACTION) {
+            Ok(()) => ActuatorOutcome::Applied,
+            Err(e) => ActuatorOutcome::ApplyFailed(e.to_string()),
+        };
+        let snap = machine.record_actuator(outcome);
+        assert!(snap.brake_engaged);
+        assert!(fake.is_engaged());
+
+        // Three real Ok readings → Release intent → drive the fake actuator.
+        let cool = frame(60.0, 150.0);
+        let _ = machine.evaluate(&cool);
+        let _ = machine.evaluate(&cool);
+        let snap = machine.evaluate(&cool);
+        assert_eq!(snap.intent, BrakeIntent::Release);
+        let outcome = match fake.release_emergency_brake() {
+            Ok(()) => ActuatorOutcome::Released,
+            Err(e) => ActuatorOutcome::ReleaseFailed(e.to_string()),
+        };
+        let snap = machine.record_actuator(outcome);
+        assert!(!snap.brake_engaged);
+        assert!(!fake.is_engaged());
+        assert_eq!(fake.apply_calls(), 1);
+        assert_eq!(fake.release_calls(), 1);
     }
 }
 
