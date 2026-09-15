@@ -13,8 +13,8 @@
 
 use crate::safety::{ActuatorError, BrakeMatch, SafetyActuator, instant_status};
 use crate::telemetry::{
-    DEFAULT_ACQUISITION_CADENCE_MS, RawTelemetry, TelemetryFrame, TelemetrySource,
-    assess_with_cadence, unix_now_ms,
+    DEFAULT_ACQUISITION_CADENCE_MS, RawTelemetry, SampleClock, TelemetryFrame, TelemetrySource,
+    TimestampOrigin, assess_with_clock, unix_now_ms,
 };
 use lazy_static::lazy_static;
 use nvml_wrapper::Nvml;
@@ -45,8 +45,17 @@ impl HardwareBridge {
 
     /// Acquire + assess with the configured supervisor tick interval.
     pub fn read_telemetry_with(force_software: bool, cadence_ms: u64) -> TelemetryFrame {
+        Self::read_telemetry_with_clock(force_software, cadence_ms, &mut SampleClock::new())
+    }
+
+    /// Acquire + assess through a shared session [`SampleClock`].
+    pub fn read_telemetry_with_clock(
+        force_software: bool,
+        cadence_ms: u64,
+        clock: &mut SampleClock,
+    ) -> TelemetryFrame {
         let raw = Self::acquire_raw(force_software);
-        assess_with_cadence(&raw, unix_now_ms(), cadence_ms)
+        assess_with_clock(&raw, unix_now_ms(), cadence_ms, clock)
     }
 
     /// Raw acquisition only — no validation, no silent zeros for missing sensors.
@@ -106,7 +115,8 @@ impl HardwareBridge {
         let vddcr_gfx_v = power_w.map(derive_vddcr_gfx_v);
 
         Some(RawTelemetry {
-            observed_at,
+            source_unix_ms: Some(observed_at),
+            timestamp_origin: TimestampOrigin::LiveAcquire,
             source: TelemetrySource::Nvml,
             gpu_temp_c,
             // nvml-wrapper 0.10 only exposes TemperatureSensor::Gpu. Do not
@@ -542,5 +552,27 @@ mod tests {
         assert_eq!(util.raw, Some(0.0));
         assert_eq!(util.normalized, Some(0.0));
         assert_eq!(util.validity, SampleValidity::Valid);
+        assert_eq!(mapping.timestamp_origin, TimestampOrigin::Simulated);
+        assert_eq!(mapping.batch_id, 0);
+        assert!(!mapping.session_id.is_empty());
+        assert!(mapping.source_unix_ms.is_some());
+        assert!(
+            mapping.received_at_unix_ms >= mapping.source_unix_ms.unwrap(),
+            "receive time is at or after source time on the live simulated path"
+        );
+    }
+
+    #[test]
+    fn test_software_fallback_frames_share_sample_clock_sequence() {
+        let mut clock = SampleClock::with_session_id("hw-session");
+        let a = HardwareBridge::read_telemetry_with_clock(true, 50, &mut clock);
+        let b = HardwareBridge::read_telemetry_with_clock(true, 50, &mut clock);
+        assert_eq!(a.session_id, "hw-session");
+        assert_eq!(a.session_id, b.session_id);
+        assert_eq!(a.batch_id, 0);
+        assert_eq!(b.batch_id, 1);
+        assert_eq!(a.timestamp_origin, TimestampOrigin::Simulated);
+        assert_eq!(b.timestamp_origin, TimestampOrigin::Simulated);
+        assert!(b.received_at_unix_ms >= a.received_at_unix_ms);
     }
 }
