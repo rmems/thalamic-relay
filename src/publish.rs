@@ -495,10 +495,17 @@ impl Drop for SensoryQueueConsumer {
             return;
         };
         inner.connected = false;
-        while inner.buf.pop_front().is_some() {
-            inner.record_drop(DropReason::Disconnected);
+        let leftover = inner.buf.len();
+        inner.buf.clear();
+        if leftover > 0 {
+            let slot = &mut inner.dropped_by_reason[DropReason::Disconnected.as_id()];
+            *slot = slot.saturating_add(leftover as u64);
         }
         inner.emit_gauges();
+        drop(inner);
+        for _ in 0..leftover {
+            record_drop(DropReason::Disconnected);
+        }
     }
 }
 
@@ -619,6 +626,22 @@ mod tests {
         assert!(pub_res.is_err());
         assert_eq!(snap.policy_state, SafetyState::TelemetryMissing);
         assert_eq!(snap.intent, BrakeIntent::Apply);
+    }
+
+    #[test]
+    fn queue_drop_consumer_counts_leftover_as_disconnected() {
+        let (queue, rx) =
+            IsolatedPublishQueue::bounded_with_policy(3, QueueFullPolicy::RejectNewest).unwrap();
+        queue.try_enqueue(mapping_at(1)).unwrap();
+        queue.try_enqueue(mapping_at(2)).unwrap();
+        drop(rx);
+        let snap = queue.snapshot();
+        assert_eq!(snap.depth, 0);
+        assert_eq!(snap.dropped(DropReason::Disconnected), 2);
+        assert_eq!(
+            queue.try_enqueue(mapping_at(3)),
+            Err(PublishError::Disconnected)
+        );
     }
 
     #[test]

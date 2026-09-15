@@ -229,8 +229,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
             spawn_intent(&snap, &actuator, &mut brake_task, &mut release_task);
         } else {
-            // Publication is outside the safety critical path and never awaited.
-            let _ = publisher.try_publish(&telemetry.to_sensory_mapping());
+            // Do not enqueue the older start-of-tick frame after a post-actuation
+            // re-evaluation already published a fresher sample.
+            enqueue_loop_start_if_unevaluated(evaluated_this_iter, &telemetry, &publisher);
         }
 
         {
@@ -241,6 +242,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         print_dashboard(&telemetry, step_count, machine.snapshot().state);
 
         sleep(Duration::from_millis(cli.step_interval_ms)).await;
+    }
+}
+
+/// Enqueue the loop-start telemetry frame unless this iteration already
+/// published a fresher post-actuation sample.
+fn enqueue_loop_start_if_unevaluated<P: SensoryPublisher>(
+    evaluated_this_iter: bool,
+    telemetry: &TelemetryFrame,
+    publisher: &P,
+) -> Option<Result<(), thalamic_relay::publish::PublishError>> {
+    if evaluated_this_iter {
+        None
+    } else {
+        Some(publisher.try_publish(&telemetry.to_sensory_mapping()))
     }
 }
 
@@ -405,6 +420,7 @@ fn parse_sensory_queue_capacity(s: &str) -> Result<usize, String> {
 mod tests {
     use super::*;
     use clap::Parser;
+    use thalamic_relay::telemetry::{assess, fixtures};
 
     #[test]
     fn parses_custom_args_and_env_equiv() {
@@ -520,8 +536,6 @@ mod tests {
 
     #[test]
     fn dashboard_shows_only_valid_present_as_live_hardware() {
-        use thalamic_relay::telemetry::{assess, fixtures};
-
         let live = assess(&fixtures::healthy_real(), fixtures::NOW);
         assert_eq!(
             format_live_reading(&live.power_w, |w| format!("{w:.0}W")),
@@ -545,5 +559,20 @@ mod tests {
             format_live_reading(&missing.power_w, |w| format!("{w:.0}W")),
             "n/a"
         );
+    }
+
+    #[test]
+    fn queue_skips_loop_start_frame_after_post_actuation_eval() {
+        let (queue, _rx) = IsolatedPublishQueue::bounded(4).unwrap();
+        let frame = assess(&fixtures::healthy_real(), fixtures::NOW);
+        assert!(enqueue_loop_start_if_unevaluated(true, &frame, &queue).is_none());
+        assert_eq!(queue.snapshot().depth, 0);
+        assert!(
+            enqueue_loop_start_if_unevaluated(false, &frame, &queue)
+                .unwrap()
+                .is_ok()
+        );
+        assert_eq!(queue.snapshot().depth, 1);
+        assert_eq!(queue.snapshot().enqueued_total, 1);
     }
 }
