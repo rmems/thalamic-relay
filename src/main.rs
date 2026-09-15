@@ -6,10 +6,16 @@ use thalamic_relay::cpu::{self, RelayMetrics};
 use thalamic_relay::gpu::{HardwareBridge, NvmlActuator};
 use thalamic_relay::publish::{AbsentPublisher, SensoryPublisher, evaluate_then_try_publish};
 use thalamic_relay::safety::{
-    ActuatorError, ActuatorOutcome, BRAKE_FRACTION, BrakeIntent, SafetyActuator, SafetyMachine,
-    SafetySnapshot, SafetyState,
+    ActuatorError, ActuatorOutcome, BRAKE_FRACTION, BrakeIntent, PowerLimitObservation,
+    SafetyActuator, SafetyMachine, SafetySnapshot, SafetyState, classify_power_limit,
+};
+use thalamic_relay::shutdown::{
+    InFlightActuation, InFlightJoin, SHUTDOWN_ACTUATOR_TIMEOUT, SHUTDOWN_METRICS_TIMEOUT,
+    ShutdownActuation, ShutdownPlan, ShutdownReason, join_in_flight, plan_shutdown,
+    shutdown_metrics_collector,
 };
 use thalamic_relay::telemetry::{SampleValidity, TelemetryFrame, TelemetrySample, TelemetrySource};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
@@ -89,8 +95,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let relay_metrics = Arc::new(Mutex::new(RelayMetrics::default()));
     let metrics_clone = Arc::clone(&relay_metrics);
-    tokio::spawn(async move {
-        cpu::run_metrics_collector(metrics_clone).await;
+    let (metrics_shutdown_tx, metrics_shutdown_rx) = tokio::sync::watch::channel(false);
+    let metrics_task = tokio::spawn(async move {
+        cpu::run_metrics_collector(metrics_clone, metrics_shutdown_rx).await;
     });
 
     println!("[relay] --- Thalamic Relay ---");
@@ -115,21 +122,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Detect leftover throttle from a prior crash (hardware PL persists across process restarts).
     // Only seed brake_applied when the current limit matches this relay's expected 50% brake
     // target, so deliberate operator-set sub-default caps are not auto-restored to default.
-    if let Some(m) = actuator.detect_engaged_brake(BRAKE_FRACTION) {
-        eprintln!(
-            "[relay] WARNING: GPU power limit {}W matches expected emergency brake \
-             target {}W (default {}W); will auto-release after Ok streak",
-            m.current_w, m.expected_w, m.default_w
-        );
-        machine.seed_brake_applied();
-        let seed = machine.snapshot();
-        {
-            let mut metrics = relay_metrics.lock().unwrap();
-            cpu::record_safety_snapshot(&mut metrics, &seed);
+    // This query uses the real actuator even under `--force-software-only`: simulated
+    // telemetry must not hide or authorize release of a real persistent brake.
+    let (current_w, default_w) = actuator.query_power_limits_w();
+    match classify_power_limit(current_w, default_w, BRAKE_FRACTION) {
+        PowerLimitObservation::RelayOwnedBrake(m) => {
+            eprintln!(
+                "[relay] WARNING: GPU power limit {}W matches expected emergency brake \
+                 target {}W (default {}W); will auto-release after Ok streak",
+                m.current_w, m.expected_w, m.default_w
+            );
+            machine.seed_brake_applied();
+            let seed = machine.snapshot();
+            {
+                let mut metrics = relay_metrics.lock().unwrap();
+                cpu::record_safety_snapshot(&mut metrics, &seed);
+            }
         }
+        PowerLimitObservation::ForeignSubDefaultCap {
+            current_w,
+            default_w,
+            expected_brake_w,
+        } => {
+            eprintln!(
+                "[relay] GPU power limit {current_w}W is below default {default_w}W but does not \
+                 match relay brake target {expected_brake_w}W; leaving operator/device cap unchanged"
+            );
+        }
+        PowerLimitObservation::Unreadable => {
+            tracing::info!(
+                "power limits unreadable at startup; first-frame eval will fail-closed if needed"
+            );
+        }
+        PowerLimitObservation::AtOrAboveDefault { .. } => {}
     }
 
-    loop {
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    let mut sigterm = signal(SignalKind::terminate())?;
+
+    let shutdown_reason = loop {
         step_count += 1;
         let telemetry =
             HardwareBridge::read_telemetry_with(cli.force_software_only, cli.step_interval_ms);
@@ -226,8 +258,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         print_dashboard(&telemetry, step_count, machine.snapshot().state);
 
-        sleep(Duration::from_millis(cli.step_interval_ms)).await;
-    }
+        tokio::select! {
+            _ = &mut ctrl_c => {
+                break ShutdownReason::Sigint;
+            }
+            _ = sigterm.recv() => {
+                break ShutdownReason::Sigterm;
+            }
+            _ = sleep(Duration::from_millis(cli.step_interval_ms)) => {}
+        }
+    };
+
+    let _plan = perform_orderly_shutdown(
+        shutdown_reason,
+        &mut machine,
+        &mut brake_task,
+        &mut release_task,
+        &relay_metrics,
+        &mut warned_brake_held_sim,
+        &metrics_shutdown_tx,
+        metrics_task,
+    )
+    .await;
+    eprintln!("[relay] releasing process lock {lock_path}");
+
+    Ok(())
 }
 
 fn store_safety(
@@ -238,6 +293,116 @@ fn store_safety(
     log_safety_snapshot(snap, warned_brake_held_sim);
     let mut metrics = relay_metrics.lock().unwrap();
     cpu::record_safety_snapshot(&mut metrics, snap);
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn perform_orderly_shutdown(
+    reason: ShutdownReason,
+    machine: &mut SafetyMachine,
+    brake_task: &mut Option<ActuationTask>,
+    release_task: &mut Option<ActuationTask>,
+    relay_metrics: &Arc<Mutex<RelayMetrics>>,
+    warned_brake_held_sim: &mut bool,
+    metrics_shutdown: &tokio::sync::watch::Sender<bool>,
+    metrics_task: JoinHandle<()>,
+) -> ShutdownPlan {
+    let snap = machine.snapshot();
+    let in_flight = InFlightActuation::from_tasks(brake_task.is_some(), release_task.is_some());
+    let plan = plan_shutdown(reason, &snap, in_flight);
+
+    println!();
+    eprintln!(
+        "[relay] shutdown reason={} state={} policy_state={} brake_engaged={} desired_brake={} \
+         in_flight={} unresolved_brake={} unresolved_actuator={} actuation={} ({})",
+        plan.reason.as_str(),
+        snap.state.as_str(),
+        snap.policy_state.as_str(),
+        snap.brake_engaged,
+        snap.desired_brake,
+        in_flight.as_str(),
+        plan.unresolved_brake,
+        plan.unresolved_actuator,
+        plan.actuation.as_str(),
+        plan.summary,
+    );
+    tracing::info!(
+        reason = plan.reason.as_str(),
+        state = snap.state.as_str(),
+        policy_state = snap.policy_state.as_str(),
+        brake_engaged = snap.brake_engaged,
+        desired_brake = snap.desired_brake,
+        in_flight = in_flight.as_str(),
+        unresolved_brake = plan.unresolved_brake,
+        unresolved_actuator = plan.unresolved_actuator,
+        actuation = plan.actuation.as_str(),
+        summary = plan.summary,
+        "orderly shutdown (fail-closed: no new power-limit restore)"
+    );
+
+    {
+        let mut metrics = relay_metrics.lock().unwrap();
+        cpu::record_shutdown(&mut metrics, &plan);
+    }
+
+    match plan.actuation {
+        ShutdownActuation::Idle => {
+            if let Some(task) = brake_task.take() {
+                task.abort();
+            }
+            if let Some(task) = release_task.take() {
+                task.abort();
+            }
+        }
+        ShutdownActuation::AwaitApply => {
+            if let Some(task) = brake_task.take() {
+                match join_in_flight(task, SHUTDOWN_ACTUATOR_TIMEOUT).await {
+                    InFlightJoin::Succeeded => {
+                        let snap = machine.record_actuator(ActuatorOutcome::Applied);
+                        store_safety(relay_metrics, &snap, warned_brake_held_sim);
+                    }
+                    InFlightJoin::Failed(e) | InFlightJoin::Panicked(e) => {
+                        eprintln!("[relay] shutdown: in-flight apply did not succeed: {e}");
+                        let snap = machine.record_actuator(ActuatorOutcome::ApplyFailed(e));
+                        store_safety(relay_metrics, &snap, warned_brake_held_sim);
+                    }
+                    InFlightJoin::TimedOut => {
+                        eprintln!(
+                            "[relay] shutdown: in-flight apply timed out; leaving hardware unchanged"
+                        );
+                    }
+                }
+            }
+            if let Some(task) = release_task.take() {
+                task.abort();
+            }
+        }
+        ShutdownActuation::AwaitAuthorizedRelease => {
+            if let Some(task) = release_task.take() {
+                match join_in_flight(task, SHUTDOWN_ACTUATOR_TIMEOUT).await {
+                    InFlightJoin::Succeeded => {
+                        let snap = machine.record_actuator(ActuatorOutcome::Released);
+                        store_safety(relay_metrics, &snap, warned_brake_held_sim);
+                    }
+                    InFlightJoin::Failed(e) | InFlightJoin::Panicked(e) => {
+                        eprintln!("[relay] shutdown: in-flight release did not succeed: {e}");
+                        let snap = machine.record_actuator(ActuatorOutcome::ReleaseFailed(e));
+                        store_safety(relay_metrics, &snap, warned_brake_held_sim);
+                    }
+                    InFlightJoin::TimedOut => {
+                        eprintln!(
+                            "[relay] shutdown: in-flight release timed out; leaving brake engaged"
+                        );
+                    }
+                }
+            }
+            if let Some(task) = brake_task.take() {
+                task.abort();
+            }
+        }
+    }
+
+    shutdown_metrics_collector(metrics_shutdown, metrics_task, SHUTDOWN_METRICS_TIMEOUT).await;
+    plan
 }
 
 fn log_safety_snapshot(snap: &SafetySnapshot, warned_brake_held_sim: &mut bool) {
@@ -465,5 +630,107 @@ mod tests {
             format_live_reading(&missing.power_w, |w| format!("{w:.0}W")),
             "n/a"
         );
+    }
+
+    #[tokio::test]
+    async fn orderly_shutdown_leaves_seeded_brake_and_stops_metrics() {
+        let mut machine = SafetyMachine::new();
+        machine.seed_brake_applied();
+        let mut brake_task = None;
+        let mut release_task = None;
+        let relay_metrics = Arc::new(Mutex::new(RelayMetrics::default()));
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let metrics_task = tokio::spawn(cpu::run_metrics_collector(Arc::clone(&relay_metrics), rx));
+        let mut warned = false;
+        let plan = perform_orderly_shutdown(
+            ShutdownReason::Sigterm,
+            &mut machine,
+            &mut brake_task,
+            &mut release_task,
+            &relay_metrics,
+            &mut warned,
+            &tx,
+            metrics_task,
+        )
+        .await;
+        assert_eq!(plan.actuation, ShutdownActuation::Idle);
+        assert!(plan.leave_brake_engaged);
+        assert!(plan.unresolved_brake);
+        assert!(machine.snapshot().brake_engaged);
+        assert_eq!(
+            relay_metrics.lock().unwrap().shutdown_reason,
+            Some("sigterm")
+        );
+    }
+
+    #[tokio::test]
+    async fn orderly_shutdown_records_in_flight_apply_without_release() {
+        use thalamic_relay::safety::FakeActuator;
+        use thalamic_relay::telemetry::{assess, fixtures};
+
+        let fake = Arc::new(FakeActuator::new());
+        let fake_task = Arc::clone(&fake);
+        let mut machine = SafetyMachine::new();
+        let mut raw = fixtures::healthy_real();
+        raw.gpu_temp_c = Some(90.0);
+        let snap = machine.evaluate(&assess(&raw, fixtures::NOW));
+        assert_eq!(snap.intent, BrakeIntent::Apply);
+
+        let mut brake_task = Some(tokio::task::spawn_blocking(move || {
+            fake_task.apply_emergency_brake(BRAKE_FRACTION)
+        }));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let mut release_task = None;
+        let relay_metrics = Arc::new(Mutex::new(RelayMetrics::default()));
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let metrics_task = tokio::spawn(cpu::run_metrics_collector(Arc::clone(&relay_metrics), rx));
+        let mut warned = false;
+        let plan = perform_orderly_shutdown(
+            ShutdownReason::Sigint,
+            &mut machine,
+            &mut brake_task,
+            &mut release_task,
+            &relay_metrics,
+            &mut warned,
+            &tx,
+            metrics_task,
+        )
+        .await;
+        assert_eq!(plan.actuation, ShutdownActuation::AwaitApply);
+        assert!(fake.is_engaged());
+        assert!(machine.snapshot().brake_engaged);
+        assert_eq!(fake.apply_calls(), 1);
+        assert_eq!(fake.release_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn orderly_shutdown_then_lock_guard_releases_file() {
+        let lock_path = "/tmp/thalamic_relay_test_shutdown.lock";
+        let _ = std::fs::remove_file(lock_path);
+        let guard = try_acquire_lock(lock_path).unwrap();
+        assert!(std::path::Path::new(lock_path).exists());
+
+        let mut machine = SafetyMachine::new();
+        let mut brake_task = None;
+        let mut release_task = None;
+        let relay_metrics = Arc::new(Mutex::new(RelayMetrics::default()));
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let metrics_task = tokio::spawn(cpu::run_metrics_collector(Arc::clone(&relay_metrics), rx));
+        let mut warned = false;
+        let _ = perform_orderly_shutdown(
+            ShutdownReason::Sigint,
+            &mut machine,
+            &mut brake_task,
+            &mut release_task,
+            &relay_metrics,
+            &mut warned,
+            &tx,
+            metrics_task,
+        )
+        .await;
+        assert!(std::path::Path::new(lock_path).exists());
+        drop(guard);
+        assert!(!std::path::Path::new(lock_path).exists());
     }
 }
