@@ -5,6 +5,7 @@
 //! transitions, CLI/process lifecycle, and IPC isolation. Typed `corpus-ipc`
 //! round-trips remain GH#40 / RM-1144.
 
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 use thalamic_relay::gpu::HardwareBridge;
@@ -47,7 +48,7 @@ fn binary_help_and_version_exit_zero_without_gpu() {
 fn binary_software_only_starts_without_nvidia() {
     let bin = env!("CARGO_BIN_EXE_thalamic-relay");
     let lock_path = "/tmp/thalamic_relay.lock";
-    let _ = std::fs::remove_file(lock_path);
+    reclaim_stale_production_lock(lock_path);
 
     let mut child = Command::new(bin)
         .args(["--force-software-only", "--step-interval-ms", "50"])
@@ -55,22 +56,57 @@ fn binary_software_only_starts_without_nvidia() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn thalamic-relay");
+    let child_pid = child.id();
 
     // Stop the supervisor ourselves so this test does not depend on coreutils
     // `timeout` (missing on some CI images / non-GNU hosts).
     std::thread::sleep(Duration::from_secs(1));
-    let _ = child.kill();
+    let still_running = child.try_wait().expect("poll thalamic-relay").is_none();
+    if still_running {
+        let _ = child.kill();
+    }
     let output = child.wait_with_output().expect("collect relay output");
-    let _ = std::fs::remove_file(lock_path);
+    remove_lock_if_pid(lock_path, child_pid);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{stdout}{stderr}");
     assert!(
+        still_running,
+        "supervisor exited before kill ({:?}): stdout={stdout:?} stderr={stderr:?}",
+        output.status.code()
+    );
+    assert!(
         combined.contains("software-only"),
         "expected software-only startup, exit={:?} stdout={stdout:?} stderr={stderr:?}",
         output.status.code()
     );
+}
+
+/// Reclaim `/tmp/thalamic_relay.lock` only when the recorded PID is dead.
+/// Never unlink a live supervisor's single-instance marker.
+fn reclaim_stale_production_lock(lock_path: &str) {
+    if !Path::new(lock_path).exists() {
+        return;
+    }
+    let content = std::fs::read_to_string(lock_path).unwrap_or_default();
+    let Some(pid) = content.trim().parse::<u32>().ok() else {
+        panic!("refusing to delete unparseable production lock {lock_path}");
+    };
+    assert!(
+        !Path::new(&format!("/proc/{pid}")).exists(),
+        "refusing to clobber live lock {lock_path} (PID {pid}); stop that instance first"
+    );
+    std::fs::remove_file(lock_path).expect("remove stale production lock");
+}
+
+fn remove_lock_if_pid(lock_path: &str, pid: u32) {
+    let Ok(content) = std::fs::read_to_string(lock_path) else {
+        return;
+    };
+    if content.trim() == pid.to_string() {
+        let _ = std::fs::remove_file(lock_path);
+    }
 }
 
 #[test]
