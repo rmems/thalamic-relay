@@ -4,9 +4,10 @@
 
 ```bash
 cargo test                    # all tests
-cargo test --lib              # src/lib.rs tests (telemetry + gpu + cpu)
+cargo test --lib              # src/lib.rs tests (telemetry + telemetry_csv + gpu + cpu)
 cargo test --bin thalamic-relay  # src/main.rs tests only (6)
 cargo test telemetry          # typed contract / fixtures
+cargo test telemetry_csv      # frozen CSV header / parse / replay (RM-629)
 cargo test gpu                # gpu acquisition + check_safety facade
 cargo test safety              # SafetyMachine + named states (no GPU)
 cargo test publish             # IPC isolation / failing publisher
@@ -19,6 +20,15 @@ cargo test lock_guard         # single-instance lockfile tests
 
 | Binary | Test | What it covers |
 |--------|------|----------------|
+| lib.rs | `header_is_the_frozen_five_column_string` | CSV `HEADER` lock (RM-629) |
+| lib.rs | `load_csv_accepts_canonical_header_and_parses_rows` | Canonical 5-column parse |
+| lib.rs | `load_csv_rejects_bad_header` | Header mismatch fails closed |
+| lib.rs | `load_csv_rejects_session_label_extension_as_header_mismatch` | Extra `session_label` column is not compatible |
+| lib.rs | `load_csv_skips_malformed_short_rows` | Short rows + NaN skipped |
+| lib.rs | `load_csv_skips_non_numeric_fields` | Non-numeric fields skipped |
+| lib.rs | `load_csv_skips_non_finite_and_extra_columns` | Inf / extra columns skipped |
+| lib.rs | `row_for_tick_wraps_around_and_rewrites_timestamp` | Replay wrap + `tick + 1` |
+| lib.rs | `format_csv_round_trips_through_parse` | Producer emit → validate |
 | lib.rs | `healthy_real_is_valid_nvml_with_legitimate_zero_util` | Healthy NVML fixture; 0% util ≠ missing |
 | lib.rs | `software_fallback_is_explicit_source_not_magic_values` | Software fallback provenance |
 | lib.rs | `nvml_matching_old_magic_is_not_simulated` | `0°C`/`25W` NVML is not simulated |
