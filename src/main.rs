@@ -160,9 +160,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
     let mut sigterm = signal(SignalKind::terminate())?;
-    let mut shutdown_reason = None;
 
-    loop {
+    let shutdown_reason = loop {
         step_count += 1;
         let telemetry =
             HardwareBridge::read_telemetry_with(cli.force_software_only, cli.step_interval_ms);
@@ -261,31 +260,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         tokio::select! {
             _ = &mut ctrl_c => {
-                shutdown_reason = Some(ShutdownReason::Sigint);
-                break;
+                break ShutdownReason::Sigint;
             }
             _ = sigterm.recv() => {
-                shutdown_reason = Some(ShutdownReason::Sigterm);
-                break;
+                break ShutdownReason::Sigterm;
             }
             _ = sleep(Duration::from_millis(cli.step_interval_ms)) => {}
         }
-    }
+    };
 
-    if let Some(reason) = shutdown_reason {
-        let _plan = perform_orderly_shutdown(
-            reason,
-            &mut machine,
-            &mut brake_task,
-            &mut release_task,
-            &relay_metrics,
-            &mut warned_brake_held_sim,
-            &metrics_shutdown_tx,
-            metrics_task,
-        )
-        .await;
-        eprintln!("[relay] releasing process lock {lock_path}");
-    }
+    let _plan = perform_orderly_shutdown(
+        shutdown_reason,
+        &mut machine,
+        &mut brake_task,
+        &mut release_task,
+        &relay_metrics,
+        &mut warned_brake_held_sim,
+        &metrics_shutdown_tx,
+        metrics_task,
+    )
+    .await;
+    eprintln!("[relay] releasing process lock {lock_path}");
 
     Ok(())
 }
