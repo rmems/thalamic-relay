@@ -124,6 +124,7 @@ rules, and [`docs/telemetry.md`](docs/telemetry.md) for the sample contract.
 ### Core Modules
 
 - **`telemetry`**: Typed sample contract (validity, freshness, provenance, normalization) and the corpus-ipc mapping surface
+- **`time`**: Process-local sample clock (`session_id` + `batch_id`) and timestamp provenance
 - **`safety`**: Pure deterministic classification + hysteresis (`SafetyMachine`); no NVML, no IPC
 - **`gpu`**: Raw NVML acquisition and privileged power-limit actuation
 - **`publish`**: Non-blocking sensory publish stub (`AbsentPublisher`, `IsolatedPublishQueue`); transport is GH#40
@@ -175,7 +176,7 @@ THALAMIC_METRICS_IP=0.0.0.0 \
 The relay exports metrics compatible with Prometheus monitoring. Safety
 state is observable here; there is no neural-state query:
 
-- `telemetry_freshness_s` — sample age at scrape time
+- `telemetry_freshness_s` — sample age at scrape time (monotonic receive instant, not source wall time)
 - `safety_state{state=...}` / `safety_state_id` — current named safety state
 - `safety_policy_state{state=...}` — policy classification before the ActuatorFailure overlay (`safety_state` is the overlay)
 - `safety_brake_engaged` — last successful brake still claimed
@@ -203,7 +204,9 @@ Structured logging via `tracing` with configurable output levels.
 ## Telemetry contract
 
 Every GPU reading is a typed `TelemetrySample` with `value: Option<T>`,
-`observed_at`, `source`, `validity`, and `unit`. See
+`observed_at`, `source`, `validity`, and `unit`. Every emitted frame also
+carries `session_id`, a strictly increasing `batch_id`, source vs
+receive/emit timestamps, and `source_time_status`. See
 [`docs/telemetry.md`](docs/telemetry.md) for the full inventory.
 
 | Signal | Class | Notes |

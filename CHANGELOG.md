@@ -7,10 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Time / freshness (RM-1335):** Process-local `SampleClock` stamps every
+  emitted frame with a stable `session_id` (new on restart) and a strictly
+  increasing `batch_id` (corpus-ipc `StimulusBatch` field names). Source wall
+  time is preserved separately from receive/emit time with
+  `timestamp_origin` / `source_time_status`. Duplicate, backward, missing,
+  and very large source timestamps do not regress the sample sequence.
+  Freshness (`telemetry_freshness_s`) uses receive-time `Instant`, not source
+  wall time. CSV/replay rows share the same clock as live collectors.
+
 - **Safety actuation boundary (GH#46):** Extracted privileged GPU actuation behind a `SafetyActuator` trait in `safety`, complementing the pure `SafetyMachine` policy (GH#42). The NVML/`nvidia-smi` backend is now `NvmlActuator` in `gpu` — a hardware adapter that implements the trait but defines no safety semantics. Actuator failures are typed and observable (`ActuatorError`) instead of stringly coupled to the supervisor, startup brake detection returns a typed `BrakeMatch`, and an in-memory `FakeActuator` enables deterministic apply/release tests with no GPU or subprocess. The supervisor drives actuation through `Arc<dyn SafetyActuator>`, preserving fail-closed behavior.
 - **Breaking (internal):** Replaced numeric `GpuTelemetry` fields with a typed `TelemetrySample` contract (`Option` values, explicit source/validity/unit/freshness). Software-only mode is tagged `TelemetrySource::SoftwareFallback` and is no longer inferred from `temperature <= 0 && power <= 25`. Missing sensors stay `None` instead of silent `0.0`/`NaN`. See `docs/telemetry.md` (GH#41)
 - Added `TelemetryFrame::to_sensory_mapping()` as the deterministic mapping surface toward corpus-ipc (transport remains GH#40)
-- NVML/driver failure is `TelemetrySource::NvmlUnavailable` (fail closed); `SoftwareFallback` is reserved for `--force-software-only`. Mapping re-evaluates freshness at emit time and carries stale threshold plus configured `--step-interval-ms` cadence. Freshness gauge is computed at scrape time from `acquired_at`.
+- NVML/driver failure is `TelemetrySource::NvmlUnavailable` (fail closed); `SoftwareFallback` is reserved for `--force-software-only`. Mapping re-evaluates freshness at emit time and carries stale threshold plus configured `--step-interval-ms` cadence. Freshness gauge is computed at scrape time from a monotonic receive `Instant` (RM-1335), not source wall time.
 - **Safety failure domain (GH#42):** `SafetyMachine` is isolated from IPC/Brainstem. Named states (healthy-real, warning, critical/braked, recovering, telemetry missing/stale/invalid, simulated, actuator-failure), documented hysteresis, Prometheus safety/brake/transition/actuator-failure metrics, and GPU-less tests including a failing/slow publish sink. See `docs/safety.md`.
 - **Breaking:** Removed in-process SNN execution (`neuromod::SpikingNetwork`, `NeuroModulators`) and the UDP control surface it existed to drive (`Stimuli` / `LearningReward` / `GetNeuroState`, and the `--udp-addr`/`--num-channels`/`--num-lif`/`--num-izh` flags). Thalamic is now a sensory + deterministic hardware-safety relay only; neural execution lives in `brainstem-daemon`. `docs/ipc.md` now documents the removal and points to the planned `corpus-ipc`-based replacement (RM-1143 / GH#39)
 - Removed the `neuromod` and `serde_json` dependencies (no longer used)

@@ -7,6 +7,8 @@ cargo test                    # all tests
 cargo test --lib              # src/lib.rs tests (telemetry + gpu + cpu)
 cargo test --bin thalamic-relay  # src/main.rs tests only (6)
 cargo test telemetry          # typed contract / fixtures
+cargo test time               # sample clock + timestamp provenance
+cargo test freshness          # freshness gauge basis / boundaries
 cargo test gpu                # gpu acquisition + check_safety facade
 cargo test safety              # SafetyMachine + named states (no GPU)
 cargo test publish             # IPC isolation / failing publisher
@@ -46,6 +48,16 @@ cargo test lock_guard         # single-instance lockfile tests
 | lib.rs | `test_nvml_unavailable_fail_closes_safety` | Unavailable NVML is not simulated |
 | lib.rs | `test_acquire_raw_force_software_is_fallback_not_unavailable` | force vs unavailable provenance |
 | lib.rs | `future_observed_at_is_invalid_not_valid` | Future timestamps are Invalid |
+| lib.rs | `mapping_carries_session_batch_and_split_timestamps` | Source vs receive vs emit |
+| lib.rs | `csv_fixture_rows_share_clock_with_live_and_flag_source_anomalies` | CSV + live share SampleClock |
+| lib.rs | `sample_clock_is_strictly_increasing_within_one_session` | Monotonic batch_id |
+| lib.rs | `duplicate_source_timestamps_do_not_regress_the_sample_clock` | Duplicate source time |
+| lib.rs | `backward_source_timestamps_do_not_regress_the_sample_clock` | Backward source time |
+| lib.rs | `missing_source_timestamp_is_flagged_and_clock_still_advances` | Missing source time |
+| lib.rs | `very_large_source_timestamp_is_future_and_does_not_regress_clock` | u64::MAX source time |
+| lib.rs | `restart_resets_are_distinguishable_by_session_id` | New clock ⇒ new session |
+| lib.rs | `freshness_seconds_uses_receive_time_not_source_time` | Freshness basis |
+| lib.rs | `freshness_seconds_boundaries` | None / equal / backward now / max |
 | lib.rs | `mapping_re_evaluates_stale_and_carries_thresholds` | Mapping-time freshness + stale_after |
 | lib.rs | `mapping_reports_configured_acquisition_cadence` | Actual vs default cadence |
 | lib.rs | `freshness_seconds_grows_when_export_time_advances` | Gauge age at scrape time |
