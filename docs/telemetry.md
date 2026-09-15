@@ -110,9 +110,9 @@ fail-closes. This is not software-only confirmation.
 `TelemetryFrame::to_sensory_mapping_at(now)` produces `SensoryMapping` /
 `MappedStimulus` with timestamp, source, validity (re-evaluated at `now`),
 raw engineering value, normalized `[0, 1]` (only when `Valid` at `now`),
-`stale_after_ms`, and the actual `cadence_ms`. `#40` should map this into
-published `corpus-ipc` types rather than copying a second wire schema. This
-crate does not take a `corpus-ipc` dependency here.
+`stale_after_ms`, and the actual `cadence_ms`. `#40` maps this into published `corpus-ipc` `StimulusBatch` / `IpcMessage::Stimuli`
+in `src/publish.rs`. This module does not depend on `corpus-ipc` and does not
+duplicate the wire schema.
 
 ## Fixtures
 

@@ -4,7 +4,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thalamic_relay::cpu::{self, RelayMetrics};
 use thalamic_relay::gpu::{HardwareBridge, NvmlActuator};
-use thalamic_relay::publish::{AbsentPublisher, SensoryPublisher, evaluate_then_try_publish};
+use thalamic_relay::publish::{
+    AbsentPublisher, CorpusIpcPublisher, DEFAULT_IPC_ENDPOINT, DEFAULT_IPC_QUEUE_CAPACITY,
+    DEFAULT_IPC_SESSION_ID, SensoryPublisher, evaluate_then_try_publish,
+};
 use thalamic_relay::safety::{
     ActuatorError, ActuatorOutcome, BRAKE_FRACTION, BrakeIntent, SafetyActuator, SafetyMachine,
     SafetySnapshot, SafetyState,
@@ -102,7 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut step_count: u64 = 0;
     let mut machine = SafetyMachine::new();
-    let publisher = AbsentPublisher;
+    let publisher = build_publisher(&cli);
     let mut warned_brake_held_sim = false;
     let mut brake_task: Option<ActuationTask> = None;
     let mut release_task: Option<ActuationTask> = None;
@@ -110,6 +113,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Privileged NVML/nvidia-smi actuation backend. The supervisor only ever
     // reaches hardware through this `SafetyActuator`; all safety semantics live
     // in `thalamic_relay::safety`, never in the NVIDIA adapter (GH#46).
+    // Sensory IPC is a separate failure domain: `publisher` is never awaited
+    // from `SafetyMachine::evaluate`.
     let actuator: Arc<dyn SafetyActuator> = Arc::new(NvmlActuator::new());
 
     // Detect leftover throttle from a prior crash (hardware PL persists across process restarts).
@@ -149,8 +154,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     })
                     .await
                     .expect("post-brake telemetry read task panicked");
-                    let (snap, pub_res) =
-                        evaluate_then_try_publish(&mut machine, &post_telemetry, &publisher);
+                    let (snap, pub_res) = evaluate_then_try_publish(
+                        &mut machine,
+                        &post_telemetry,
+                        publisher.as_ref(),
+                    );
                     let _ = pub_res;
                     store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
                     spawn_intent(&snap, &actuator, &mut brake_task, &mut release_task);
@@ -182,8 +190,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     })
                     .await
                     .expect("post-release telemetry read task panicked");
-                    let (snap, pub_res) =
-                        evaluate_then_try_publish(&mut machine, &post_telemetry, &publisher);
+                    let (snap, pub_res) = evaluate_then_try_publish(
+                        &mut machine,
+                        &post_telemetry,
+                        publisher.as_ref(),
+                    );
                     let _ = pub_res;
                     store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
                     spawn_intent(&snap, &actuator, &mut brake_task, &mut release_task);
@@ -210,7 +221,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Do not spawn from the pre-telemetry snapshot: SoftwareFallback holds
         // rather than applies, which only classify_frame can decide.
         if !evaluated_this_iter && (step_count == 1 || step_count.is_multiple_of(10)) {
-            let (snap, pub_res) = evaluate_then_try_publish(&mut machine, &telemetry, &publisher);
+            let (snap, pub_res) =
+                evaluate_then_try_publish(&mut machine, &telemetry, publisher.as_ref());
             let _ = pub_res;
             store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
             spawn_intent(&snap, &actuator, &mut brake_task, &mut release_task);
@@ -227,6 +239,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         print_dashboard(&telemetry, step_count, machine.snapshot().state);
 
         sleep(Duration::from_millis(cli.step_interval_ms)).await;
+    }
+}
+
+fn build_publisher(cli: &Cli) -> Box<dyn SensoryPublisher> {
+    if cli.ipc_disabled {
+        println!("[relay] corpus-ipc: disabled; hardware safety is independent of Brainstem");
+        return Box::new(AbsentPublisher);
+    }
+    let session_id = if cli.ipc_session_id.is_empty() {
+        None
+    } else {
+        Some(cli.ipc_session_id.clone())
+    };
+    match cli.ipc_endpoint.parse::<std::net::SocketAddr>() {
+        Ok(endpoint) => {
+            match CorpusIpcPublisher::spawn(endpoint, session_id, DEFAULT_IPC_QUEUE_CAPACITY) {
+                Ok(publisher) => {
+                    println!(
+                        "[relay] corpus-ipc: publishing IpcMessage::Stimuli to udp://{endpoint} \
+                     (best-effort; safety does not wait)"
+                    );
+                    Box::new(publisher)
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[relay] corpus-ipc: publisher unavailable ({err}); continuing without Brainstem"
+                    );
+                    Box::new(AbsentPublisher)
+                }
+            }
+        }
+        Err(err) => {
+            eprintln!(
+                "[relay] corpus-ipc: invalid --ipc-endpoint '{}': {err}; continuing without Brainstem",
+                cli.ipc_endpoint
+            );
+            Box::new(AbsentPublisher)
+        }
     }
 }
 
@@ -359,6 +409,19 @@ struct Cli {
     /// value (`--force-software-only=false` / `THALAMIC_FORCE_SOFTWARE_ONLY=false`).
     #[arg(long, env = "THALAMIC_FORCE_SOFTWARE_ONLY", num_args = 0..=1, default_missing_value = "true", default_value_t = false, value_parser = clap::value_parser!(bool))]
     force_software_only: bool,
+
+    /// UDP destination for canonical `corpus-ipc` `IpcMessage::Stimuli` datagrams.
+    /// Fire-and-forget; Brainstem absence does not stall safety.
+    #[arg(long, default_value = DEFAULT_IPC_ENDPOINT, env = "THALAMIC_IPC_ENDPOINT")]
+    ipc_endpoint: String,
+
+    /// Disable corpus-ipc publication. Hardware safety still evaluates.
+    #[arg(long, env = "THALAMIC_IPC_DISABLED", num_args = 0..=1, default_missing_value = "true", default_value_t = false, value_parser = clap::value_parser!(bool))]
+    ipc_disabled: bool,
+
+    /// Session id stamped on each `StimulusBatch` (`session_id`). Empty omits it.
+    #[arg(long, default_value = DEFAULT_IPC_SESSION_ID, env = "THALAMIC_IPC_SESSION_ID")]
+    ipc_session_id: String,
 }
 
 #[cfg(test)]
@@ -395,6 +458,25 @@ mod tests {
         );
         assert_eq!(cli.step_interval_ms, 100);
         assert!(!cli.force_software_only);
+        assert_eq!(cli.ipc_endpoint, DEFAULT_IPC_ENDPOINT);
+        assert!(!cli.ipc_disabled);
+        assert_eq!(cli.ipc_session_id, DEFAULT_IPC_SESSION_ID);
+    }
+
+    #[test]
+    fn parses_ipc_flags() {
+        let cli = Cli::try_parse_from([
+            "thalamic-relay",
+            "--ipc-endpoint",
+            "127.0.0.1:9911",
+            "--ipc-disabled",
+            "--ipc-session-id",
+            "lab-1",
+        ])
+        .unwrap();
+        assert_eq!(cli.ipc_endpoint, "127.0.0.1:9911");
+        assert!(cli.ipc_disabled);
+        assert_eq!(cli.ipc_session_id, "lab-1");
     }
 
     #[test]

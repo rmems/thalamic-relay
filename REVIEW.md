@@ -9,7 +9,7 @@ cargo test --bin thalamic-relay  # src/main.rs tests only (6)
 cargo test telemetry          # typed contract / fixtures
 cargo test gpu                # gpu acquisition + check_safety facade
 cargo test safety              # SafetyMachine + named states (no GPU)
-cargo test publish             # IPC isolation / failing publisher
+cargo test publish             # IPC isolation / corpus-ipc StimulusBatch mapping
 cargo test cpu                # cpu metrics tests
 cargo test test_safety        # safety-related tests
 cargo test lock_guard         # single-instance lockfile tests
@@ -56,6 +56,12 @@ cargo test lock_guard         # single-instance lockfile tests
 | lib.rs | `record_safety_snapshot_copies_state_and_brake` | Shared metrics copy safety snapshot |
 | lib.rs | `healthy_real_is_named_state` … `transitions_are_counted` | `SafetyMachine` GPU-less transitions (`src/safety.rs`) |
 | lib.rs | `absent_brainstem_does_not_block_or_change_safety` … | IPC/Brainstem absence cannot stall safety (`src/publish.rs`) |
+| lib.rs | `mapping_to_stimulus_batch_carries_timestamp_source_and_validity` | GH#41 fields on canonical `StimulusBatch` |
+| lib.rs | `missing_channel_is_masked_not_a_real_zero` | `valid_mask` vs legitimate zero |
+| lib.rs | `stimulus_batch_round_trips_through_published_corpus_ipc_types` | serde round-trip of `IpcMessage::Stimuli` |
+| lib.rs | `corpus_ipc_publisher_slow_consumer_does_not_block_safety` | Bounded `try_send` isolation |
+| lib.rs | `software_only_emits_typed_corpus_ipc_frame_without_gpu` | Software-only UDP emit, no GPU |
+| main.rs | `parses_ipc_flags` | `--ipc-endpoint` / `--ipc-disabled` / `--ipc-session-id` |
 | main.rs | `dashboard_shows_only_valid_present_as_live_hardware` | Dashboard hides stale/invalid/missing |
 | main.rs | `parses_custom_args_and_env_equiv` | CLI flag parsing |
 | main.rs | `parses_defaults` | CLI defaults |
