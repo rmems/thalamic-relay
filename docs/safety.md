@@ -22,7 +22,7 @@ emits **intents**; hardware side effects go through [`SafetyActuator`].
 | Power-limit apply/release | Thalamic (`gpu` actuator) |
 | Safety/brake state and transition/error counters | Thalamic Prometheus (`:9000/metrics`) |
 | Sensory mapping types | Thalamic (`TelemetryFrame::to_sensory_mapping`) |
-| Sensory transport to Brainstem | `corpus-ipc` (GH#40, not required for safety) |
+| Sensory transport to Brainstem | Thalamic `publish` → `corpus-ipc` `IpcMessage::Stimuli` (not required for safety) |
 | SNN tick, neuromodulation, neural state | Brainstem |
 | Reward / plasticity | Brainstem (never Thalamic) |
 
@@ -82,13 +82,16 @@ SafetySnapshot (state, brake, intent)
       ├─ spawn_blocking apply/release   (gpu, not on the eval path)
       └─ SensoryPublisher::try_publish   (best-effort, after eval)
              IsolatedPublishQueue.try_enqueue  (drop on full)
+                   │
+                   ▼  CorpusIpcPublisher worker (not awaited)
+             IpcMessage::Stimuli JSON → UDP sendto
 ```
 
-Production currently uses [`AbsentPublisher`](../src/publish.rs) (Brainstem
-absent). GH#40 should plug a `corpus-ipc` publisher into
-`IsolatedPublishQueue` (bounded `try_send`). A full or disconnected queue
-is `SlowConsumer` / `Disconnected` and **must not** be `recv`'d from the
-safety loop.
+Production uses [`CorpusIpcPublisher`](../src/publish.rs) unless
+`--ipc-disabled` (then [`AbsentPublisher`](../src/publish.rs)). The worker
+is a bounded `try_send` plus fire-and-forget UDP. A full or disconnected
+queue is `SlowConsumer` / `Disconnected` and **must not** be `recv`'d from
+the safety loop. Brainstem absence cannot stall evaluation.
 
 ## Prometheus
 

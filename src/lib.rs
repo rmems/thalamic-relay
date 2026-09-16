@@ -22,7 +22,7 @@
 //! ```text
 //! RawTelemetry  →  assess()  →  TelemetryFrame
 //!                                   ├─ SafetyMachine::evaluate()  →  BrakeIntent
-//!                                   ├─ to_sensory_mapping()       →  corpus-ipc (GH#40)
+//!                                   ├─ to_sensory_mapping()       →  corpus-ipc
 //!                                   └─ SensoryPublisher::try_publish()  (never on evaluate)
 //! ```
 //!

@@ -47,8 +47,8 @@ thalamic-relay
   - normalization
   - staleness/missingness
   - hard safety
-      ↓
-corpus-ipc          (follow-up work — not yet implemented)
+      ↓  IpcMessage::Stimuli (best-effort; not on the safety path)
+corpus-ipc
       ↓
 brainstem-daemon
   - SpikingNetwork
@@ -108,11 +108,9 @@ and hardware safety when available.
 While running it exposes (address configurable via CLI/env; see Configuration):
 
 - **Prometheus metrics** on `http://localhost:9000/metrics` (bind IP configurable via --metrics-ip)
+- **corpus-ipc sensory publish** on UDP `127.0.0.1:9900` by default (`--ipc-endpoint`): fire-and-forget `IpcMessage::Stimuli` JSON. This is not a control/query socket and is not the retired neural UDP protocol; see [`docs/ipc.md`](docs/ipc.md).
 
-It currently has no control/query IPC surface — the prior UDP protocol was
-removed along with the in-process SNN it existed to drive; see
-[`docs/ipc.md`](docs/ipc.md) for the retired UDP surface, the GH#41 mapping
-types, and the planned `corpus-ipc` transport (GH#40).
+Hardware safety keeps evaluating if Brainstem is absent or the queue is full.
 
 ## Architecture
 
@@ -127,8 +125,8 @@ thalamic-relay
   - SafetyMachine (never waits on IPC)
   - privileged brake actuator
   - Prometheus safety/brake state
-      ↓  best-effort try_publish (drop on full / absent)
-corpus-ipc          (follow-up work — GH#40; not required for safety)
+      ↓  IsolatedPublishQueue.try_enqueue (drop on full / absent)
+corpus-ipc          IpcMessage::Stimuli JSON over UDP (not required for safety)
       ↓
 brainstem-daemon
   - SpikingNetwork
@@ -155,9 +153,9 @@ Reusable from a downstream crate (no GPU, no supervisor process):
 - **`time`**: Process-local sample clock (`session_id` + `batch_id`) and timestamp provenance
 - **`telemetry_csv`**: Frozen hardware-telemetry CSV header + reader/validator for corinth ingest (one-way copy; no corinth dependency)
 - **`safety`**: Pure deterministic classification + hysteresis (`SafetyMachine`) and the `SafetyActuator` trait; no NVML, no IPC
-- **`publish`**: Non-blocking sensory publish stub (`AbsentPublisher`, `IsolatedPublishQueue`); transport is GH#40
+- **`publish`**: Maps `SensoryMapping` → `corpus-ipc` `StimulusBatch` / `IpcMessage::Stimuli` and UDP-publishes off the safety path (`CorpusIpcPublisher`, `AbsentPublisher`, `IsolatedPublishQueue`)
 
-Binary-only (not semver-facing): NVML acquisition, privileged `nvidia-smi`
+Binary-only (not semver-facing): NVML acquisition (`gpu`), CPU metrics (`cpu`), privileged `nvidia-smi`
 actuation, Prometheus initialization, CLI, process lock, supervisor loop.
 
 ### Key Components
@@ -172,7 +170,8 @@ actuation, Prometheus initialization, CLI, process lock, supervisor loop.
 ### Core Dependencies
 
 - `tokio`: Async runtime with full features
-- `serde`: Serialization framework (used by the typed telemetry contract)
+- `serde` / `serde_json`: Serialization of the typed telemetry contract and `IpcMessage`
+- `corpus-ipc` 0.1.0: canonical `StimulusBatch` / `IpcMessage` wire schema (default features; no ZeroMQ)
 - `tracing` / `tracing-subscriber`: Structured logging and telemetry
 - `metrics` / `metrics-exporter-prometheus`: Metrics collection with Prometheus export
 
@@ -191,6 +190,9 @@ Key options (with env var equivalent):
 - `--metrics-ip` / `THALAMIC_METRICS_IP` (default: 127.0.0.1; port is always 9000)
 - `--step-interval-ms` / `THALAMIC_STEP_INTERVAL_MS` (default: 100) — relay loop tick interval
 - `--force-software-only` / `THALAMIC_FORCE_SOFTWARE_ONLY`
+- `--ipc-endpoint` / `THALAMIC_IPC_ENDPOINT` (default: `127.0.0.1:9900`) — UDP destination for `IpcMessage::Stimuli`
+- `--ipc-disabled` / `THALAMIC_IPC_DISABLED` — skip publication; safety still runs
+- `--ipc-session-id` / `THALAMIC_IPC_SESSION_ID` (default: `thalamic-relay`)
 - `RUST_LOG` (standard for tracing; or --log-level in future extensions)
 
 Example with env + flag:
@@ -222,7 +224,7 @@ Structured logging via `tracing` with configurable output levels.
 ## Safety Features
 
 - **Instance Protection**: Lockfile mechanism prevents multiple relay instances (lock acquired before port binding)
-- **Independent safety loop**: `SafetyMachine::evaluate` has no publisher argument and is not awaited on IPC. Production uses `AbsentPublisher` until GH#40.
+- **Independent safety loop**: `SafetyMachine::evaluate` has no publisher argument and is not awaited on IPC. Production uses `CorpusIpcPublisher` (`try_send` + detached UDP worker). `--ipc-disabled` or a bind failure falls back to `AbsentPublisher`.
 - **GPU Safety Monitoring**: Safety cadence every ~1 second (every 10 ticks); named states for healthy-real, warning, critical/braked, recovering, missing/stale/invalid, simulated, actuator-failure
 - **Emergency Brakes**: Automatically throttles GPU power limit to 50% via `nvidia-smi -pl` on fail-closed or critical; 3 consecutive real Ok readings to release; warn immediately after release re-applies
 - **Graceful Degradation**: Continues in software-only mode when
@@ -249,7 +251,7 @@ corinth will read. The CSV schema is frozen; do not add columns.
 | Signal | Class | Notes |
 | --- | --- | --- |
 | `gpu_temp_c`, `power_w` | safety + runtime-input | Missing/invalid/stale fail closed |
-| `gpu_clock_mhz`, `mem_util_pct` | runtime-input | Sensory mapping toward `#40` |
+| `gpu_clock_mhz`, `mem_util_pct` | runtime-input | Sensory mapping → `StimulusBatch` |
 | `vram_temp_c`, `mem_clock_mhz`, `fan_speed_pct` | observability-only | Raw preserved; not model input |
 | `vddcr_gfx_v` | observability-only (derived) | Estimated from power; not an NVML voltage sensor |
 

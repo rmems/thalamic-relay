@@ -33,12 +33,18 @@ rustdoc-args = ["--cfg", "docsrs"]
 # Core Logic
 tokio = { version = "1.36", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 lazy_static = "1.4"
 
+# Canonical IpcMessage / StimulusBatch wire schema (GH#40 / RM-1144).
+# corpus-ipc 0.1.0 is the published crate version in Limen-Neural/corpus-ipc
+# (RM-1141) but is not yet in the crates.io index; pin that 0.1.0 source.
+# Default features only: wire models, no ZeroMQ / C++ vendor build.
+corpus-ipc = { version = "0.1.0", git = "https://github.com/Limen-Neural/corpus-ipc", rev = "3ad764a9765ead27d6120d25ecd963b9338940fb" }
 
 # CLI
 clap = { version = "4.5", features = ["derive", "env"] }

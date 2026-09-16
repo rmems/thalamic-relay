@@ -150,10 +150,10 @@ fail-closes. This is not software-only confirmation.
 `MappedStimulus` with `session_id`, `batch_id`, source vs receive vs emit
 timestamps, source-time status, acquisition source, validity (re-evaluated
 at `now`), raw engineering value, normalized `[0, 1]` (only when `Valid`
-at `now`), `stale_after_ms`, and the actual `cadence_ms`. `#40` should map
-this into published `corpus-ipc` types (`StimulusBatch.session_id` /
-`batch_id` / `timestamp`) rather than copying a second wire schema. This
-crate does not take a `corpus-ipc` dependency here.
+at `now`), `stale_after_ms`, and the actual `cadence_ms`. `src/publish.rs` (#40)
+maps this into published `corpus-ipc` `StimulusBatch` / `IpcMessage::Stimuli`
+off the safety path. `telemetry` does not depend on `corpus-ipc` and does not
+duplicate the wire schema.
 
 ## Fixtures
 

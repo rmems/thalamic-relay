@@ -6,7 +6,8 @@
 //! converted into a legitimate numeric zero.
 //!
 //! This module owns the typed mapping surface toward `corpus-ipc` ([#40](https://github.com/rmems/thalamic-relay/issues/40)):
-//! [`SensoryMapping`] / [`MappedStimulus`]. It does **not** implement transport.
+//! [`SensoryMapping`] / [`MappedStimulus`]. Transport and the canonical
+//! `StimulusBatch` conversion live in [`crate::publish`].
 //!
 //! Frame ordering and timestamp provenance live in [`crate::time`]: every
 //! assessed frame is stamped with a session id + strictly increasing
@@ -778,7 +779,8 @@ impl MappedStimulus {
     }
 }
 
-/// Typed mapping hook for `#40`. Not a `corpus-ipc` schema duplicate.
+/// Typed mapping hook for `#40`. Converted to `corpus-ipc` `StimulusBatch`
+/// in [`crate::publish`] — not a wire-schema duplicate.
 ///
 /// `session_id` / `batch_id` match corpus-ipc `StimulusBatch`. Source wall
 /// time and receive/emit time are separate so RM-1144 can put emit time on
