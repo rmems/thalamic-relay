@@ -18,11 +18,14 @@ pub const SHUTDOWN_METRICS_TIMEOUT: Duration = Duration::from_secs(2);
 /// Why the supervisor is leaving the run loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShutdownReason {
+    /// Received SIGINT (Ctrl+C).
     Sigint,
+    /// Received SIGTERM.
     Sigterm,
 }
 
 impl ShutdownReason {
+    /// Return string label for metrics and logs.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -35,12 +38,16 @@ impl ShutdownReason {
 /// In-flight privileged actuation, if any, when the signal arrives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InFlightActuation {
+    /// No task currently executing.
     None,
+    /// Emergency brake apply task in-flight.
     Apply,
+    /// Emergency brake release task in-flight.
     Release,
 }
 
 impl InFlightActuation {
+    /// Deduce in-flight state from active brake/release tasks.
     #[must_use]
     pub const fn from_tasks(apply: bool, release: bool) -> Self {
         match (apply, release) {
@@ -50,6 +57,7 @@ impl InFlightActuation {
         }
     }
 
+    /// Return string label for metrics and logs.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -72,6 +80,7 @@ pub enum ShutdownActuation {
 }
 
 impl ShutdownActuation {
+    /// Return string label for metrics and logs.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -85,11 +94,17 @@ impl ShutdownActuation {
 /// Observable shutdown decision. The type system has no "restore default PL" action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShutdownPlan {
+    /// Reason triggering the shutdown.
     pub reason: ShutdownReason,
+    /// Actuation handling decision on shutdown.
     pub actuation: ShutdownActuation,
+    /// Whether the emergency brake remains engaged at shutdown.
     pub leave_brake_engaged: bool,
+    /// Whether an unresolved brake state persists.
     pub unresolved_brake: bool,
+    /// Whether an actuator failure occurred during execution or shutdown.
     pub unresolved_actuator: bool,
+    /// Summary message explaining the shutdown decision.
     pub summary: &'static str,
 }
 
@@ -172,9 +187,13 @@ fn shutdown_summary(snap: &SafetySnapshot, in_flight: InFlightActuation) -> &'st
 /// Result of waiting on an in-flight apply/release during shutdown.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InFlightJoin {
+    /// In-flight task completed successfully.
     Succeeded,
+    /// Task returned an error.
     Failed(String),
+    /// Task panicked.
     Panicked(String),
+    /// Task timed out.
     TimedOut,
 }
 

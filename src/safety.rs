@@ -3,8 +3,9 @@
 //! Classification, hysteresis, and brake *intent* are pure functions of a
 //! [`TelemetryFrame`] plus machine state. This module has no corpus-ipc,
 //! Brainstem, NVML, subprocess, or async-runtime dependency. Privileged
-//! power-limit actuation stays in [`crate::gpu`]; sensory publication lives
-//! in [`crate::publish`] and must never be awaited on this path.
+//! power-limit actuation is performed by the `thalamic-relay` executable
+//! through [`SafetyActuator`]; sensory publication lives in [`crate::publish`]
+//! and must never be awaited on this path.
 //!
 //! Transition rules: [`docs/safety.md`](../../docs/safety.md).
 
@@ -26,15 +27,18 @@ pub const POWER_WARN_W: f32 = 300.0;
 /// Power critical threshold (W).
 pub const POWER_CRITICAL_W: f32 = 350.0;
 
-/// Instantaneous Ok / Warn / Critical used by the GPU facade and logs.
+/// Instantaneous Ok / Warn / Critical used by logs and [`instant_status`].
 ///
 /// Missing, invalid, and stale safety samples are [`Self::Critical`] (fail
 /// closed). Simulated software-only frames are [`Self::Ok`] — there is no
 /// real GPU to protect. Stateful relay names live in [`SafetyState`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum SafetyStatus {
+    /// Safety samples present and below warn thresholds (or software-fallback).
     Ok,
+    /// Thermal or power warn band; reason is human-readable.
     Warn(String),
+    /// Fail-closed or critical thermal/power; reason is human-readable.
     Critical(String),
 }
 
@@ -108,11 +112,14 @@ impl SafetyState {
     }
 }
 
-/// Brake command the supervisor may dispatch to the GPU actuator.
+/// Brake command the supervisor may dispatch to a [`SafetyActuator`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrakeIntent {
+    /// No apply/release this step.
     None,
+    /// Supervisor should apply the emergency brake.
     Apply,
+    /// Supervisor should release the emergency brake.
     Release,
 }
 
@@ -120,28 +127,41 @@ pub enum BrakeIntent {
 /// the machine never executes the command itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActuatorOutcome {
+    /// Brake apply succeeded.
     Applied,
+    /// Brake apply failed; the string is a log-oriented reason.
     ApplyFailed(String),
+    /// Brake release succeeded.
     Released,
+    /// Brake release failed; the string is a log-oriented reason.
     ReleaseFailed(String),
 }
 
 /// Stateless classification of one frame (no hysteresis, no actuator).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssessmentKind {
+    /// [`crate::telemetry::TelemetrySource::SoftwareFallback`]; skips thresholds.
     Simulated,
+    /// Safety-critical sample missing.
     Missing,
+    /// Safety-critical sample non-finite or out of engineering range.
     Invalid,
+    /// Safety-critical sample older than its stale threshold.
     Stale,
+    /// Valid samples above critical thermal/power limits.
     Critical,
+    /// Valid samples in the warn band.
     Warn,
+    /// Valid samples below warn thresholds.
     Ok,
 }
 
 /// Frame assessment with a human-readable reason for logs/metrics.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FrameAssessment {
+    /// Stateless kind (no hysteresis).
     pub kind: AssessmentKind,
+    /// Human-readable reason suitable for logs and metrics.
     pub reason: String,
 }
 
@@ -152,18 +172,26 @@ pub struct SafetySnapshot {
     pub state: SafetyState,
     /// Policy classification ignoring actuator overlay.
     pub policy_state: SafetyState,
+    /// Whether the last successful apply is still claimed.
     pub brake_engaged: bool,
+    /// Whether policy currently wants the brake on.
     pub desired_brake: bool,
+    /// Apply / release / none derived from desired vs engaged.
     pub intent: BrakeIntent,
+    /// Consecutive real Ok evaluations while braked (release hysteresis).
     pub hysteresis_ok_count: u32,
+    /// Reason from the latest classification or actuator feedback.
     pub last_reason: String,
+    /// Last apply/release error, if the overlay is active.
     pub last_actuator_error: Option<String>,
+    /// Named-state change this step, if any.
     pub transition: Option<(SafetyState, SafetyState)>,
     /// True when this step recorded a new actuator failure.
     pub actuator_failed: bool,
 }
 
 impl SafetySnapshot {
+    /// Derive [`BrakeIntent`] from desired vs currently engaged brake.
     #[must_use]
     pub fn intent_from(desired_brake: bool, brake_engaged: bool) -> BrakeIntent {
         match (desired_brake, brake_engaged) {
@@ -175,6 +203,16 @@ impl SafetySnapshot {
 }
 
 /// Deterministic safety state machine. Not coupled to IPC or GPU actuation.
+///
+/// ```
+/// use thalamic_relay::safety::{SafetyMachine, SafetyState};
+/// use thalamic_relay::telemetry::{assess, fixtures};
+///
+/// let mut machine = SafetyMachine::new();
+/// let frame = assess(&fixtures::healthy_real(), fixtures::NOW);
+/// let snap = machine.evaluate(&frame);
+/// assert_eq!(snap.state, SafetyState::HealthyReal);
+/// ```
 #[derive(Debug, Clone)]
 pub struct SafetyMachine {
     brake_engaged: bool,
@@ -189,6 +227,7 @@ pub struct SafetyMachine {
 }
 
 impl Default for SafetyMachine {
+    /// Same as [`Self::new`]: fail-closed (`TelemetryMissing`) until the first frame.
     fn default() -> Self {
         Self::new()
     }
@@ -211,6 +250,18 @@ impl SafetyMachine {
         }
     }
 
+    /// Consecutive named-state changes observed by this machine.
+    #[must_use]
+    pub fn transitions_total(&self) -> u64 {
+        self.transitions_total
+    }
+
+    /// Actuator apply/release failures recorded by this machine.
+    #[must_use]
+    pub fn actuator_failures_total(&self) -> u64 {
+        self.actuator_failures_total
+    }
+
     /// Seed leftover hardware throttle detected at process start.
     pub fn seed_brake_applied(&mut self) {
         self.brake_engaged = true;
@@ -219,16 +270,6 @@ impl SafetyMachine {
         self.last_policy_state = SafetyState::Recovering;
         self.state = SafetyState::Recovering;
         self.last_reason = "leftover emergency brake detected at startup".to_string();
-    }
-
-    #[must_use]
-    pub fn transitions_total(&self) -> u64 {
-        self.transitions_total
-    }
-
-    #[must_use]
-    pub fn actuator_failures_total(&self) -> u64 {
-        self.actuator_failures_total
     }
 
     /// Current snapshot without advancing hysteresis.
@@ -388,7 +429,7 @@ impl SafetyMachine {
     }
 }
 
-/// Instantaneous status used by [`crate::gpu::HardwareBridge::check_safety`].
+/// Instantaneous status (no hysteresis). Same classification as [`classify_frame`].
 #[must_use]
 pub fn instant_status(frame: &TelemetryFrame) -> (SafetyStatus, bool) {
     let assessment = classify_frame(frame);
@@ -461,8 +502,9 @@ pub fn classify_frame(frame: &TelemetryFrame) -> FrameAssessment {
 
 /// Direct warn-path helper: missing/invalid/stale fail closed as Critical.
 /// Kept so the fail-closed warn regression does not skip via `Option::?`.
+#[cfg(test)]
 #[must_use]
-pub fn warn_from_frame(frame: &TelemetryFrame) -> Option<SafetyStatus> {
+fn warn_from_frame(frame: &TelemetryFrame) -> Option<SafetyStatus> {
     match classify_frame(frame).kind {
         AssessmentKind::Missing
         | AssessmentKind::Invalid
@@ -592,8 +634,11 @@ impl std::error::Error for ActuatorError {}
 /// A detected engaged brake: the current, default, and expected-brake limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BrakeMatch {
+    /// Current power limit in watts.
     pub current_w: u32,
+    /// Device default power limit in watts.
     pub default_w: u32,
+    /// Expected emergency-brake target in watts (`pct` of default).
     pub expected_w: u32,
 }
 
@@ -607,14 +652,22 @@ pub enum PowerLimitObservation {
     /// evaluation fail-closes if telemetry is also missing.
     Unreadable,
     /// At or above the device default (within [`BRAKE_MATCH_TOLERANCE_W`]).
-    AtOrAboveDefault { current_w: u32, default_w: u32 },
+    AtOrAboveDefault {
+        /// Current observed power limit in watts.
+        current_w: u32,
+        /// Default device power limit in watts.
+        default_w: u32,
+    },
     /// Current limit matches this relay's expected brake target. Adopt and
     /// recover only through the normal Ok-streak hysteresis.
     RelayOwnedBrake(BrakeMatch),
     /// Below default but not the relay target. Leave unchanged; never auto-release.
     ForeignSubDefaultCap {
+        /// Current observed power limit in watts.
         current_w: u32,
+        /// Default device power limit in watts.
         default_w: u32,
+        /// Expected emergency brake target in watts.
         expected_brake_w: u32,
     },
 }
@@ -675,11 +728,11 @@ pub fn classify_power_limit(
 /// The privileged hardware-safety actuation boundary.
 ///
 /// Implementations apply/release a hardware power-limit brake and detect a
-/// leftover brake at startup. The NVML/`nvidia-smi` backend lives in
-/// [`crate::gpu`]; [`FakeActuator`] provides a deterministic test double. This
-/// trait is the actuation half of GH#46: the [`SafetyMachine`] decides *intent*
-/// ([`BrakeIntent`]) and never actuates, while implementations here perform the
-/// privileged side effect and report typed [`ActuatorError`]s.
+/// leftover brake at startup. The NVML/`nvidia-smi` backend is private to the
+/// `thalamic-relay` executable; [`FakeActuator`] provides a deterministic test
+/// double. This trait is the actuation half of GH#46: the [`SafetyMachine`]
+/// decides *intent* ([`BrakeIntent`]) and never actuates, while implementations
+/// here perform the privileged side effect and report typed [`ActuatorError`]s.
 ///
 /// Implementations must be `Send + Sync` so the supervisor can drive them from
 /// blocking worker tasks without stalling the telemetry loop.
@@ -1373,5 +1426,131 @@ mod tests {
             slightly_under_default,
             PowerLimitObservation::AtOrAboveDefault { .. }
         ));
+    }
+
+    #[test]
+    fn default_machine_matches_new() {
+        let snap = SafetyMachine::default().snapshot();
+        assert_eq!(snap.state, SafetyState::TelemetryMissing);
+        assert_eq!(snap.intent, BrakeIntent::Apply);
+    }
+
+    #[test]
+    fn exact_critical_thresholds_are_exclusive() {
+        let at_temp = eval_once({
+            let mut raw = fixtures::healthy_real();
+            raw.gpu_temp_c = Some(TEMP_CRITICAL_C);
+            raw
+        });
+        assert_eq!(at_temp.state, SafetyState::Warning);
+
+        let over_temp = eval_once({
+            let mut raw = fixtures::healthy_real();
+            raw.gpu_temp_c = Some(TEMP_CRITICAL_C + 0.1);
+            raw
+        });
+        assert_eq!(over_temp.state, SafetyState::CriticalBraked);
+        assert_eq!(over_temp.intent, BrakeIntent::Apply);
+
+        let at_power = eval_once({
+            let mut raw = fixtures::healthy_real();
+            raw.power_w = Some(POWER_CRITICAL_W);
+            raw
+        });
+        assert_eq!(at_power.state, SafetyState::Warning);
+
+        let over_power = eval_once({
+            let mut raw = fixtures::healthy_real();
+            raw.power_w = Some(POWER_CRITICAL_W + 0.1);
+            raw
+        });
+        assert_eq!(over_power.state, SafetyState::CriticalBraked);
+    }
+
+    #[test]
+    fn power_critical_wins_over_temp_warn() {
+        let snap = eval_once({
+            let mut raw = fixtures::healthy_real();
+            raw.gpu_temp_c = Some(78.0);
+            raw.power_w = Some(360.0);
+            raw
+        });
+        assert_eq!(snap.state, SafetyState::CriticalBraked);
+        assert!(snap.last_reason.contains("power"));
+    }
+
+    #[test]
+    fn non_finite_is_named_telemetry_invalid() {
+        let snap = eval_once(fixtures::non_finite());
+        assert_eq!(snap.state, SafetyState::TelemetryInvalid);
+        assert_eq!(snap.intent, BrakeIntent::Apply);
+    }
+
+    #[test]
+    fn mixed_faults_rank_missing_over_invalid_over_stale() {
+        let mut invalid_over_stale = nvml_temp_power(65.0, 200.0);
+        invalid_over_stale.gpu_temp_c.validity = SampleValidity::Stale;
+        invalid_over_stale.power_w.validity = SampleValidity::Invalid;
+        let assessment = classify_frame(&invalid_over_stale);
+        assert_eq!(assessment.kind, AssessmentKind::Invalid);
+        assert!(assessment.reason.contains("power_w"));
+
+        let mut missing_over_invalid = nvml_temp_power(65.0, 200.0);
+        missing_over_invalid.gpu_temp_c.validity = SampleValidity::Invalid;
+        missing_over_invalid.power_w.value = None;
+        missing_over_invalid.power_w.validity = SampleValidity::Missing;
+        let assessment = classify_frame(&missing_over_invalid);
+        assert_eq!(assessment.kind, AssessmentKind::Missing);
+        assert!(assessment.reason.contains("power_w"));
+    }
+
+    #[test]
+    fn equal_fault_rank_prefers_gpu_temp() {
+        let mut both_stale = nvml_temp_power(65.0, 200.0);
+        both_stale.gpu_temp_c.validity = SampleValidity::Stale;
+        both_stale.power_w.validity = SampleValidity::Stale;
+        let assessment = classify_frame(&both_stale);
+        assert_eq!(assessment.kind, AssessmentKind::Stale);
+        assert!(assessment.reason.contains("gpu_temp_c"));
+
+        let mut both_invalid = nvml_temp_power(65.0, 200.0);
+        both_invalid.gpu_temp_c.validity = SampleValidity::Invalid;
+        both_invalid.power_w.validity = SampleValidity::Invalid;
+        let assessment = classify_frame(&both_invalid);
+        assert_eq!(assessment.kind, AssessmentKind::Invalid);
+        assert!(assessment.reason.contains("gpu_temp_c"));
+
+        let mut both_missing = nvml_temp_power(65.0, 200.0);
+        both_missing.gpu_temp_c.value = None;
+        both_missing.gpu_temp_c.validity = SampleValidity::Missing;
+        both_missing.power_w.value = None;
+        both_missing.power_w.validity = SampleValidity::Missing;
+        let assessment = classify_frame(&both_missing);
+        assert_eq!(assessment.kind, AssessmentKind::Missing);
+        assert!(assessment.reason.contains("gpu_temp_c"));
+    }
+
+    #[test]
+    fn warn_from_frame_is_none_for_ok_and_simulated() {
+        assert_eq!(
+            warn_from_frame(&assess(&fixtures::healthy_real(), fixtures::NOW)),
+            None
+        );
+        assert_eq!(
+            warn_from_frame(&assess(&fixtures::software_fallback(), fixtures::NOW)),
+            None
+        );
+    }
+
+    #[test]
+    fn leftover_brake_plus_simulated_holds_and_does_not_apply() {
+        let mut machine = SafetyMachine::new();
+        machine.seed_brake_applied();
+        let snap = machine.evaluate(&assess(&fixtures::software_fallback(), fixtures::NOW));
+        assert_eq!(snap.state, SafetyState::SimulatedSoftwareOnly);
+        assert!(snap.brake_engaged);
+        assert!(snap.desired_brake);
+        assert_eq!(snap.intent, BrakeIntent::None);
+        assert_eq!(snap.hysteresis_ok_count, 0);
     }
 }

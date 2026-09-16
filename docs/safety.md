@@ -9,10 +9,9 @@ disconnect, or a slow consumer. Brainstem has **no** authority to override
 Thalamic hard-safety policy — there is no IPC command that can inhibit the
 brake.
 
-Privileged `nvidia-smi` actuation stays in `src/gpu.rs`. The state machine
-in `src/safety.rs` only emits **intents**. Full actuator-trait extraction
-is GH#46; this crate keeps that split as a hook (pure machine, side-effect
-actuation in the supervisor).
+Privileged `nvidia-smi` actuation stays in private `src/gpu.rs` (used only by
+the `thalamic-relay` executable). The state machine in `src/safety.rs` only
+emits **intents**; hardware side effects go through [`SafetyActuator`].
 
 ## Ownership
 
@@ -24,7 +23,7 @@ actuation in the supervisor).
 | Safety/brake state and transition/error counters | Thalamic Prometheus (`:9000/metrics`) |
 | Orderly SIGINT/SIGTERM shutdown (fail-closed) | Thalamic (`shutdown` + supervisor) |
 | Sensory mapping types | Thalamic (`TelemetryFrame::to_sensory_mapping`) |
-| Sensory transport to Brainstem | `corpus-ipc` (GH#40, not required for safety) |
+| Sensory transport to Brainstem | Thalamic `publish` → `corpus-ipc` `IpcMessage::Stimuli` (not required for safety) |
 | SNN tick, neuromodulation, neural state | Brainstem |
 | Reward / plasticity | Brainstem (never Thalamic) |
 
@@ -123,13 +122,16 @@ SafetySnapshot (state, brake, intent)
       ├─ spawn_blocking apply/release   (gpu, not on the eval path)
       └─ SensoryPublisher::try_publish   (best-effort, after eval)
              IsolatedPublishQueue.try_enqueue  (drop on full)
+                   │
+                   ▼  CorpusIpcPublisher worker (not awaited)
+             IpcMessage::Stimuli JSON → UDP sendto
 ```
 
-Production currently uses [`AbsentPublisher`](../src/publish.rs) (Brainstem
-absent). GH#40 should plug a `corpus-ipc` publisher into
-`IsolatedPublishQueue` (bounded `try_send`). A full or disconnected queue
-is `SlowConsumer` / `Disconnected` and **must not** be `recv`'d from the
-safety loop.
+Production uses [`CorpusIpcPublisher`](../src/publish.rs) unless
+`--ipc-disabled` (then [`AbsentPublisher`](../src/publish.rs)). The worker
+is a bounded `try_send` plus fire-and-forget UDP. A full or disconnected
+queue is `SlowConsumer` / `Disconnected` and **must not** be `recv`'d from
+the safety loop. Brainstem absence cannot stall evaluation.
 
 ## Prometheus
 
@@ -148,7 +150,7 @@ Exported without querying Brainstem:
 | `shutdown_unresolved_brake` | gauge 0/1 | brake still claimed or still desired at exit |
 | `shutdown_unresolved_actuator` | gauge 0/1 | last apply/release still failed at exit |
 | `shutdown_brake_left_engaged` | gauge 0/1 | hardware brake left in place (not restored) |
-| `telemetry_freshness_s` | gauge | sample age at scrape time |
+| `telemetry_freshness_s` | gauge | sample age at scrape time (monotonic receive instant) |
 
 Numeric ids: 0 `healthy_real`, 1 `warning`, 2 `critical_braked`,
 3 `recovering`, 4 `telemetry_missing`, 5 `telemetry_stale`,
