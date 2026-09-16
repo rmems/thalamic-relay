@@ -25,7 +25,9 @@ cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 Requires Rust edition 2024, MSRV 1.98.1. No sibling path dependencies — a
-plain `cargo build` from the repo root is sufficient.
+plain `cargo build` from the repo root is sufficient. CI also qualifies
+packaging (`cargo package --locked`, packaged-source tests, token-free
+`cargo publish --dry-run --locked`) and rustdoc with warnings denied.
 
 ## Interfaces
 
@@ -34,6 +36,10 @@ plain `cargo build` from the repo root is sufficient.
   surface — the retired UDP protocol (`Stimuli`/`LearningReward`/`GetNeuroState`
   at `127.0.0.1:9898`) was removed in RM-1143. See [`docs/ipc.md`](docs/ipc.md).
 - Prometheus metrics on `:9000/metrics`.
+- Frozen hardware-telemetry CSV interchange:
+  `timestamp_ms,gpu_temp_c,gpu_power_w,cpu_tctl_c,cpu_package_power_w`
+  (`src/telemetry_csv.rs`, [`docs/telemetry_csv.md`](docs/telemetry_csv.md)).
+  Do not change that schema.
 
 ## Reviewing / responding to automated PR review bots
 

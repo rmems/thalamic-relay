@@ -3,6 +3,13 @@
 This is the normative validity / freshness / normalization / provenance
 contract for `thalamic-relay` ([GH#41](https://github.com/rmems/thalamic-relay/issues/41)).
 
+The frozen **CSV interchange** consumed by corinth-canal
+(`timestamp_ms,gpu_temp_c,gpu_power_w,cpu_tctl_c,cpu_package_power_w`) is a
+separate contract in [`docs/telemetry_csv.md`](telemetry_csv.md) and
+`thalamic_relay::telemetry_csv` ([RM-629](https://linear.app/rpd-34/issue/RM-629)).
+Do not treat CSV columns as [`TelemetrySample`] values: CSV fields are
+required finite numbers, not `Option`.
+
 Invalid, missing, stale, and simulated data is **never** inferred from magic
 numeric values. Missing sensors stay `None`; they are never silently converted
 into a legitimate `0.0`.
@@ -17,12 +24,43 @@ Named relay states and hysteresis: [`docs/safety.md`](safety.md) (GH#42).
 ```text
 TelemetrySample<T> {
     value: Option<T>,       // engineering units; None if missing or non-finite
-    observed_at: unix ms,
+    observed_at: unix ms,   // source wall time, or receive time if source missing
     source: TelemetrySource, // Nvml | SoftwareFallback | NvmlUnavailable
     validity: SampleValidity, // Valid | Missing | Invalid | Stale
     unit: Unit,
 }
 ```
+
+## Sample clock and timestamp provenance (RM-1335)
+
+Wall-clock source timestamps can jump, repeat, or arrive out of order.
+Every assessed / emitted frame is stamped by a process-local
+[`SampleClock`] (`src/time.rs`):
+
+| Field | Meaning |
+| --- | --- |
+| `session_id` | Stable boot/session id (corpus-ipc `StimulusBatch.session_id`). A new `SampleClock` (process restart) is a new session. |
+| `batch_id` | Strictly increasing sample sequence within that session (corpus-ipc `batch_id`; first frame is 0). Resets to 0 on restart. |
+| `source_unix_ms` | Original producer wall time (`None` if the CSV cell / producer omitted it). |
+| `received_at_unix_ms` / `acquired_at` | Receive/assess time at the relay. **Freshness uses this**, not source wall time. |
+| `emitted_at_unix_ms` | Mapping-time instant (`to_sensory_mapping_at(now)`). Distinct from receive when a held frame is mapped later. |
+| `timestamp_origin` | `LiveAcquire` \| `CsvSource` \| `Simulated` |
+| `source_time_status` | `InOrder` \| `Duplicate` \| `Backward` \| `Future` \| `Missing` |
+
+Duplicate, backward, missing, and very large source timestamps **do not
+regress** `batch_id`. They are flagged on `source_time_status`. Future
+source time (`source_unix_ms > now`, including `u64::MAX`) is also
+[`SampleValidity::Invalid`] — the existing validity policy. Missing source
+time uses receive time for sample age (so a just-received row is not
+spuriously stale) and is flagged `Missing`.
+
+Consumers must key frames by `(session_id, batch_id)`, never `batch_id`
+alone. Live NVML, `--force-software-only`, and CSV/replay rows share this
+contract by passing the same `SampleClock` into
+`TelemetryFrame::from_raw_with_clock` / `HardwareBridge::read_telemetry_with_clock`.
+
+Prometheus `telemetry_freshness_s` is computed from a monotonic
+`Instant` captured at receive, not from source wall time.
 
 Simulated data is [`TelemetrySource::SoftwareFallback`] and is used only for
 `--force-software-only`. NVML/driver/device lookup failure is
@@ -34,19 +72,20 @@ legitimate idle GPU.
 ## Pipeline
 
 ```text
-RawTelemetry          (optional engineering values + acquisition source)
+RawTelemetry          (optional engineering values + source time + origin)
         │
-        ▼  assess() / TelemetryFrame::from_raw()
-TelemetryFrame        (per-signal TelemetrySample)
+        ▼  assess() / assess_with_clock() / TelemetryFrame::from_raw_with_clock()
+TelemetryFrame        (per-signal TelemetrySample + session_id/batch_id + split times)
         │
         ├─ SafetyMachine::evaluate()      isolated; no IPC  → GH#42
-        ├─ HardwareBridge::check_safety() instantaneous Ok/Warn/Critical
+        ├─ instant_status() / classify_frame()  instantaneous Ok/Warn/Critical
         ├─ to_sensory_mapping()            runtime-input / Both  → GH#40
         └─ to_observability_snapshot()      every signal, raw preserved
 ```
 
-The supervisor currently assesses each acquisition immediately (age ≈ 0).
-If NVML is unavailable it emits `NvmlUnavailable` with missing safety samples
+The supervisor currently assesses each acquisition immediately (sample age
+vs source time ≈ 0 for live NVML). The sample sequence still advances when
+CSV/replay source times duplicate or go backward. If NVML is unavailable it emits `NvmlUnavailable` with missing safety samples
 (fail closed), not `SoftwareFallback`. `SoftwareFallback` is reserved for
 `--force-software-only`. `to_sensory_mapping_at(now)` re-evaluates freshness
 so a held frame older than the per-signal stale threshold is `Stale` and
@@ -108,10 +147,12 @@ fail-closes. This is not software-only confirmation.
 ## corpus-ipc mapping surface (#41 owns types, #40 owns transport)
 
 `TelemetryFrame::to_sensory_mapping_at(now)` produces `SensoryMapping` /
-`MappedStimulus` with timestamp, source, validity (re-evaluated at `now`),
-raw engineering value, normalized `[0, 1]` (only when `Valid` at `now`),
-`stale_after_ms`, and the actual `cadence_ms`. `#40` maps this into published `corpus-ipc` `StimulusBatch` / `IpcMessage::Stimuli`
-in `src/publish.rs`. This module does not depend on `corpus-ipc` and does not
+`MappedStimulus` with `session_id`, `batch_id`, source vs receive vs emit
+timestamps, source-time status, acquisition source, validity (re-evaluated
+at `now`), raw engineering value, normalized `[0, 1]` (only when `Valid`
+at `now`), `stale_after_ms`, and the actual `cadence_ms`. `src/publish.rs` (#40)
+maps this into published `corpus-ipc` `StimulusBatch` / `IpcMessage::Stimuli`
+off the safety path. `telemetry` does not depend on `corpus-ipc` and does not
 duplicate the wire schema.
 
 ## Fixtures
@@ -121,8 +162,13 @@ duplicate the wire schema.
 - `healthy_real` — NVML-like, including legitimate `mem_util_pct = 0.0`
 - `software_fallback` — explicit simulated idle (`--force-software-only`)
 - `nvml_unavailable` — all channels missing, fail-closed safety path
-- `stale` — healthy values with `observed_at` 10 s in the past
+- `stale` — healthy values with `source_unix_ms` 10 s in the past
 - `sensor_dropout` — `power_w = None` (not `0.0` / `NaN`)
 - `non_finite` — `power_w = NaN`
 - `out_of_range` — `gpu_temp_c = 200`
 - `nvml_looks_like_old_magic` — NVML `0 °C` / `25 W`, **not** simulated
+- `duplicate_source_timestamp` / `backward_source_timestamp` /
+  `missing_source_timestamp` / `very_large_source_timestamp` — source-time
+  anomalies (CSV/replay)
+- `CSV_SOURCE_TIME_FIXTURE` / `raw_from_csv_row` — the same four anomalies
+  as CSV rows, stamped through the shared `SampleClock`

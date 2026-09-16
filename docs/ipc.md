@@ -19,9 +19,16 @@ Prometheus metrics remain on `:9000/metrics`.
 
 The typed validity / freshness / provenance / normalization contract
 (GH#41) lives in [`docs/telemetry.md`](telemetry.md) and
-`thalamic_relay::telemetry`. `TelemetryFrame::to_sensory_mapping()` is the
-internal mapping surface (not a second wire schema). `publish` maps that
-into `corpus_ipc::StimulusBatch` and sends `IpcMessage::Stimuli`.
+`thalamic_relay::telemetry`. Frame ordering and timestamp provenance
+(RM-1335) live in `thalamic_relay::time`: `session_id` / `batch_id` match
+corpus-ipc `StimulusBatch`, source wall time is preserved separately from
+receive/emit time, and a restart is a new `session_id` with `batch_id`
+reset to 0. `TelemetryFrame::to_sensory_mapping()` is the
+deterministic mapping surface toward `corpus-ipc`; it is **not** a second
+wire schema. `publish` maps that into `corpus_ipc::StimulusBatch` and sends
+`IpcMessage::Stimuli` via `CorpusIpcPublisher`, using `AbsentPublisher` or
+`IsolatedPublishQueue` off the safety path so transport failures never stall
+`SafetyMachine::evaluate`.
 
 ## Ownership
 
