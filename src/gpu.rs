@@ -14,9 +14,9 @@
 //! semantics (thresholds, hysteresis, fail-closed policy) — those belong to
 //! [`crate::safety`].
 
-use crate::safety::{ActuatorError, SafetyActuator, instant_status};
+use crate::safety::{ActuatorError, SafetyActuator};
 #[cfg(test)]
-use crate::safety::SafetyStatus;
+use crate::safety::{SafetyStatus, instant_status};
 #[cfg(test)]
 use crate::telemetry::DEFAULT_ACQUISITION_CADENCE_MS;
 use crate::telemetry::{
