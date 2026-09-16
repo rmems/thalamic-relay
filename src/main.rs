@@ -465,5 +465,113 @@ mod tests {
             format_live_reading(&missing.power_w, |w| format!("{w:.0}W")),
             "n/a"
         );
+
+        let mut valid_none = live.clone();
+        valid_none.power_w.value = None;
+        assert_eq!(
+            format_live_reading(&valid_none.power_w, |w| format!("{w:.0}W")),
+            "n/a"
+        );
+    }
+
+    #[test]
+    fn cli_rejects_zero_step_interval() {
+        let result = Cli::try_parse_from(["thalamic-relay", "--step-interval-ms", "0"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn lock_guard_rejects_unparseable_pid() {
+        let lock_path = "/tmp/thalamic_relay_test_unparseable.lock";
+        let _ = std::fs::remove_file(lock_path);
+        std::fs::write(lock_path, "not-a-pid").unwrap();
+        let err = try_acquire_lock(lock_path).unwrap_err();
+        assert!(
+            err.contains("unreadable/unparseable"),
+            "expected fail-closed unparseable lock, got: {err}"
+        );
+        let _ = std::fs::remove_file(lock_path);
+    }
+
+    #[test]
+    fn lock_guard_rejects_empty_lock_file() {
+        let lock_path = "/tmp/thalamic_relay_test_empty.lock";
+        let _ = std::fs::remove_file(lock_path);
+        std::fs::write(lock_path, "   \n").unwrap();
+        let err = try_acquire_lock(lock_path).unwrap_err();
+        assert!(
+            err.contains("unreadable/unparseable"),
+            "expected fail-closed empty lock, got: {err}"
+        );
+        let _ = std::fs::remove_file(lock_path);
+    }
+
+    #[tokio::test]
+    async fn spawn_intent_apply_and_release_drive_fake_actuator() {
+        use thalamic_relay::safety::FakeActuator;
+        use thalamic_relay::telemetry::{assess, fixtures};
+
+        let fake = Arc::new(FakeActuator::new());
+        let actuator: Arc<dyn SafetyActuator> = fake.clone();
+        let mut brake_task = None;
+        let mut release_task = None;
+        let mut machine = SafetyMachine::new();
+
+        let mut critical = fixtures::healthy_real();
+        critical.gpu_temp_c = Some(90.0);
+        let apply_snap = machine.evaluate(&assess(&critical, fixtures::NOW));
+        assert_eq!(apply_snap.intent, BrakeIntent::Apply);
+
+        spawn_intent(&apply_snap, &actuator, &mut brake_task, &mut release_task);
+        assert!(brake_task.is_some());
+        assert!(release_task.is_none());
+
+        let mut blocked_release = apply_snap.clone();
+        blocked_release.intent = BrakeIntent::Release;
+        spawn_intent(
+            &blocked_release,
+            &actuator,
+            &mut brake_task,
+            &mut release_task,
+        );
+        assert!(release_task.is_none(), "in-flight apply must block release");
+
+        let applied = brake_task.take().expect("apply task").await.unwrap();
+        assert!(applied.is_ok());
+        assert!(fake.is_engaged());
+        assert_eq!(fake.apply_calls(), 1);
+
+        let _ = machine.record_actuator(ActuatorOutcome::Applied);
+        let ok = assess(&fixtures::healthy_real(), fixtures::NOW);
+        let _ = machine.evaluate(&ok);
+        let _ = machine.evaluate(&ok);
+        let release_snap = machine.evaluate(&ok);
+        assert_eq!(release_snap.intent, BrakeIntent::Release);
+
+        spawn_intent(&release_snap, &actuator, &mut brake_task, &mut release_task);
+        assert!(brake_task.is_none());
+        let released = release_task.take().expect("release task").await.unwrap();
+        assert!(released.is_ok());
+        assert!(!fake.is_engaged());
+        assert_eq!(fake.release_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn spawn_intent_none_does_not_start_tasks() {
+        use thalamic_relay::safety::FakeActuator;
+        use thalamic_relay::telemetry::{assess, fixtures};
+
+        let fake = Arc::new(FakeActuator::new());
+        let actuator: Arc<dyn SafetyActuator> = fake.clone();
+        let mut brake_task = None;
+        let mut release_task = None;
+        let mut machine = SafetyMachine::new();
+        let snap = machine.evaluate(&assess(&fixtures::healthy_real(), fixtures::NOW));
+        assert_eq!(snap.intent, BrakeIntent::None);
+        spawn_intent(&snap, &actuator, &mut brake_task, &mut release_task);
+        assert!(brake_task.is_none());
+        assert!(release_task.is_none());
+        assert_eq!(fake.apply_calls(), 0);
+        assert_eq!(fake.release_calls(), 0);
     }
 }

@@ -5,7 +5,8 @@
 ```bash
 cargo test                    # all tests
 cargo test --lib              # src/lib.rs tests (telemetry + telemetry_csv + gpu + cpu)
-cargo test --bin thalamic-relay  # src/main.rs tests only (6)
+cargo test --bin thalamic-relay  # src/main.rs tests (CLI/lock/spawn_intent)
+cargo test --test software_only  # GPU-less integration harness (RM-1217)
 cargo test telemetry          # typed contract / fixtures
 cargo test telemetry_csv      # frozen CSV header / parse / replay (RM-629)
 cargo test gpu                # gpu acquisition + check_safety facade
@@ -73,11 +74,52 @@ cargo test lock_guard         # single-instance lockfile tests
 | main.rs | `lock_guard_created_and_removed` | Lockfile create/drop lifecycle |
 | main.rs | `lock_guard_rejects_active_pid` | Second instance refused while PID alive |
 | main.rs | `lock_guard_reclaims_stale_lock` | Stale lock (dead PID) reclaimed |
+| main.rs | `lock_guard_rejects_unparseable_pid` | Unreadable/unparseable lock fail-closed |
+| main.rs | `lock_guard_rejects_empty_lock_file` | Empty lock fail-closed |
+| main.rs | `cli_rejects_zero_step_interval` | `--step-interval-ms 0` rejected |
+| main.rs | `spawn_intent_apply_and_release_drive_fake_actuator` | Supervisor intent dispatch, no GPU |
+| main.rs | `spawn_intent_none_does_not_start_tasks` | Healthy snapshot does not actuate |
+| tests/software_only.rs | `binary_help_and_version_exit_zero_without_gpu` | CLI `--help`/`-V` without NVML |
+| tests/software_only.rs | `binary_software_only_starts_without_nvidia` | Forced software-only process start |
+| tests/software_only.rs | `software_only_pipeline_evaluates_safety_then_best_effort_publish` | Acquire → evaluate → absent publish |
+| tests/software_only.rs | `ipc_failure_cannot_stall_safety_loop_progress` | Hysteresis while IPC send fails |
+| tests/software_only.rs | `missing_invalid_stale_and_simulated_frames_are_named_states` | Named fail-closed / simulated states |
+| tests/software_only.rs | `slow_and_disconnected_publish_queues_do_not_block_critical_brake` | Disconnected queue ≠ safety pause |
+| tests/software_only.rs | `acquire_without_force_is_not_simulated_on_ci` | No-GPU acquire is NvmlUnavailable, not sim |
 
 As of RM-1143 (GH#39), `thalamic-relay` no longer runs an in-process SNN or
 exposes a UDP control surface — the `Stimuli`/`LearningReward`/`GetNeuroState`
 tests and the `num-channels`/`num-lif`/`num-izh` CLI tests were removed along
 with that code. See [`docs/ipc.md`](docs/ipc.md).
+
+## Coverage update (RM-1217)
+
+Post-GH#39 inventory of production branches that still needed deterministic,
+GPU-less tests. Unit coverage already landed with GH#41/#42/#46; this change
+locks the remaining edges and adds an integration harness under `tests/`.
+
+### Gaps closed
+
+- Telemetry: identity/degenerate normalization, inclusive engineering range,
+  below-min / `+inf` / future-missing / `at_time` staleness, cadence floor of 1,
+  `SignalClass` helpers, derived `vddcr_gfx_v`.
+- Safety: exclusive critical thresholds, mixed-fault ranking (missing > invalid
+  > stale; equal rank prefers `gpu_temp_c`), leftover-brake + simulated hold,
+  `warn_from_frame` None for Ok/simulated.
+- IPC isolation (GH#40 transport **not** implemented yet): hysteresis still
+  reaches release while `FailingPublisher` errors; capacity-0 queue;
+  disconnected/slow `try_enqueue` cannot change `BrakeIntent::Apply`.
+- CLI/lockfile: unparseable/empty lock fail-closed; zero step interval rejected.
+- Supervisor `spawn_intent` apply/release/none via `FakeActuator` (tokio).
+- Software-only integration crate: binary `--help`/`-V`, `--force-software-only`
+  process start, acquire→evaluate→publish pipeline, no GPU.
+
+### Gaps explicitly deferred
+
+- `cpu::init_telemetry` / `cpu::run_metrics_collector`: bind a network port and run an indefinite loop; not safely unit-testable without an integration harness.
+- `NvmlActuator` live `nvidia-smi` mutation: requires a real NVML-capable GPU; fail-closed-without-GPU is tested. Policy is covered by `SafetyMachine` + `FakeActuator`.
+- Typed `corpus-ipc` round-trips: blocked on GH#40 / RM-1144. Isolation stub (`AbsentPublisher`, `IsolatedPublishQueue`, `FailingPublisher`) is the current contract.
+- The `main` async supervisor loop body (post-brake re-read, every-10-ticks cadence) is still exercised by the software-only binary smoke plus unit tests of `spawn_intent` / `evaluate_then_try_publish`, not a full in-process tick harness.
 
 ## Coverage update (RM-342)
 
