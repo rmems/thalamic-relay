@@ -25,6 +25,10 @@ pub enum PublishError {
 
 /// Best-effort sensory publisher. Must not block the safety loop.
 pub trait SensoryPublisher: Send + Sync {
+    /// Attempt to publish `mapping` without waiting on a consumer.
+    ///
+    /// Must return promptly. A full queue, absent transport, or send failure
+    /// is reported as [`PublishError`]; it must not stall [`crate::safety::SafetyMachine::evaluate`].
     fn try_publish(&self, mapping: &SensoryMapping) -> Result<(), PublishError>;
 }
 
@@ -41,10 +45,12 @@ impl SensoryPublisher for AbsentPublisher {
 /// Test double that fails every send without blocking.
 #[derive(Debug, Clone)]
 pub struct FailingPublisher {
+    /// Reason string returned as [`PublishError::SendFailed`].
     pub reason: String,
 }
 
 impl FailingPublisher {
+    /// Publisher that reports a generic send failure.
     #[must_use]
     pub fn send_failed() -> Self {
         Self {
@@ -52,6 +58,7 @@ impl FailingPublisher {
         }
     }
 
+    /// Publisher that reports a disconnected worker.
     #[must_use]
     pub fn disconnected() -> Self {
         Self {
@@ -186,5 +193,66 @@ mod tests {
         assert!(pub_res.is_err());
         assert_eq!(snap.policy_state, SafetyState::TelemetryMissing);
         assert_eq!(snap.intent, BrakeIntent::Apply);
+    }
+
+    #[test]
+    fn hysteresis_still_reaches_release_while_publisher_fails() {
+        use crate::safety::{ActuatorOutcome, BRAKE_FRACTION, FakeActuator, SafetyActuator};
+
+        let mut machine = SafetyMachine::new();
+        let publisher = FailingPublisher::send_failed();
+        let fake = FakeActuator::new();
+
+        let (snap, pub_res) =
+            evaluate_then_try_publish(&mut machine, &critical_frame(), &publisher);
+        assert_eq!(
+            pub_res,
+            Err(PublishError::SendFailed("ipc send failed".into()))
+        );
+        assert_eq!(snap.intent, BrakeIntent::Apply);
+        fake.apply_emergency_brake(BRAKE_FRACTION).unwrap();
+        let snap = machine.record_actuator(ActuatorOutcome::Applied);
+        assert!(snap.brake_engaged);
+
+        let ok = healthy_frame();
+        let _ = evaluate_then_try_publish(&mut machine, &ok, &publisher);
+        let _ = evaluate_then_try_publish(&mut machine, &ok, &publisher);
+        let (third, pub_res) = evaluate_then_try_publish(&mut machine, &ok, &publisher);
+        assert!(pub_res.is_err());
+        assert_eq!(third.state, SafetyState::Recovering);
+        assert_eq!(third.intent, BrakeIntent::Release);
+        fake.release_emergency_brake().unwrap();
+        let snap = machine.record_actuator(ActuatorOutcome::Released);
+        assert!(!snap.brake_engaged);
+        assert!(!fake.is_engaged());
+    }
+
+    #[test]
+    fn zero_capacity_queue_still_accepts_one_then_reports_slow_consumer() {
+        let (queue, rx) = IsolatedPublishQueue::bounded(0);
+        let mapping = healthy_frame().to_sensory_mapping_at(fixtures::NOW);
+        queue.try_enqueue(mapping.clone()).unwrap();
+        assert_eq!(
+            queue.try_enqueue(mapping.clone()),
+            Err(PublishError::SlowConsumer)
+        );
+        let received = rx.try_recv().unwrap();
+        assert_eq!(received.acquisition_source, mapping.acquisition_source);
+        assert_eq!(received.stimuli.len(), mapping.stimuli.len());
+    }
+
+    #[test]
+    fn successful_try_publish_does_not_mutate_safety_snapshot() {
+        let (queue, rx) = IsolatedPublishQueue::bounded(4);
+        let mut machine = SafetyMachine::new();
+        let (snap, pub_res) = evaluate_then_try_publish(&mut machine, &healthy_frame(), &queue);
+        assert!(pub_res.is_ok());
+        assert_eq!(snap.state, SafetyState::HealthyReal);
+        let received = rx.try_recv().unwrap();
+        assert_eq!(
+            received.acquisition_source,
+            crate::telemetry::TelemetrySource::Nvml
+        );
+        assert!(rx.try_recv().is_err());
     }
 }
