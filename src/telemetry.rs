@@ -1332,14 +1332,14 @@ mod tests {
     #[test]
     fn future_missing_stays_missing_and_future_non_finite_is_invalid() {
         let mut missing = fixtures::healthy_real();
-        missing.observed_at = NOW + 5_000;
+        missing.source_unix_ms = Some(NOW + 5_000);
         missing.gpu_temp_c = None;
         let frame = assess(&missing, NOW);
         assert_eq!(frame.gpu_temp_c.validity, SampleValidity::Missing);
         assert_eq!(frame.gpu_temp_c.value, None);
 
         let mut nan = fixtures::healthy_real();
-        nan.observed_at = NOW + 5_000;
+        nan.source_unix_ms = Some(NOW + 5_000);
         nan.power_w = Some(f32::NAN);
         let frame = assess(&nan, NOW);
         assert_eq!(frame.power_w.validity, SampleValidity::Invalid);
