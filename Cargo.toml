@@ -2,10 +2,31 @@
 name = "thalamic-relay"
 version = "0.1.0"
 edition = "2024"
-description = "Lightweight CLI relay that observes hardware telemetry and provides deterministic hardware safety (software-only, no built-in FPGA bridge)."
-repository = "https://github.com/rmems/thalamic-relay"
-license = "MIT OR Apache-2.0"
 rust-version = "1.98.1"
+authors = ["Raul Cardenas Montoya"]
+description = "Sensory and deterministic hardware-safety relay: GPU telemetry, fail-closed thermal/power protection, and Prometheus observability."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rmems/thalamic-relay"
+homepage = "https://github.com/rmems/thalamic-relay"
+documentation = "https://docs.rs/thalamic-relay"
+readme = "README.md"
+keywords = ["telemetry", "gpu", "safety", "nvml", "prometheus"]
+categories = ["hardware-support", "command-line-utilities"]
+publish = ["crates-io"]
+# Allowlist (not a denylist): only consumer-facing sources, licenses, changelog,
+# and architecture docs ship in the .crate. Contributor/agent files (AGENTS.md,
+# CLAUDE.md, REVIEW.md), CI, and local tool configs stay in git and out of the
+# published artifact. Cargo.lock is included because this package has a binary.
+include = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "CHANGELOG.md",
+    "README.md",
+    "LICENSE-APACHE-2.0",
+    "LICENSE-MIT",
+    "src/**",
+    "docs/**",
+]
 
 
 [dependencies]

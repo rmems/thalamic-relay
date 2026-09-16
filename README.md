@@ -239,6 +239,21 @@ This project is licensed under either of
 
 at your option.
 
+## Crate package
+
+The crates.io artifact is an **allowlist** (`include` in `Cargo.toml`), not a
+denylist, so development-only files cannot ship by accident. The package
+contains:
+
+- `src/` (library + `thalamic-relay` binary)
+- consumer docs: `README.md`, `CHANGELOG.md`, `docs/`
+- `Cargo.lock` (this package has a binary)
+- `LICENSE-MIT` and `LICENSE-APACHE-2.0`
+
+Contributor and agent files (`AGENTS.md`, `CLAUDE.md`, `REVIEW.md`), CI
+(`.github/`), and local tool configs (`.codacy.yml`, `.gitignore`) stay in git
+and are **not** part of the `.crate`. Inspect with `cargo package --list`.
+
 ## Contributing
 
 Contributions are welcome! Please ensure all submissions follow the project's
@@ -246,7 +261,12 @@ coding standards and include appropriate tests.
 
 ## Releasing
 
-This crate is not yet published to crates.io (that is planned for v1.0; see #29).
+This crate is not yet published to crates.io. The first intended registry
+release is `0.2.0` and is gated on the publication epic (#44); do **not** run
+the real `cargo publish` without explicit maintainer approval. Packaging
+hygiene for that gate is `cargo package --locked` and
+`cargo publish --dry-run --locked` from a clean checkout.
+
 To cut a tag and GitHub Release for a `0.1.x` patch:
 
 1. Make sure `CHANGELOG.md` is up to date and the version in `Cargo.toml` matches the intended release.
