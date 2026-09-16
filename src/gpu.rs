@@ -273,7 +273,7 @@ fn query_default_power_limit_w() -> Option<u32> {
 
 /// Derive an observability-only Vcore estimate from board power.
 /// This is not an NVML voltage sensor; [`crate::telemetry::SignalOrigin::Derived`].
-fn derive_vddcr_gfx_v(power_w: f32) -> f32 {
+pub(crate) fn derive_vddcr_gfx_v(power_w: f32) -> f32 {
     let p_idle = 50.0_f32;
     let p_tdp = 300.0_f32;
     let v_idle = 0.70_f32;
@@ -574,5 +574,25 @@ mod tests {
         assert_eq!(a.timestamp_origin, TimestampOrigin::Simulated);
         assert_eq!(b.timestamp_origin, TimestampOrigin::Simulated);
         assert!(b.received_at_unix_ms >= a.received_at_unix_ms);
+    }
+
+    #[test]
+    fn test_derive_vddcr_gfx_v_is_deterministic() {
+        assert!((derive_vddcr_gfx_v(50.0) - 0.70).abs() < 1e-6);
+        assert!((derive_vddcr_gfx_v(0.0) - 0.70).abs() < 1e-6);
+        assert!((derive_vddcr_gfx_v(300.0) - 1.05).abs() < 1e-6);
+        assert!((derive_vddcr_gfx_v(400.0) - 1.05).abs() < 1e-6);
+        let mid = derive_vddcr_gfx_v(175.0);
+        assert!((mid - 0.875).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_read_telemetry_without_force_is_never_software_fallback() {
+        let frame = HardwareBridge::read_telemetry();
+        assert_ne!(frame.source, TelemetrySource::SoftwareFallback);
+        assert!(matches!(
+            frame.source,
+            TelemetrySource::Nvml | TelemetrySource::NvmlUnavailable
+        ));
     }
 }

@@ -182,4 +182,27 @@ mod tests {
         assert!(!metrics.brake_engaged);
         assert_eq!(metrics.policy_state, SafetyState::CriticalBraked);
     }
+
+    #[test]
+    fn freshness_seconds_is_zero_when_acquired_at_now() {
+        assert_eq!(freshness_seconds(Some(5_000), 5_000), 0.0);
+        assert_eq!(freshness_seconds(Some(8_000), 5_000), 0.0);
+    }
+
+    #[test]
+    fn record_safety_snapshot_tracks_hysteresis_and_actuator_overlay() {
+        use crate::safety::ActuatorOutcome;
+
+        let mut metrics = RelayMetrics::default();
+        let mut machine = SafetyMachine::new();
+        let mut raw = fixtures::healthy_real();
+        raw.gpu_temp_c = Some(90.0);
+        let _ = machine.evaluate(&assess(&raw, fixtures::NOW));
+        let failed = machine.record_actuator(ActuatorOutcome::ApplyFailed("pl".into()));
+        record_safety_snapshot(&mut metrics, &failed);
+        assert_eq!(metrics.safety_state, SafetyState::ActuatorFailure);
+        assert_eq!(metrics.policy_state, SafetyState::CriticalBraked);
+        assert!(!metrics.brake_engaged);
+        assert_eq!(metrics.hysteresis_ok_count, 0);
+    }
 }

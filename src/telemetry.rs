@@ -1266,4 +1266,126 @@ mod tests {
         assert_eq!(frame.power_w.validity, SampleValidity::Missing);
         assert_eq!(frame.gpu_temp_c.value, None);
     }
+
+    #[test]
+    fn identity_and_degenerate_linear_normalization() {
+        assert_eq!(Normalization::Identity.apply(42.0), 42.0);
+        assert_eq!(Normalization::Identity.apply(-3.5), -3.5);
+        let collapsed = Normalization::Linear {
+            min: 10.0,
+            max: 10.0,
+        };
+        assert_eq!(collapsed.apply(10.0), 0.0);
+        let non_finite = Normalization::Linear {
+            min: f32::NAN,
+            max: 1.0,
+        };
+        assert_eq!(non_finite.apply(0.5), 0.0);
+        let linear = Normalization::Linear {
+            min: 0.0,
+            max: 100.0,
+        };
+        assert_eq!(linear.apply(-10.0), 0.0);
+        assert_eq!(linear.apply(150.0), 1.0);
+        assert_eq!(linear.apply(25.0), 0.25);
+    }
+
+    #[test]
+    fn signal_class_and_name_helpers() {
+        assert!(SignalClass::Both.includes_runtime_input());
+        assert!(SignalClass::Both.includes_safety());
+        assert!(SignalClass::RuntimeInput.includes_runtime_input());
+        assert!(!SignalClass::RuntimeInput.includes_safety());
+        assert!(!SignalClass::SafetyOnly.includes_runtime_input());
+        assert!(SignalClass::SafetyOnly.includes_safety());
+        assert!(!SignalClass::ObservabilityOnly.includes_runtime_input());
+        assert!(!SignalClass::ObservabilityOnly.includes_safety());
+        for id in ALL_SIGNALS {
+            assert_eq!(id.name(), signal_spec(id).name);
+        }
+        assert_eq!(SignalId::GpuTempC.name(), "gpu_temp_c");
+    }
+
+    #[test]
+    fn engineering_range_is_inclusive_and_below_min_is_invalid() {
+        let mut at_min = fixtures::healthy_real();
+        at_min.gpu_temp_c = Some(0.0);
+        let frame = assess_now(&at_min);
+        assert_eq!(frame.gpu_temp_c.validity, SampleValidity::Valid);
+        assert_eq!(frame.gpu_temp_c.value, Some(0.0));
+
+        let mut at_max = fixtures::healthy_real();
+        at_max.gpu_temp_c = Some(125.0);
+        let frame = assess_now(&at_max);
+        assert_eq!(frame.gpu_temp_c.validity, SampleValidity::Valid);
+        assert_eq!(frame.gpu_temp_c.value, Some(125.0));
+        assert_eq!(frame.gpu_temp_c.normalized(), Some(1.0));
+
+        let mut below = fixtures::healthy_real();
+        below.gpu_temp_c = Some(-1.0);
+        let frame = assess_now(&below);
+        assert_eq!(frame.gpu_temp_c.validity, SampleValidity::Invalid);
+        assert_eq!(frame.gpu_temp_c.value, Some(-1.0));
+        assert_eq!(frame.gpu_temp_c.normalized(), None);
+    }
+
+    #[test]
+    fn future_missing_stays_missing_and_future_non_finite_is_invalid() {
+        let mut missing = fixtures::healthy_real();
+        missing.observed_at = NOW + 5_000;
+        missing.gpu_temp_c = None;
+        let frame = assess(&missing, NOW);
+        assert_eq!(frame.gpu_temp_c.validity, SampleValidity::Missing);
+        assert_eq!(frame.gpu_temp_c.value, None);
+
+        let mut nan = fixtures::healthy_real();
+        nan.observed_at = NOW + 5_000;
+        nan.power_w = Some(f32::NAN);
+        let frame = assess(&nan, NOW);
+        assert_eq!(frame.power_w.validity, SampleValidity::Invalid);
+        assert_eq!(frame.power_w.value, None);
+    }
+
+    #[test]
+    fn infinity_is_invalid_with_none_value() {
+        let mut raw = fixtures::healthy_real();
+        raw.gpu_temp_c = Some(f32::INFINITY);
+        let frame = assess_now(&raw);
+        assert_eq!(frame.gpu_temp_c.validity, SampleValidity::Invalid);
+        assert_eq!(frame.gpu_temp_c.value, None);
+        assert_eq!(frame.gpu_temp_c.normalized(), None);
+    }
+
+    #[test]
+    fn at_time_leaves_missing_alone_and_can_stale_a_valid_sample() {
+        let dropout = assess_now(&fixtures::sensor_dropout());
+        let later = dropout.power_w.at_time(NOW + 10_000);
+        assert_eq!(later.validity, SampleValidity::Missing);
+        assert_eq!(later.value, None);
+
+        let healthy = assess_now(&fixtures::healthy_real());
+        assert_eq!(healthy.gpu_temp_c.validity, SampleValidity::Valid);
+        let stale = healthy.gpu_temp_c.at_time(NOW + SAFETY_STALE_AFTER_MS);
+        assert_eq!(stale.validity, SampleValidity::Stale);
+        assert_eq!(stale.value, Some(65.0));
+        assert_eq!(stale.normalized(), None);
+    }
+
+    #[test]
+    fn zero_cadence_is_floored_to_one() {
+        let frame = assess_with_cadence(&fixtures::healthy_real(), NOW, 0);
+        assert_eq!(frame.acquisition_cadence_ms, 1);
+        let mapping = frame.to_sensory_mapping_at(NOW);
+        assert_eq!(mapping.acquisition_cadence_ms, 1);
+        assert!(mapping.stimuli.iter().all(|s| s.cadence_ms == 1));
+    }
+
+    #[test]
+    fn unix_now_ms_is_epoch_based() {
+        let now = unix_now_ms();
+        assert!(
+            now >= NOW,
+            "unix_now_ms={now} should be at/after fixture NOW"
+        );
+    }
 }

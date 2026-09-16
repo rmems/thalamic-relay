@@ -125,6 +125,7 @@ rules, and [`docs/telemetry.md`](docs/telemetry.md) for the sample contract.
 
 - **`telemetry`**: Typed sample contract (validity, freshness, provenance, normalization) and the corpus-ipc mapping surface
 - **`time`**: Process-local sample clock (`session_id` + `batch_id`) and timestamp provenance
+- **`telemetry_csv`**: Frozen hardware-telemetry CSV header + reader/validator for corinth ingest (one-way copy; no corinth dependency)
 - **`safety`**: Pure deterministic classification + hysteresis (`SafetyMachine`); no NVML, no IPC
 - **`gpu`**: Raw NVML acquisition and privileged power-limit actuation
 - **`publish`**: Non-blocking sensory publish stub (`AbsentPublisher`, `IsolatedPublishQueue`); transport is GH#40
@@ -208,6 +209,13 @@ Every GPU reading is a typed `TelemetrySample` with `value: Option<T>`,
 carries `session_id`, a strictly increasing `batch_id`, source vs
 receive/emit timestamps, and `source_time_status`. See
 [`docs/telemetry.md`](docs/telemetry.md) for the full inventory.
+
+A separate frozen **CSV interchange** for corinth-canal ingest lives in
+[`docs/telemetry_csv.md`](docs/telemetry_csv.md) and
+`thalamic_relay::telemetry_csv` (header
+`timestamp_ms,gpu_temp_c,gpu_power_w,cpu_tctl_c,cpu_package_power_w`).
+Producers should validate against that module before publishing a file
+corinth will read. The CSV schema is frozen; do not add columns.
 
 | Signal | Class | Notes |
 | --- | --- | --- |
