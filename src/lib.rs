@@ -59,6 +59,8 @@ mod gpu;
 pub mod publish;
 pub mod safety;
 pub mod telemetry;
+pub mod telemetry_csv;
+pub mod time;
 
 /// Process entry for the `thalamic-relay` executable. Not reusable library API.
 #[doc(hidden)]

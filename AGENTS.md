@@ -47,6 +47,10 @@ in-process SNN it used to step was removed in RM-1143. Build with a plain
   for the removal note and the planned `corpus-ipc`-based replacement.
 - Prometheus metrics on `http://localhost:9000/metrics` (bind IP (Internet Protocol) configurable via --metrics-ip).
 - Binds on startup, so only one instance can run at a time.
+- Frozen hardware-telemetry CSV interchange (corinth ingest):
+  `timestamp_ms,gpu_temp_c,gpu_power_w,cpu_tctl_c,cpu_package_power_w`.
+  Reader/validator: `thalamic_relay::telemetry_csv` /
+  [`docs/telemetry_csv.md`](docs/telemetry_csv.md). Do not change that schema.
 
 ### Responding to automated PR review bots
 
@@ -59,6 +63,14 @@ a short reply explaining why) on anything already handled, restated, or
 wrong, and don't let a "fix" overstate a guarantee the code doesn't actually
 provide. See `CLAUDE.md` for more detail and the concrete lessons from PR
 #38 (`docs/ipc.md`).
+
+## Packaging
+
+`Cargo.toml` uses an `include` allowlist for crates.io. Do not add
+contributor-only files (`AGENTS.md`, `CLAUDE.md`, `REVIEW.md`, CI, local
+tool configs) to `include`. After changing packaged paths, run
+`cargo package --list` and `cargo publish --dry-run --locked`. Never run the
+real `cargo publish` without explicit maintainer approval (#44 / #48).
 
 ## Boundaries
 

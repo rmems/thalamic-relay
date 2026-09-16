@@ -152,6 +152,8 @@ rules, and [`docs/telemetry.md`](docs/telemetry.md) for the sample contract.
 Reusable from a downstream crate (no GPU, no supervisor process):
 
 - **`telemetry`**: Typed sample contract (validity, freshness, provenance, normalization) and the corpus-ipc mapping surface
+- **`time`**: Process-local sample clock (`session_id` + `batch_id`) and timestamp provenance
+- **`telemetry_csv`**: Frozen hardware-telemetry CSV header + reader/validator for corinth ingest (one-way copy; no corinth dependency)
 - **`safety`**: Pure deterministic classification + hysteresis (`SafetyMachine`) and the `SafetyActuator` trait; no NVML, no IPC
 - **`publish`**: Non-blocking sensory publish stub (`AbsentPublisher`, `IsolatedPublishQueue`); transport is GH#40
 
@@ -204,7 +206,7 @@ THALAMIC_METRICS_IP=0.0.0.0 \
 The relay exports metrics compatible with Prometheus monitoring. Safety
 state is observable here; there is no neural-state query:
 
-- `telemetry_freshness_s` — sample age at scrape time
+- `telemetry_freshness_s` — sample age at scrape time (monotonic receive instant, not source wall time)
 - `safety_state{state=...}` / `safety_state_id` — current named safety state
 - `safety_policy_state{state=...}` — policy classification before the ActuatorFailure overlay (`safety_state` is the overlay)
 - `safety_brake_engaged` — last successful brake still claimed
@@ -232,8 +234,17 @@ Structured logging via `tracing` with configurable output levels.
 ## Telemetry contract
 
 Every GPU reading is a typed `TelemetrySample` with `value: Option<T>`,
-`observed_at`, `source`, `validity`, and `unit`. See
+`observed_at`, `source`, `validity`, and `unit`. Every emitted frame also
+carries `session_id`, a strictly increasing `batch_id`, source vs
+receive/emit timestamps, and `source_time_status`. See
 [`docs/telemetry.md`](docs/telemetry.md) for the full inventory.
+
+A separate frozen **CSV interchange** for corinth-canal ingest lives in
+[`docs/telemetry_csv.md`](docs/telemetry_csv.md) and
+`thalamic_relay::telemetry_csv` (header
+`timestamp_ms,gpu_temp_c,gpu_power_w,cpu_tctl_c,cpu_package_power_w`).
+Producers should validate against that module before publishing a file
+corinth will read. The CSV schema is frozen; do not add columns.
 
 | Signal | Class | Notes |
 | --- | --- | --- |
@@ -257,6 +268,21 @@ This project is licensed under either of
 
 at your option.
 
+## Crate package
+
+The crates.io artifact is an **allowlist** (`include` in `Cargo.toml`), not a
+denylist, so development-only files cannot ship by accident. The package
+contains:
+
+- `src/` (library + `thalamic-relay` binary)
+- consumer docs: `README.md`, `CHANGELOG.md`, `docs/`
+- `Cargo.lock` (this package has a binary)
+- `LICENSE-MIT` and `LICENSE-APACHE-2.0`
+
+Contributor and agent files (`AGENTS.md`, `CLAUDE.md`, `REVIEW.md`), CI
+(`.github/`), and local tool configs (`.codacy.yml`, `.gitignore`) stay in git
+and are **not** part of the `.crate`. Inspect with `cargo package --list`.
+
 ## Contributing
 
 Contributions are welcome! Please ensure all submissions follow the project's
@@ -264,7 +290,12 @@ coding standards and include appropriate tests.
 
 ## Releasing
 
-This crate is not yet published to crates.io (that is planned for v1.0; see #29).
+This crate is not yet published to crates.io. The first intended registry
+release is `0.2.0` and is gated on the publication epic (#44); do **not** run
+the real `cargo publish` without explicit maintainer approval. Packaging
+hygiene for that gate is `cargo package --locked` and
+`cargo publish --dry-run --locked` from a clean checkout.
+
 To cut a tag and GitHub Release for a `0.1.x` patch:
 
 1. Make sure `CHANGELOG.md` is up to date and the version in `Cargo.toml` matches the intended release.

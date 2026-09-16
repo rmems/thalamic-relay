@@ -103,7 +103,7 @@ Exported without querying Brainstem:
 | `safety_hysteresis_ok_count` | gauge | Ok streak while braked |
 | `safety_transitions_total` | counter | reported-state changes |
 | `safety_actuator_failures_total` | counter | apply/release errors |
-| `telemetry_freshness_s` | gauge | sample age at scrape time |
+| `telemetry_freshness_s` | gauge | sample age at scrape time (monotonic receive instant) |
 
 Numeric ids: 0 `healthy_real`, 1 `warning`, 2 `critical_braked`,
 3 `recovering`, 4 `telemetry_missing`, 5 `telemetry_stale`,

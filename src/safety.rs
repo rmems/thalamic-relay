@@ -1235,4 +1235,130 @@ mod tests {
         }
         assert_eq!(SafetyState::ActuatorFailure.as_str(), "actuator_failure");
     }
+
+    #[test]
+    fn default_machine_matches_new() {
+        let snap = SafetyMachine::default().snapshot();
+        assert_eq!(snap.state, SafetyState::TelemetryMissing);
+        assert_eq!(snap.intent, BrakeIntent::Apply);
+    }
+
+    #[test]
+    fn exact_critical_thresholds_are_exclusive() {
+        let at_temp = eval_once({
+            let mut raw = fixtures::healthy_real();
+            raw.gpu_temp_c = Some(TEMP_CRITICAL_C);
+            raw
+        });
+        assert_eq!(at_temp.state, SafetyState::Warning);
+
+        let over_temp = eval_once({
+            let mut raw = fixtures::healthy_real();
+            raw.gpu_temp_c = Some(TEMP_CRITICAL_C + 0.1);
+            raw
+        });
+        assert_eq!(over_temp.state, SafetyState::CriticalBraked);
+        assert_eq!(over_temp.intent, BrakeIntent::Apply);
+
+        let at_power = eval_once({
+            let mut raw = fixtures::healthy_real();
+            raw.power_w = Some(POWER_CRITICAL_W);
+            raw
+        });
+        assert_eq!(at_power.state, SafetyState::Warning);
+
+        let over_power = eval_once({
+            let mut raw = fixtures::healthy_real();
+            raw.power_w = Some(POWER_CRITICAL_W + 0.1);
+            raw
+        });
+        assert_eq!(over_power.state, SafetyState::CriticalBraked);
+    }
+
+    #[test]
+    fn power_critical_wins_over_temp_warn() {
+        let snap = eval_once({
+            let mut raw = fixtures::healthy_real();
+            raw.gpu_temp_c = Some(78.0);
+            raw.power_w = Some(360.0);
+            raw
+        });
+        assert_eq!(snap.state, SafetyState::CriticalBraked);
+        assert!(snap.last_reason.contains("power"));
+    }
+
+    #[test]
+    fn non_finite_is_named_telemetry_invalid() {
+        let snap = eval_once(fixtures::non_finite());
+        assert_eq!(snap.state, SafetyState::TelemetryInvalid);
+        assert_eq!(snap.intent, BrakeIntent::Apply);
+    }
+
+    #[test]
+    fn mixed_faults_rank_missing_over_invalid_over_stale() {
+        let mut invalid_over_stale = nvml_temp_power(65.0, 200.0);
+        invalid_over_stale.gpu_temp_c.validity = SampleValidity::Stale;
+        invalid_over_stale.power_w.validity = SampleValidity::Invalid;
+        let assessment = classify_frame(&invalid_over_stale);
+        assert_eq!(assessment.kind, AssessmentKind::Invalid);
+        assert!(assessment.reason.contains("power_w"));
+
+        let mut missing_over_invalid = nvml_temp_power(65.0, 200.0);
+        missing_over_invalid.gpu_temp_c.validity = SampleValidity::Invalid;
+        missing_over_invalid.power_w.value = None;
+        missing_over_invalid.power_w.validity = SampleValidity::Missing;
+        let assessment = classify_frame(&missing_over_invalid);
+        assert_eq!(assessment.kind, AssessmentKind::Missing);
+        assert!(assessment.reason.contains("power_w"));
+    }
+
+    #[test]
+    fn equal_fault_rank_prefers_gpu_temp() {
+        let mut both_stale = nvml_temp_power(65.0, 200.0);
+        both_stale.gpu_temp_c.validity = SampleValidity::Stale;
+        both_stale.power_w.validity = SampleValidity::Stale;
+        let assessment = classify_frame(&both_stale);
+        assert_eq!(assessment.kind, AssessmentKind::Stale);
+        assert!(assessment.reason.contains("gpu_temp_c"));
+
+        let mut both_invalid = nvml_temp_power(65.0, 200.0);
+        both_invalid.gpu_temp_c.validity = SampleValidity::Invalid;
+        both_invalid.power_w.validity = SampleValidity::Invalid;
+        let assessment = classify_frame(&both_invalid);
+        assert_eq!(assessment.kind, AssessmentKind::Invalid);
+        assert!(assessment.reason.contains("gpu_temp_c"));
+
+        let mut both_missing = nvml_temp_power(65.0, 200.0);
+        both_missing.gpu_temp_c.value = None;
+        both_missing.gpu_temp_c.validity = SampleValidity::Missing;
+        both_missing.power_w.value = None;
+        both_missing.power_w.validity = SampleValidity::Missing;
+        let assessment = classify_frame(&both_missing);
+        assert_eq!(assessment.kind, AssessmentKind::Missing);
+        assert!(assessment.reason.contains("gpu_temp_c"));
+    }
+
+    #[test]
+    fn warn_from_frame_is_none_for_ok_and_simulated() {
+        assert_eq!(
+            warn_from_frame(&assess(&fixtures::healthy_real(), fixtures::NOW)),
+            None
+        );
+        assert_eq!(
+            warn_from_frame(&assess(&fixtures::software_fallback(), fixtures::NOW)),
+            None
+        );
+    }
+
+    #[test]
+    fn leftover_brake_plus_simulated_holds_and_does_not_apply() {
+        let mut machine = SafetyMachine::new();
+        machine.seed_brake_applied();
+        let snap = machine.evaluate(&assess(&fixtures::software_fallback(), fixtures::NOW));
+        assert_eq!(snap.state, SafetyState::SimulatedSoftwareOnly);
+        assert!(snap.brake_engaged);
+        assert!(snap.desired_brake);
+        assert_eq!(snap.intent, BrakeIntent::None);
+        assert_eq!(snap.hysteresis_ok_count, 0);
+    }
 }
