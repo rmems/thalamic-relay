@@ -2,10 +2,36 @@
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](https://github.com/rmems/thalamic-relay#license)
 
-A lightweight CLI relay that observes hardware telemetry and provides
-deterministic hardware safety for the Spikenaut runtime stack (software-only;
+A lightweight **library** (`thalamic_relay`) and **CLI** (`thalamic-relay`)
+that observes hardware telemetry and provides deterministic hardware
+safety for the Spikenaut runtime stack (software-only;
 silicon-bridge/**FPGA (Field-Programmable Gate Array)** bridge dep removed
 for modularity).
+
+## Library vs executable
+
+This crate ships two surfaces. They are not interchangeable:
+
+| Surface | Crate / binary | Use it when |
+| --- | --- | --- |
+| **Library** | `thalamic_relay` (`telemetry`, `safety`, `publish`) | A downstream crate needs typed samples, `SafetyMachine`, or a best-effort publisher **without** running the daemon |
+| **Executable** | `thalamic-relay` | You want the supervisor process: NVML acquisition, privileged power-limit brake, Prometheus on `:9000`, single-instance lock |
+
+```rust
+use thalamic_relay::safety::{SafetyMachine, SafetyState};
+use thalamic_relay::telemetry::{assess, fixtures};
+
+let frame = assess(&fixtures::healthy_real(), fixtures::NOW);
+let mut machine = SafetyMachine::new();
+let snapshot = machine.evaluate(&frame);
+assert_eq!(snapshot.state, SafetyState::HealthyReal);
+```
+
+The NVML/`nvidia-smi` adapter, Prometheus exporter, clap CLI, and
+`/tmp/thalamic_relay.lock` are **not** part of the library API (they are
+private process plumbing). Public items are documented; missing rustdoc on
+that surface is a compile error (`#![deny(missing_docs)]`). This is a
+pre-1.0 crate: the library API is intentional, not frozen.
 
 ## Overview
 
@@ -121,15 +147,18 @@ brainstem-daemon
 See [`docs/safety.md`](docs/safety.md) for named states and hysteresis
 rules, and [`docs/telemetry.md`](docs/telemetry.md) for the sample contract.
 
-### Core Modules
+### Public library modules
+
+Reusable from a downstream crate (no GPU, no supervisor process):
 
 - **`telemetry`**: Typed sample contract (validity, freshness, provenance, normalization) and the corpus-ipc mapping surface
 - **`time`**: Process-local sample clock (`session_id` + `batch_id`) and timestamp provenance
 - **`telemetry_csv`**: Frozen hardware-telemetry CSV header + reader/validator for corinth ingest (one-way copy; no corinth dependency)
-- **`safety`**: Pure deterministic classification + hysteresis (`SafetyMachine`); no NVML, no IPC
-- **`gpu`**: Raw NVML acquisition and privileged power-limit actuation
+- **`safety`**: Pure deterministic classification + hysteresis (`SafetyMachine`) and the `SafetyActuator` trait; no NVML, no IPC
 - **`publish`**: Non-blocking sensory publish stub (`AbsentPublisher`, `IsolatedPublishQueue`); transport is GH#40
-- **`cpu`**: Telemetry initialization and metrics collection
+
+Binary-only (not semver-facing): NVML acquisition, privileged `nvidia-smi`
+actuation, Prometheus initialization, CLI, process lock, supervisor loop.
 
 ### Key Components
 

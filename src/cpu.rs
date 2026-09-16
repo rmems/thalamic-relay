@@ -1,3 +1,7 @@
+//! Prometheus / tracing init and scrape-time gauges for the supervisor.
+//!
+//! Crate-private process plumbing: not part of the public `thalamic_relay` API.
+
 use metrics::{counter, gauge};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use std::sync::{Arc, Mutex};
@@ -37,7 +41,8 @@ impl Default for RelayMetrics {
     }
 }
 
-pub use crate::time::freshness_seconds;
+#[cfg(test)]
+use crate::time::freshness_seconds;
 
 /// Copy a safety snapshot into shared metrics and increment event counters.
 pub fn record_safety_snapshot(metrics: &mut RelayMetrics, snap: &SafetySnapshot) {

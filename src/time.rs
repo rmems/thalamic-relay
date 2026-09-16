@@ -111,7 +111,9 @@ pub struct FrameTiming {
     pub source_unix_ms: Option<UnixMillis>,
     /// Receive/assess time at the relay (unix ms). Distinct from source time.
     pub received_at_unix_ms: UnixMillis,
+    /// Timestamp origin provenance.
     pub timestamp_origin: TimestampOrigin,
+    /// Anomaly status of source vs receive time.
     pub source_time_status: SourceTimeStatus,
 }
 
@@ -146,6 +148,7 @@ impl SampleClock {
         }
     }
 
+    /// Stable boot/session identifier string.
     #[must_use]
     pub fn session_id(&self) -> &str {
         &self.session_id

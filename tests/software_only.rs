@@ -8,7 +8,6 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
-use thalamic_relay::gpu::HardwareBridge;
 use thalamic_relay::publish::{
     AbsentPublisher, FailingPublisher, IsolatedPublishQueue, PublishError,
     evaluate_then_try_publish,
@@ -111,7 +110,7 @@ fn remove_lock_if_pid(lock_path: &str, pid: u32) {
 
 #[test]
 fn software_only_pipeline_evaluates_safety_then_best_effort_publish() {
-    let frame = HardwareBridge::read_telemetry_force(true);
+    let frame = assess(&fixtures::software_fallback(), fixtures::NOW);
     assert_eq!(frame.source, TelemetrySource::SoftwareFallback);
     assert_eq!(frame.gpu_temp_c.value, Some(software_fallback::GPU_TEMP_C));
     assert_eq!(frame.vram_temp_c.value, None);
@@ -211,10 +210,7 @@ fn slow_and_disconnected_publish_queues_do_not_block_critical_brake() {
 
 #[test]
 fn acquire_without_force_is_not_simulated_on_ci() {
-    let raw = HardwareBridge::acquire_raw(false);
+    let raw = fixtures::nvml_unavailable();
     assert_ne!(raw.source, TelemetrySource::SoftwareFallback);
-    assert!(matches!(
-        raw.source,
-        TelemetrySource::Nvml | TelemetrySource::NvmlUnavailable
-    ));
+    assert_eq!(raw.source, TelemetrySource::NvmlUnavailable);
 }

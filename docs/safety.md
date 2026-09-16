@@ -9,10 +9,9 @@ disconnect, or a slow consumer. Brainstem has **no** authority to override
 Thalamic hard-safety policy — there is no IPC command that can inhibit the
 brake.
 
-Privileged `nvidia-smi` actuation stays in `src/gpu.rs`. The state machine
-in `src/safety.rs` only emits **intents**. Full actuator-trait extraction
-is GH#46; this crate keeps that split as a hook (pure machine, side-effect
-actuation in the supervisor).
+Privileged `nvidia-smi` actuation stays in private `src/gpu.rs` (used only by
+the `thalamic-relay` executable). The state machine in `src/safety.rs` only
+emits **intents**; hardware side effects go through [`SafetyActuator`].
 
 ## Ownership
 

@@ -32,10 +32,15 @@ pub const FIELD_COUNT: usize = 5;
 /// One validated hardware-telemetry CSV row.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TelemetryCsvRow {
+    /// Timestamp in milliseconds.
     pub timestamp_ms: u64,
+    /// GPU die temperature (°C).
     pub gpu_temp_c: f32,
+    /// GPU power usage (W).
     pub gpu_power_w: f32,
+    /// CPU Tctl temperature (°C).
     pub cpu_tctl_c: f32,
+    /// CPU package power usage (W).
     pub cpu_package_power_w: f32,
 }
 
@@ -69,12 +74,22 @@ pub enum ParseDataLine {
 #[derive(Debug)]
 pub enum TelemetryCsvError {
     /// The file could not be read.
-    Io { path: PathBuf, source: io::Error },
+    Io {
+        /// Path to the CSV file.
+        path: PathBuf,
+        /// Underlying I/O error.
+        source: io::Error,
+    },
     /// No header line (empty input).
-    Empty { path: Option<PathBuf> },
+    Empty {
+        /// Optional path to the CSV file.
+        path: Option<PathBuf>,
+    },
     /// Trimmed header is not exactly [`HEADER`].
     HeaderMismatch {
+        /// Optional path to the CSV file.
         path: Option<PathBuf>,
+        /// Actual header string encountered.
         actual: String,
     },
 }
@@ -133,7 +148,9 @@ impl std::error::Error for TelemetryCsvError {
 /// Rows accepted from a CSV plus how many malformed data lines were skipped.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoadResult {
+    /// Valid telemetry CSV rows parsed.
     pub rows: Vec<TelemetryCsvRow>,
+    /// Number of malformed data rows skipped.
     pub skipped: usize,
 }
 

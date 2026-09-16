@@ -25,6 +25,10 @@ pub enum PublishError {
 
 /// Best-effort sensory publisher. Must not block the safety loop.
 pub trait SensoryPublisher: Send + Sync {
+    /// Attempt to publish `mapping` without waiting on a consumer.
+    ///
+    /// Must return promptly. A full queue, absent transport, or send failure
+    /// is reported as [`PublishError`]; it must not stall [`crate::safety::SafetyMachine::evaluate`].
     fn try_publish(&self, mapping: &SensoryMapping) -> Result<(), PublishError>;
 }
 
@@ -41,10 +45,12 @@ impl SensoryPublisher for AbsentPublisher {
 /// Test double that fails every send without blocking.
 #[derive(Debug, Clone)]
 pub struct FailingPublisher {
+    /// Reason string returned as [`PublishError::SendFailed`].
     pub reason: String,
 }
 
 impl FailingPublisher {
+    /// Publisher that reports a generic send failure.
     #[must_use]
     pub fn send_failed() -> Self {
         Self {
@@ -52,6 +58,7 @@ impl FailingPublisher {
         }
     }
 
+    /// Publisher that reports a disconnected worker.
     #[must_use]
     pub fn disconnected() -> Self {
         Self {
