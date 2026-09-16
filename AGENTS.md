@@ -47,6 +47,10 @@ in-process SNN it used to step was removed in RM-1143. Build with a plain
   for the removal note and the planned `corpus-ipc`-based replacement.
 - Prometheus metrics on `http://localhost:9000/metrics` (bind IP (Internet Protocol) configurable via --metrics-ip).
 - Binds on startup, so only one instance can run at a time.
+- Frozen hardware-telemetry CSV interchange (corinth ingest):
+  `timestamp_ms,gpu_temp_c,gpu_power_w,cpu_tctl_c,cpu_package_power_w`.
+  Reader/validator: `thalamic_relay::telemetry_csv` /
+  [`docs/telemetry_csv.md`](docs/telemetry_csv.md). Do not change that schema.
 
 ### Responding to automated PR review bots
 
