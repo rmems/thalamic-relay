@@ -20,8 +20,8 @@ use crate::safety::{SafetyStatus, instant_status};
 #[cfg(test)]
 use crate::telemetry::DEFAULT_ACQUISITION_CADENCE_MS;
 use crate::telemetry::{
-    RawTelemetry, SampleClock, TelemetryFrame, TelemetrySource, TimestampOrigin,
-    assess_with_clock, unix_now_ms,
+    RawTelemetry, SampleClock, TelemetryFrame, TelemetrySource, TimestampOrigin, assess_with_clock,
+    unix_now_ms,
 };
 use lazy_static::lazy_static;
 use nvml_wrapper::Nvml;
