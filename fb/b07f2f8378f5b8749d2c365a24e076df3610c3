@@ -1,0 +1,17 @@
+README.md
+  11c73ceaee4849cc 152
+src/lib.rs
+  11c73ceaee4849cc 8-52
+src/publish.rs
+  11c73ceaee4849cc 269,290,296,306,568-628
+docs/ipc.md
+  11c73ceaee4849cc 27-31
+docs/telemetry.md
+  11c73ceaee4849cc 153-155
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "fbb07f2f8378f5b8749d2c365a24e076df3610c3",
+  "prompts": {}
+}
