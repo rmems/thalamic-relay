@@ -1,0 +1,11 @@
+src/telemetry.rs
+  cca8ecda0c2b548c 450-453,479-480,497-498,526-530,533-545,573-575,584-599,601,604-610,624-636,674-680,697-703,727-737,782-785,788-802,813-827
+src/gpu.rs
+  cca8ecda0c2b548c 23-24
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "f32faf536af342e27c56fda0e705d51ccf47c95b",
+  "prompts": {}
+}
