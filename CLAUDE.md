@@ -25,7 +25,9 @@ cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 Requires Rust edition 2024, MSRV 1.98.1. No sibling path dependencies — a
-plain `cargo build` from the repo root is sufficient.
+plain `cargo build` from the repo root is sufficient. CI also qualifies
+packaging (`cargo package --locked`, packaged-source tests, token-free
+`cargo publish --dry-run --locked`) and rustdoc with warnings denied.
 
 ## Interfaces
 

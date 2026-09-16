@@ -21,7 +21,9 @@ in-process SNN it used to step was removed in RM-1143. Build with a plain
 - Requires Rust edition 2024 with MSRV 1.98.1 (toolchain >= 1.98.1; `u64::is_multiple_of` and
   clippy lints are used in CI; stable is set as the rustup default in this
   environment). `cargo`/`cargo build`/`cargo test`/`cargo clippy` all work from
-  `/workspace`.
+  `/workspace`. CI also runs exact-MSRV tests, `RUSTDOCFLAGS="-D warnings" cargo doc`,
+  `cargo package --locked`, a packaged-source smoke test, and
+  `cargo publish --dry-run --locked`. Real `cargo publish` is not automated.
 - `pkg-config` may be used by native dependencies. `libudev-dev` is no longer
   required: the serial backend (`serialport`, via `silicon-bridge`) was removed,
   and `nvml-wrapper` (NVML — NVIDIA Management Library) loads `libnvidia-ml.so` at runtime without linking libudev.

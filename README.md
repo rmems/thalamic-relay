@@ -299,12 +299,18 @@ hygiene for that gate is `cargo package --locked` and
 To cut a tag and GitHub Release for a `0.1.x` patch:
 
 1. Make sure `CHANGELOG.md` is up to date and the version in `Cargo.toml` matches the intended release.
-2. Run the validation suite locally:
+2. Run the validation suite locally (CI on every `main`/PR run also checks
+   exact MSRV, rustdoc, packaging, and a token-free `cargo publish --dry-run`;
+   see `.github/workflows/ci.yml`). Real `cargo publish` is a manual
+   maintainer action and is **not** performed by CI:
    ```bash
    cargo fmt --check
    cargo clippy --all-targets --all-features -- -D warnings
    cargo test --all-features
    cargo build --release
+   RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+   cargo package --locked
+   cargo publish --dry-run --locked
    ```
 3. Create an annotated tag from a clean `main` branch and push it:
    ```bash
