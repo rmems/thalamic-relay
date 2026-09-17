@@ -41,8 +41,6 @@ metrics-exporter-prometheus = "0.16"
 lazy_static = "1.4"
 
 # Canonical IpcMessage / StimulusBatch wire schema (GH#40 / RM-1144).
-# corpus-ipc 0.1.0 is the published crate version in Limen-Neural/corpus-ipc
-# (RM-1141) but is not yet in the crates.io index; pin that 0.1.0 source.
 # Default features only: wire models, no ZeroMQ / C++ vendor build.
 corpus-ipc = "0.1.0"
 
