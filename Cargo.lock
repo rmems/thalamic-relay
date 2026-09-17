@@ -208,9 +208,11 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 [[package]]
 name = "corpus-ipc"
 version = "0.1.0"
-source = "git+https://github.com/Limen-Neural/corpus-ipc?rev=3ad764a9765ead27d6120d25ecd963b9338940fb#3ad764a9765ead27d6120d25ecd963b9338940fb"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eec6624caf88783f1c35109fe1c27615fc85c986249d480c8efabb72d5f92081"
 dependencies = [
  "serde",
+ "serde_json",
  "thiserror",
 ]
 
