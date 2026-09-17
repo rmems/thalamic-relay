@@ -9,6 +9,9 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   validate:
     name: Build & Test
@@ -70,3 +73,144 @@ jobs:
 
       - name: Test
         run: cargo test --all-features
+
+  # Exact declared MSRV (package.rust-version). Software-only; no GPU, NVIDIA
+  # driver, or extra privileged packages. See GH#25 / RM-339.
+  msrv:
+    name: Exact MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Read declared MSRV
+        id: msrv
+        run: |
+          msrv="$(python3 -c 'import tomllib, pathlib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["package"]["rust-version"])')"
+          echo "version=${msrv}" >> "${GITHUB_OUTPUT}"
+          echo "Declared MSRV: ${msrv}"
+
+      - name: Install exact MSRV
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # 1.98.1
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - name: Verify rustc matches declared MSRV
+        run: |
+          actual="$(rustc -vV | awk '/^release:/{print $2}')"
+          expected="${{ steps.msrv.outputs.version }}"
+          echo "rustc=${actual} rust-version=${expected}"
+          test "${actual}" = "${expected}"
+
+      - name: Cache cargo registry
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-msrv-${{ steps.msrv.outputs.version }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Test on exact MSRV
+        run: cargo test --locked --all-features
+
+  # crates.io qualification. Never runs a real `cargo publish`.
+  # cargo-semver-checks is deferred until a public API baseline exists (GH#45).
+  release-qualify:
+    name: crates.io qualification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Read package metadata
+        id: pkg
+        run: |
+          python3 - <<'PY' >> "${GITHUB_OUTPUT}"
+          import tomllib, pathlib
+          pkg = tomllib.loads(pathlib.Path("Cargo.toml").read_text())["package"]
+          print(f"name={pkg['name']}")
+          print(f"version={pkg['version']}")
+          print(f"msrv={pkg['rust-version']}")
+          PY
+
+      - name: Install exact MSRV
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # 1.98.1
+        with:
+          toolchain: ${{ steps.pkg.outputs.msrv }}
+
+      - name: Cache cargo registry
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-release-qualify-${{ steps.pkg.outputs.msrv }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: rustdoc (deny warnings)
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+      - name: cargo package --locked
+        run: cargo package --locked
+
+      - name: Reject path dependencies in the packaged manifest
+        env:
+          PKG_NAME: ${{ steps.pkg.outputs.name }}
+          PKG_VERSION: ${{ steps.pkg.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, sys, tomllib
+
+          manifest = (
+              pathlib.Path("target/package")
+              / f"{os.environ['PKG_NAME']}-{os.environ['PKG_VERSION']}"
+              / "Cargo.toml"
+          )
+          data = tomllib.loads(manifest.read_text())
+
+          def path_deps(table):
+              hits = []
+              for dep, spec in (table or {}).items():
+                  if isinstance(spec, dict) and "path" in spec:
+                      hits.append((dep, spec["path"]))
+              return hits
+
+          hits = []
+          for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+              for dep, path in path_deps(data.get(section)):
+                  hits.append(f"{section}.{dep} -> {path}")
+          for target, table in (data.get("target") or {}).items():
+              for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+                  for dep, path in path_deps(table.get(section)):
+                      hits.append(f"target.{target}.{section}.{dep} -> {path}")
+          if hits:
+              print("packaged manifest contains path dependencies:", *hits, sep="\n  ")
+              sys.exit(1)
+          print("no path dependencies in packaged Cargo.toml")
+          PY
+
+      - name: Smoke-test packaged source outside the repository
+        env:
+          PKG_NAME: ${{ steps.pkg.outputs.name }}
+          PKG_VERSION: ${{ steps.pkg.outputs.version }}
+        run: |
+          set -euo pipefail
+          crate="target/package/${PKG_NAME}-${PKG_VERSION}.crate"
+          test -f "${crate}"
+          smoke_dir="$(mktemp -d)"
+          tar -C "${smoke_dir}" -xzf "${crate}"
+          packaged="${smoke_dir}/${PKG_NAME}-${PKG_VERSION}"
+          test -d "${packaged}"
+          # Build and test the crate as crates.io consumers receive it, not
+          # against repository-relative paths such as sibling ../ crates.
+          (cd "${packaged}" && cargo test --locked --all-features)
+
+      # Token-free: cargo only requests credentials on a real upload.
+      # A real `cargo publish` (without --dry-run) must remain a maintainer action.
+      - name: cargo publish --dry-run --locked
+        run: cargo publish --dry-run --locked

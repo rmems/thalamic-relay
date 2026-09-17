@@ -2,22 +2,47 @@
 name = "thalamic-relay"
 version = "0.1.0"
 edition = "2024"
-description = "Lightweight CLI relay that observes hardware telemetry and provides deterministic hardware safety (software-only, no built-in FPGA bridge)."
-repository = "https://github.com/rmems/thalamic-relay"
-license = "MIT OR Apache-2.0"
 rust-version = "1.98.1"
+authors = ["Raul Cardenas Montoya"]
+description = "Typed hardware telemetry and deterministic safety library, plus the thalamic-relay supervisor binary (software-only, no built-in FPGA bridge)."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rmems/thalamic-relay"
+homepage = "https://github.com/rmems/thalamic-relay"
+documentation = "https://docs.rs/thalamic-relay"
+readme = "README.md"
+keywords = ["telemetry", "gpu", "safety", "nvml", "prometheus"]
+categories = ["hardware-support", "command-line-utilities"]
+publish = ["crates-io"]
+include = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "CHANGELOG.md",
+    "README.md",
+    "LICENSE-APACHE-2.0",
+    "LICENSE-MIT",
+    "src/**",
+    "docs/**",
+]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 
 [dependencies]
 # Core Logic
 tokio = { version = "1.36", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 lazy_static = "1.4"
 
+# Canonical IpcMessage / StimulusBatch wire schema (GH#40 / RM-1144).
+# Default features only: wire models, no ZeroMQ / C++ vendor build.
+corpus-ipc = "0.1.0"
 
 # CLI
 clap = { version = "4.5", features = ["derive", "env"] }

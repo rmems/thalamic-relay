@@ -27,17 +27,21 @@ cargo clippy --all-targets --all-features -- -D warnings
 **Edition** is Rust 2024 (rustc/Cargo ≥ 1.85 to parse the manifest). **MSRV** is
 1.98.1 (`package.rust-version`; authoritative). CI installs exactly that
 toolchain; `rust-toolchain.toml` must match. No sibling path dependencies — a
-plain `cargo build` from the repo root is sufficient once rustc ≥ MSRV.
+plain `cargo build` from the repo root is sufficient. CI also qualifies
+packaging (`cargo package --locked`, packaged-source tests, token-free
+`cargo publish --dry-run --locked`) and rustdoc with warnings denied.
 
 ## Interfaces
 
-- No control/query IPC surface currently. The UDP protocol
-  (`Stimuli`/`LearningReward`/`GetNeuroState`) that used to live at
-  `127.0.0.1:9898` was removed in RM-1143 along with the in-process SNN it
-  existed to drive — see [`docs/ipc.md`](docs/ipc.md) for the removal note
-  and the planned `corpus-ipc`-based replacement (RM-1144/RM-1145, separate
-  follow-up work).
+- Sensory publish: fire-and-forget UDP `IpcMessage::Stimuli` JSON to
+  `127.0.0.1:9900` by default (`--ipc-endpoint`). This is not a control/query
+  surface — the retired UDP protocol (`Stimuli`/`LearningReward`/`GetNeuroState`
+  at `127.0.0.1:9898`) was removed in RM-1143. See [`docs/ipc.md`](docs/ipc.md).
 - Prometheus metrics on `:9000/metrics`.
+- Frozen hardware-telemetry CSV interchange:
+  `timestamp_ms,gpu_temp_c,gpu_power_w,cpu_tctl_c,cpu_package_power_w`
+  (`src/telemetry_csv.rs`, [`docs/telemetry_csv.md`](docs/telemetry_csv.md)).
+  Do not change that schema.
 
 ## Reviewing / responding to automated PR review bots
 
