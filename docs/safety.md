@@ -9,10 +9,11 @@ disconnect, or a slow consumer. Brainstem has **no** authority to override
 Thalamic hard-safety policy — there is no IPC command that can inhibit the
 brake.
 
-Privileged `nvidia-smi` actuation stays in `src/gpu.rs` behind
-`SafetyActuator` (`NvmlActuator` in production, `FakeActuator` in tests).
-The state machine in `src/safety.rs` only emits **intents**. Apply/release
-is best-effort and requires Linux, NVML, and passwordless `sudo -n nvidia-smi`
+Privileged `nvidia-smi` actuation stays in private `src/gpu.rs` (used only by
+the `thalamic-relay` executable). The state machine in `src/safety.rs` only
+emits **intents**; hardware side effects go through [`SafetyActuator`]
+(`NvmlActuator` in production, `FakeActuator` in tests). Apply/release is
+best-effort and requires Linux, NVML, and passwordless `sudo -n nvidia-smi`
 (see the crate README).
 
 ## Ownership
@@ -23,8 +24,9 @@ is best-effort and requires Linux, NVML, and passwordless `sudo -n nvidia-smi`
 | Hard-safety classification, hysteresis, brake intent | Thalamic (`safety`) |
 | Power-limit apply/release | Thalamic (`gpu` actuator) |
 | Safety/brake state and transition/error counters | Thalamic Prometheus (`:9000/metrics`) |
+| Orderly SIGINT/SIGTERM shutdown (fail-closed) | Thalamic (`shutdown` + supervisor) |
 | Sensory mapping types | Thalamic (`TelemetryFrame::to_sensory_mapping`) |
-| Sensory transport to Brainstem | `corpus-ipc` (GH#40, **not implemented**; not required for safety) |
+| Sensory transport to Brainstem | Thalamic `publish` → `corpus-ipc` `IpcMessage::Stimuli` (not required for safety) |
 | SNN tick, neuromodulation, neural state | Brainstem |
 | Reward / plasticity | Brainstem (never Thalamic) |
 
@@ -73,6 +75,45 @@ never publishes and never calls `nvidia-smi`. Pre-telemetry snapshots are
 not dispatched as hardware commands: `--force-software-only` must be
 classified first (hold, do not apply).
 
+## Shutdown and restart
+
+SIGINT (Ctrl-C) and SIGTERM enter a **controlled shutdown**. The process lock
+at `/tmp/thalamic_relay.lock` is released on the way out. Background metrics
+collection and in-flight actuation are joined with a bounded timeout (they
+must not hang indefinitely). There is no control-plane IPC task to drain
+today (`AbsentPublisher`). SIGKILL and power loss are **not** promised to
+clean up.
+
+**Fail-closed invariant:** shutdown never dispatches a new apply or release.
+Exiting must not convert an unresolved unsafe or unverified state into a
+full-power device by restoring the default GPU power limit.
+
+| Situation at signal | Hardware action |
+| --- | --- |
+| Healthy, brake released | leave hardware unchanged |
+| Warned, brake not engaged | do not apply; do not restore |
+| Brake requested (not yet applied) | do not dispatch a new apply; next start evaluates immediately |
+| In-flight apply | await (bounded); completing apply is fail-closed-friendly |
+| Brake active | leave the throttle in place |
+| Recovering / release pending but not dispatched | **abandon** the release; leave the brake on |
+| In-flight release (already hysteresis-authorized) | await (bounded); this is the same policy that ran in-loop |
+| Actuator failed | do not retry on the way out; log unresolved |
+| Telemetry missing / stale / invalid | leave hardware unchanged (unverified) |
+| Simulated / software-only with a real brake held | **must not** release; simulated numbers cannot authorize recovery |
+
+Crash/restart recovery uses `classify_power_limit`:
+
+- Current PL matches the relay's expected 50% target (2 W tolerance) → adopt
+  as a leftover brake (`seed_brake_applied`) and release only after the
+  normal 3 real Ok streak.
+- Current PL is below default but **not** that target → treat as an
+  operator/device cap. Do **not** seed, do **not** auto-release.
+- Limits unreadable, or at/above default → do not seed. The first acquired
+  frame still fail-closes if telemetry is missing.
+
+`--force-software-only` does not skip leftover-brake detection on the real
+actuator. Simulated frames hold an adopted brake and reset hysteresis.
+
 ## IPC isolation
 
 ```text
@@ -84,13 +125,16 @@ SafetySnapshot (state, brake, intent)
       ├─ spawn_blocking apply/release   (gpu, not on the eval path)
       └─ SensoryPublisher::try_publish   (best-effort, after eval)
              IsolatedPublishQueue.try_enqueue  (drop on full)
+                   │
+                   ▼  CorpusIpcPublisher worker (not awaited)
+             IpcMessage::Stimuli JSON → UDP sendto
 ```
 
-Production currently uses [`AbsentPublisher`](../src/publish.rs) (Brainstem
-absent; **no `corpus-ipc` client in this crate**). GH#40 should plug a
-`corpus-ipc` publisher into `IsolatedPublishQueue` (bounded `try_send`). A
-full or disconnected queue is `SlowConsumer` / `Disconnected` and **must not**
-be `recv`'d from the safety loop.
+Production uses [`CorpusIpcPublisher`](../src/publish.rs) unless
+`--ipc-disabled` (then [`AbsentPublisher`](../src/publish.rs)). The worker
+is a bounded `try_send` plus fire-and-forget UDP. A full or disconnected
+queue is `SlowConsumer` / `Disconnected` and **must not** be `recv`'d from
+the safety loop. Brainstem absence cannot stall evaluation.
 
 ## Prometheus
 
@@ -105,7 +149,11 @@ Exported without querying Brainstem:
 | `safety_hysteresis_ok_count` | gauge | Ok streak while braked |
 | `safety_transitions_total` | counter | reported-state changes |
 | `safety_actuator_failures_total` | counter | apply/release errors |
-| `telemetry_freshness_s` | gauge | sample age at scrape time |
+| `shutdown_total{reason}` | counter | orderly shutdown (`sigint` / `sigterm`) |
+| `shutdown_unresolved_brake` | gauge 0/1 | brake still claimed or still desired at exit |
+| `shutdown_unresolved_actuator` | gauge 0/1 | last apply/release still failed at exit |
+| `shutdown_brake_left_engaged` | gauge 0/1 | hardware brake left in place (not restored) |
+| `telemetry_freshness_s` | gauge | sample age at scrape time (monotonic receive instant) |
 
 Numeric ids: 0 `healthy_real`, 1 `warning`, 2 `critical_braked`,
 3 `recovering`, 4 `telemetry_missing`, 5 `telemetry_stale`,

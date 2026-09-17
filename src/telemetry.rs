@@ -5,17 +5,19 @@
 //! values. Missing or invalid readings stay [`None`] and are never silently
 //! converted into a legitimate numeric zero.
 //!
-//! [`SensoryMapping`] / [`MappedStimulus`] are a typed mapping hook toward a
-//! future publisher ([#40](https://github.com/rmems/thalamic-relay/issues/40)).
-//! This module does **not** implement `corpus-ipc` transport and does not feed
-//! a local neuromorphic inference core.
+//! This module owns the typed mapping surface toward `corpus-ipc` ([#40](https://github.com/rmems/thalamic-relay/issues/40)):
+//! [`SensoryMapping`] / [`MappedStimulus`]. Transport and the canonical
+//! `StimulusBatch` conversion live in [`crate::publish`].
+//!
+//! Frame ordering and timestamp provenance live in [`crate::time`]: every
+//! assessed frame is stamped with a session id + strictly increasing
+//! `batch_id`. Source wall time is preserved separately from receive/emit time.
 
 use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Unix-epoch timestamp in milliseconds (UTC). Serializable and suitable for
-/// the sensory mapping surface.
-pub type UnixMillis = u64;
+pub use crate::time::{
+    FrameTiming, SampleClock, SourceTimeStatus, TimestampOrigin, UnixMillis, unix_now_ms,
+};
 
 /// Provenance of a telemetry acquisition path.
 ///
@@ -56,16 +58,14 @@ pub enum Unit {
     Volt,
     /// Megahertz.
     Megahertz,
-    /// Percent (0–100 engineering units).
+    /// Percent (0–100).
     Percent,
 }
 
-/// How a signal may be consumed. See the repository file `docs/telemetry.md`.
+/// How a signal may be consumed. See `docs/telemetry.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SignalClass {
-    /// Candidate sensory input for a downstream runtime (via a future publisher).
-    ///
-    /// Thalamic itself does not consume this as neural input.
+    /// Candidate sensory input for downstream runtimes (via corpus-ipc).
     RuntimeInput,
     /// Consumed only by hardware-safety policy.
     SafetyOnly,
@@ -76,7 +76,7 @@ pub enum SignalClass {
 }
 
 impl SignalClass {
-    /// Whether this signal may appear in the sensory mapping toward a future publisher.
+    /// Whether this signal may appear in the corpus-ipc sensory mapping.
     #[must_use]
     pub const fn includes_runtime_input(self) -> bool {
         matches!(self, Self::RuntimeInput | Self::Both)
@@ -92,23 +92,22 @@ impl SignalClass {
 /// Whether the engineering value is measured or computed from another signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SignalOrigin {
-    /// Read from a device sensor (NVML) or a documented software-only estimate.
+    /// Read from a hardware sensor.
     Measured,
-    /// Computed from another signal (currently `vddcr_gfx_v` from power).
+    /// Computed from another signal (not a sensor reading).
     Derived,
 }
 
-/// Deterministic `[0, 1]` normalization for the sensory mapping.
-/// Applied only to [`SampleValidity::Valid`].
+/// Deterministic model-input normalization. Applied only to [`SampleValidity::Valid`].
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum Normalization {
     /// Pass-through of the engineering value (not used for current GPU signals).
     Identity,
     /// `(value - min) / (max - min)` clamped to `[0, 1]`.
     Linear {
-        /// Lower bound of the engineering range used for scaling.
+        /// Lower bound of the linear mapping (engineering units).
         min: f32,
-        /// Upper bound of the engineering range used for scaling.
+        /// Upper bound of the linear mapping (engineering units).
         max: f32,
     },
 }
@@ -132,19 +131,16 @@ impl Normalization {
     }
 }
 
-/// Stable signal identifiers. Names are the sensory-mapping keys.
+/// Stable signal identifiers. Names are the corpus-ipc mapping keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SignalId {
     /// GPU die temperature (`gpu_temp_c`).
     GpuTempC,
-    /// VRAM temperature when the adapter can read it (`vram_temp_c`).
+    /// VRAM temperature when the sensor exists (`vram_temp_c`).
     VramTempC,
     /// Board power (`power_w`).
     PowerW,
-    /// Derived GFX-rail voltage *estimate* (`vddcr_gfx_v`), not an NVML sensor.
-    ///
-    /// The identifier is historical (AMD `VDDCR_GFX` naming). It is
-    /// observability-only and is omitted from [`SensoryMapping`].
+    /// Derived Vcore estimate (`vddcr_gfx_v`); not an NVML voltage sensor.
     VddcrGfxV,
     /// Graphics clock (`gpu_clock_mhz`).
     GpuClockMhz,
@@ -157,7 +153,7 @@ pub enum SignalId {
 }
 
 impl SignalId {
-    /// Canonical snake_case name for docs and the sensory mapping keys.
+    /// Canonical snake_case name for docs and corpus-ipc mapping.
     #[must_use]
     pub const fn name(self) -> &'static str {
         signal_spec(self).name
@@ -188,25 +184,25 @@ pub const OBSERVABILITY_STALE_AFTER_MS: u64 = 5_000;
 /// Per-signal contract: unit, range, origin, class, normalization, cadence, stale.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SignalSpec {
-    /// Stable identifier for this channel.
+    /// Stable identifier for this signal.
     pub id: SignalId,
-    /// Canonical snake_case name (mapping key).
+    /// Canonical snake_case name (corpus-ipc mapping key).
     pub name: &'static str,
-    /// Engineering unit of `value`.
+    /// Engineering unit of [`TelemetrySample::value`].
     pub unit: Unit,
-    /// Inclusive minimum of the documented engineering range.
+    /// Inclusive engineering-range minimum; below this is [`SampleValidity::Invalid`].
     pub min: f32,
-    /// Inclusive maximum of the documented engineering range.
+    /// Inclusive engineering-range maximum; above this is [`SampleValidity::Invalid`].
     pub max: f32,
-    /// Measured versus derived.
+    /// Measured vs derived.
     pub origin: SignalOrigin,
-    /// Whether safety, sensory mapping, and/or observability may consume this.
+    /// How the signal may be consumed.
     pub class: SignalClass,
-    /// `[0, 1]` scaling applied only to [`SampleValidity::Valid`] samples.
+    /// Model-input mapping applied only to [`SampleValidity::Valid`] values.
     pub normalization: Normalization,
-    /// Documented default acquisition interval (ms).
+    /// Documented acquisition cadence (ms). Actual cadence is on the frame.
     pub cadence_ms: u64,
-    /// Age (ms) at or beyond which a sample is [`SampleValidity::Stale`].
+    /// Age after which a finite value becomes [`SampleValidity::Stale`].
     pub stale_after_ms: u64,
 }
 
@@ -341,7 +337,7 @@ pub mod software_fallback {
     pub const GPU_TEMP_C: f32 = 35.0;
     /// Typical idle board power estimate (W).
     pub const POWER_W: f32 = 25.0;
-    /// Derived GFX-rail voltage estimate (V). Not a measured sensor.
+    /// Typical idle Vcore estimate (V). Derived, not measured.
     pub const VDDCR_GFX_V: f32 = 0.7;
     /// Typical idle graphics clock estimate (MHz).
     pub const GPU_CLOCK_MHZ: f32 = 210.0;
@@ -353,30 +349,24 @@ pub mod software_fallback {
     pub const MEM_UTIL_PCT: f32 = 0.0;
 }
 
-/// Wall-clock now as unix milliseconds. Returns 0 if the clock is before epoch.
-#[must_use]
-pub fn unix_now_ms() -> UnixMillis {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
-}
-
 /// One typed sample. `value` is engineering units when present.
 ///
 /// `value` is `None` for missing and non-finite readings. Out-of-range and
 /// stale readings keep the raw number for observability but are not [`SampleValidity::Valid`].
+/// `observed_at` is the source wall time when present, otherwise receive time
+/// (missing CSV timestamp). Frame-level source vs receive split lives on
+/// [`TelemetryFrame`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TelemetrySample<T> {
-    /// Which inventory channel this sample belongs to.
+    /// Which inventory signal this sample belongs to.
     pub signal: SignalId,
-    /// Engineering-unit value. `None` if missing or non-finite.
+    /// Engineering-unit value. `None` for missing and non-finite readings.
     pub value: Option<T>,
     /// Acquisition timestamp (unix ms).
     pub observed_at: UnixMillis,
-    /// How this reading was acquired.
+    /// Provenance of the acquisition path.
     pub source: TelemetrySource,
-    /// Valid / missing / invalid / stale.
+    /// Validity after range/freshness checks.
     pub validity: SampleValidity,
     /// Engineering unit of `value`.
     pub unit: Unit,
@@ -423,9 +413,7 @@ impl TelemetrySample<f32> {
         }
     }
 
-    /// Normalized sensory-mapping value in `[0, 1]`. `None` unless this sample
-    /// is [`SampleValidity::Valid`]. Thalamic does not feed this into a local
-    /// inference core.
+    /// Model-input value in `[0, 1]`. `None` unless this sample is [`SampleValidity::Valid`].
     #[must_use]
     pub fn normalized(&self) -> Option<f32> {
         if self.validity != SampleValidity::Valid {
@@ -454,19 +442,25 @@ impl TelemetrySample<f32> {
 ///
 /// Every field is `Option`: absence means the sensor was not read. Acquisition
 /// must not write `0.0` or `NaN` as a stand-in for "no data".
+///
+/// `source_unix_ms` is the producer's wall timestamp (NVML capture, CSV cell,
+/// or simulated emit time). It is **not** the sample-sequence key; missing
+/// cells stay `None` rather than a silent `0`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RawTelemetry {
-    /// Acquisition timestamp (unix ms).
-    pub observed_at: UnixMillis,
-    /// Provenance of this acquisition path.
+    /// Producer timestamp in unix ms, if available.
+    pub source_unix_ms: Option<UnixMillis>,
+    /// Origin of the timestamp.
+    pub timestamp_origin: TimestampOrigin,
+    /// Provenance of this raw bag.
     pub source: TelemetrySource,
     /// GPU die temperature (°C), if read.
     pub gpu_temp_c: Option<f32>,
-    /// VRAM temperature (°C), if read.
+    /// VRAM temperature (°C), if the sensor exists and was read.
     pub vram_temp_c: Option<f32>,
     /// Board power (W), if read.
     pub power_w: Option<f32>,
-    /// Derived GFX-rail voltage estimate (V), if power was present.
+    /// Derived Vcore estimate (V), if computed.
     pub vddcr_gfx_v: Option<f32>,
     /// Graphics clock (MHz), if read.
     pub gpu_clock_mhz: Option<f32>,
@@ -474,7 +468,7 @@ pub struct RawTelemetry {
     pub mem_clock_mhz: Option<f32>,
     /// Fan speed (%), if read.
     pub fan_speed_pct: Option<f32>,
-    /// Memory utilization (%), if read. `Some(0.0)` is a legitimate idle.
+    /// Memory utilization (%), if read.
     pub mem_util_pct: Option<f32>,
 }
 
@@ -483,7 +477,8 @@ impl RawTelemetry {
     #[must_use]
     pub fn software_fallback(observed_at: UnixMillis) -> Self {
         Self {
-            observed_at,
+            source_unix_ms: Some(observed_at),
+            timestamp_origin: TimestampOrigin::Simulated,
             source: TelemetrySource::SoftwareFallback,
             gpu_temp_c: Some(software_fallback::GPU_TEMP_C),
             vram_temp_c: None,
@@ -500,7 +495,8 @@ impl RawTelemetry {
     #[must_use]
     pub fn nvml_unavailable(observed_at: UnixMillis) -> Self {
         Self {
-            observed_at,
+            source_unix_ms: Some(observed_at),
+            timestamp_origin: TimestampOrigin::LiveAcquire,
             source: TelemetrySource::NvmlUnavailable,
             gpu_temp_c: None,
             vram_temp_c: None,
@@ -528,22 +524,39 @@ impl RawTelemetry {
 }
 
 /// Validated frame: per-signal [`TelemetrySample`] plus frame-level provenance.
+///
+/// Timing: [`Self::batch_id`] is the monotonic sample sequence (corpus-ipc
+/// `batch_id`); [`Self::source_unix_ms`] is the original wall time;
+/// [`Self::acquired_at`] / [`Self::received_at_unix_ms`] is receive/assess
+/// time (the freshness basis).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TelemetryFrame {
-    /// Acquisition timestamp copied from the raw bag.
+    /// Relay session identifier.
+    pub session_id: String,
+    /// Monotonic batch index within session.
+    pub batch_id: u64,
+    /// Producer timestamp in unix ms, if available.
+    pub source_unix_ms: Option<UnixMillis>,
+    /// Receive timestamp in unix ms.
+    pub received_at_unix_ms: UnixMillis,
+    /// Origin of the timestamp.
+    pub timestamp_origin: TimestampOrigin,
+    /// Anomaly status of source vs receive time.
+    pub source_time_status: SourceTimeStatus,
+    /// Receive/assess time. Freshness uses this, not source wall time.
     pub acquired_at: UnixMillis,
-    /// Frame-level provenance.
+    /// Provenance shared by every sample in this frame.
     pub source: TelemetrySource,
     /// Actual supervisor acquisition interval (`--step-interval-ms`), not the
     /// documented default in [`signal_spec`].
     pub acquisition_cadence_ms: u64,
     /// GPU die temperature sample.
     pub gpu_temp_c: TelemetrySample<f32>,
-    /// VRAM temperature sample (often missing on current NVML adapters).
+    /// VRAM temperature sample (often [`SampleValidity::Missing`]).
     pub vram_temp_c: TelemetrySample<f32>,
     /// Board power sample.
     pub power_w: TelemetrySample<f32>,
-    /// Derived GFX-rail voltage estimate (observability-only).
+    /// Derived Vcore estimate sample.
     pub vddcr_gfx_v: TelemetrySample<f32>,
     /// Graphics clock sample.
     pub gpu_clock_mhz: TelemetrySample<f32>,
@@ -558,6 +571,9 @@ pub struct TelemetryFrame {
 impl TelemetryFrame {
     /// Validate and stamp every raw channel. Does not mutate the raw bag.
     /// Uses [`DEFAULT_ACQUISITION_CADENCE_MS`] as the actual cadence.
+    ///
+    /// Uses an ephemeral [`SampleClock`] (new session per call). Production
+    /// and multi-frame tests should use [`Self::from_raw_with_clock`].
     #[must_use]
     pub fn from_raw(raw: &RawTelemetry, now: UnixMillis) -> Self {
         Self::from_raw_with_cadence(raw, now, DEFAULT_ACQUISITION_CADENCE_MS)
@@ -566,11 +582,33 @@ impl TelemetryFrame {
     /// Like [`Self::from_raw`] but records the configured acquisition interval.
     #[must_use]
     pub fn from_raw_with_cadence(raw: &RawTelemetry, now: UnixMillis, cadence_ms: u64) -> Self {
+        Self::from_raw_with_clock(raw, now, cadence_ms, &mut SampleClock::new())
+    }
+
+    /// Validate, record cadence, and stamp from a shared session clock.
+    ///
+    /// Live collectors, software-fallback, and CSV/replay must share the same
+    /// `clock` so `batch_id` is strictly increasing within one relay session.
+    #[must_use]
+    pub fn from_raw_with_clock(
+        raw: &RawTelemetry,
+        now: UnixMillis,
+        cadence_ms: u64,
+        clock: &mut SampleClock,
+    ) -> Self {
+        let timing = clock.stamp(raw.source_unix_ms, now, raw.timestamp_origin);
+        let observed_at = raw.source_unix_ms.unwrap_or(now);
         let sample = |id: SignalId| {
-            TelemetrySample::from_raw(id, raw.value(id), raw.observed_at, raw.source, now)
+            TelemetrySample::from_raw(id, raw.value(id), observed_at, raw.source, now)
         };
         Self {
-            acquired_at: raw.observed_at,
+            session_id: timing.session_id,
+            batch_id: timing.batch_id,
+            source_unix_ms: timing.source_unix_ms,
+            received_at_unix_ms: timing.received_at_unix_ms,
+            timestamp_origin: timing.timestamp_origin,
+            source_time_status: timing.source_time_status,
+            acquired_at: timing.received_at_unix_ms,
             source: raw.source,
             acquisition_cadence_ms: cadence_ms.max(1),
             gpu_temp_c: sample(SignalId::GpuTempC),
@@ -581,6 +619,19 @@ impl TelemetryFrame {
             mem_clock_mhz: sample(SignalId::MemClockMhz),
             fan_speed_pct: sample(SignalId::FanSpeedPct),
             mem_util_pct: sample(SignalId::MemUtilPct),
+        }
+    }
+
+    /// Frame-level timing view (corpus-ipc `session_id` / `batch_id` names).
+    #[must_use]
+    pub fn timing(&self) -> FrameTiming {
+        FrameTiming {
+            session_id: self.session_id.clone(),
+            batch_id: self.batch_id,
+            source_unix_ms: self.source_unix_ms,
+            received_at_unix_ms: self.received_at_unix_ms,
+            timestamp_origin: self.timestamp_origin,
+            source_time_status: self.source_time_status,
         }
     }
 
@@ -599,9 +650,7 @@ impl TelemetryFrame {
         ]
     }
 
-    /// Deterministic mapping toward a future publisher using wall-clock now.
-    ///
-    /// This is **not** transport and is **not** a local inference input.
+    /// Deterministic mapping toward corpus-ipc (`#40`) using wall-clock now.
     #[must_use]
     pub fn to_sensory_mapping(&self) -> SensoryMapping {
         self.to_sensory_mapping_at(unix_now_ms())
@@ -610,10 +659,10 @@ impl TelemetryFrame {
     /// Mapping at an explicit instant so held frames can go stale.
     ///
     /// Includes only runtime-input candidates ([`SignalClass::RuntimeInput`] or
-    /// [`SignalClass::Both`]). Observability-only channels are omitted (no
-    /// fabricated extra signals). Normalized values are `None` unless the sample
-    /// is [`SampleValidity::Valid`] *at `now`*. Each mapped channel carries
-    /// `stale_after_ms` and the actual `cadence_ms`.
+    /// [`SignalClass::Both`]). Observability-only channels are omitted (no filler).
+    /// Normalized values are `None` unless the sample is [`SampleValidity::Valid`]
+    /// *at `now`*. Each stimulus carries `stale_after_ms` and the actual
+    /// `cadence_ms` so corpus-ipc consumers need not duplicate the inventory.
     #[must_use]
     pub fn to_sensory_mapping_at(&self, now: UnixMillis) -> SensoryMapping {
         let stimuli = self
@@ -623,7 +672,13 @@ impl TelemetryFrame {
             .map(|s| MappedStimulus::from_sample(&s.at_time(now), self.acquisition_cadence_ms))
             .collect();
         SensoryMapping {
-            observed_at_unix_ms: self.acquired_at,
+            session_id: self.session_id.clone(),
+            batch_id: self.batch_id,
+            source_unix_ms: self.source_unix_ms,
+            received_at_unix_ms: self.received_at_unix_ms,
+            emitted_at_unix_ms: now,
+            timestamp_origin: self.timestamp_origin,
+            source_time_status: self.source_time_status,
             acquisition_source: self.source,
             acquisition_cadence_ms: self.acquisition_cadence_ms,
             stimuli,
@@ -640,7 +695,13 @@ impl TelemetryFrame {
     #[must_use]
     pub fn to_observability_snapshot_at(&self, now: UnixMillis) -> ObservabilitySnapshot {
         ObservabilitySnapshot {
-            observed_at_unix_ms: self.acquired_at,
+            session_id: self.session_id.clone(),
+            batch_id: self.batch_id,
+            source_unix_ms: self.source_unix_ms,
+            received_at_unix_ms: self.received_at_unix_ms,
+            emitted_at_unix_ms: now,
+            timestamp_origin: self.timestamp_origin,
+            source_time_status: self.source_time_status,
             acquisition_source: self.source,
             acquisition_cadence_ms: self.acquisition_cadence_ms,
             samples: self
@@ -664,29 +725,35 @@ pub fn assess_with_cadence(raw: &RawTelemetry, now: UnixMillis, cadence_ms: u64)
     TelemetryFrame::from_raw_with_cadence(raw, now, cadence_ms)
 }
 
-/// One channel in the sensory mapping surface (not a wire type).
-///
-/// The type name is historical (the retired UDP `Stimuli` protocol). This is
-/// **not** a neural stimulus: Thalamic does not run an SNN. Transport of this
-/// bag remains unimplemented ([#40](https://github.com/rmems/thalamic-relay/issues/40)).
+/// Validate raw acquisition through a shared [`SampleClock`].
+#[must_use]
+pub fn assess_with_clock(
+    raw: &RawTelemetry,
+    now: UnixMillis,
+    cadence_ms: u64,
+    clock: &mut SampleClock,
+) -> TelemetryFrame {
+    TelemetryFrame::from_raw_with_clock(raw, now, cadence_ms, clock)
+}
+
+/// One channel in the corpus-ipc mapping surface (not a wire type).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MappedStimulus {
     /// Inventory identifier.
     pub signal: SignalId,
     /// Canonical snake_case name.
     pub name: String,
-    /// Safety / sensory / observability class.
+    /// How this signal may be consumed.
     pub classification: SignalClass,
     /// Engineering unit of `raw`.
     pub unit: Unit,
     /// Acquisition provenance.
     pub source: TelemetrySource,
-    /// Validity re-evaluated at mapping time.
+    /// Validity at mapping time.
     pub validity: SampleValidity,
     /// Engineering-unit raw value. `None` if missing or non-finite.
     pub raw: Option<f32>,
-    /// `[0, 1]` normalized value for a downstream consumer. `None` unless
-    /// [`SampleValidity::Valid`]. Not consumed by a local inference core.
+    /// `[0, 1]` model-input. `None` unless [`SampleValidity::Valid`].
     pub normalized: Option<f32>,
     /// Per-signal stale threshold (ms). Consumers need not copy the inventory.
     pub stale_after_ms: u64,
@@ -712,45 +779,86 @@ impl MappedStimulus {
     }
 }
 
-/// Typed mapping hook toward a future publisher. Not a `corpus-ipc` schema
-/// duplicate and not a local inference input.
+/// Typed mapping hook for `#40`. Converted to `corpus-ipc` `StimulusBatch`
+/// in [`crate::publish`] — not a wire-schema duplicate.
+///
+/// `session_id` / `batch_id` match corpus-ipc `StimulusBatch`. Source wall
+/// time and receive/emit time are separate so RM-1144 can put emit time on
+/// the wire `timestamp` and source time in metadata without guessing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SensoryMapping {
-    /// Frame acquisition timestamp (unix ms).
-    pub observed_at_unix_ms: UnixMillis,
-    /// Provenance of the underlying acquisition.
+    /// Relay session identifier.
+    pub session_id: String,
+    /// Monotonic batch index within session.
+    pub batch_id: u64,
+    /// Producer timestamp in unix ms, if available.
+    pub source_unix_ms: Option<UnixMillis>,
+    /// Receive timestamp in unix ms.
+    pub received_at_unix_ms: UnixMillis,
+    /// Mapping-time instant (`now` passed to [`TelemetryFrame::to_sensory_mapping_at`]).
+    pub emitted_at_unix_ms: UnixMillis,
+    /// Origin of the timestamp.
+    pub timestamp_origin: TimestampOrigin,
+    /// Anomaly status of source vs receive time.
+    pub source_time_status: SourceTimeStatus,
+    /// Telemetry acquisition source.
     pub acquisition_source: TelemetrySource,
-    /// Actual acquisition interval for this frame (ms).
+    /// Actual acquisition cadence for this frame.
     pub acquisition_cadence_ms: u64,
-    /// Runtime-input / Both channels only (observability-only omitted).
+    /// Runtime-input / Both stimuli only (no observability-only filler).
     pub stimuli: Vec<MappedStimulus>,
 }
 
 /// Raw-preserving observability view of an entire frame.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ObservabilitySnapshot {
-    /// Frame acquisition timestamp (unix ms).
-    pub observed_at_unix_ms: UnixMillis,
-    /// Provenance of the underlying acquisition.
+    /// Relay session identifier.
+    pub session_id: String,
+    /// Monotonic batch index within session.
+    pub batch_id: u64,
+    /// Producer timestamp in unix ms, if available.
+    pub source_unix_ms: Option<UnixMillis>,
+    /// Receive timestamp in unix ms.
+    pub received_at_unix_ms: UnixMillis,
+    /// Mapping-time instant.
+    pub emitted_at_unix_ms: UnixMillis,
+    /// Origin of the timestamp.
+    pub timestamp_origin: TimestampOrigin,
+    /// Anomaly status of source vs receive time.
+    pub source_time_status: SourceTimeStatus,
+    /// Telemetry acquisition source.
     pub acquisition_source: TelemetrySource,
-    /// Actual acquisition interval for this frame (ms).
+    /// Actual acquisition cadence for this frame.
     pub acquisition_cadence_ms: u64,
-    /// Every inventory channel, including observability-only.
+    /// Every inventory signal, raw preserved independently of normalization.
     pub samples: Vec<MappedStimulus>,
 }
 
 /// Deterministic fixtures for the contract (healthy, fallback, stale, dropout, …).
 pub mod fixtures {
-    use super::{RawTelemetry, TelemetrySource, UnixMillis};
+    use super::{RawTelemetry, TelemetrySource, TimestampOrigin, UnixMillis};
+    use crate::time::parse_source_timestamp_field;
 
     /// Fixed timestamp so tests do not depend on wall clock.
     pub const NOW: UnixMillis = 1_700_000_000_000;
 
-    /// Healthy NVML-like readings, including a legitimate `mem_util_pct = 0.0`.
-    #[must_use]
-    pub fn healthy_real() -> RawTelemetry {
+    /// CSV header shared by replay fixtures: source time then two safety signals.
+    pub const CSV_HEADER: &str = "source_unix_ms,gpu_temp_c,power_w";
+
+    /// Duplicate, backward, missing, and very large source timestamps.
+    pub const CSV_SOURCE_TIME_FIXTURE: &str = "\
+source_unix_ms,gpu_temp_c,power_w
+1700000000000,65,200
+1700000000000,66,201
+1699999990000,64,190
+,65,200
+18446744073709551615,65,200
+";
+
+    fn nvml_at(source_unix_ms: Option<UnixMillis>) -> RawTelemetry {
         RawTelemetry {
-            observed_at: NOW,
+            source_unix_ms,
+            timestamp_origin: TimestampOrigin::LiveAcquire,
             source: TelemetrySource::Nvml,
             gpu_temp_c: Some(65.0),
             vram_temp_c: Some(72.0),
@@ -761,6 +869,12 @@ pub mod fixtures {
             fan_speed_pct: Some(40.0),
             mem_util_pct: Some(0.0),
         }
+    }
+
+    /// Healthy NVML-like readings, including a legitimate `mem_util_pct = 0.0`.
+    #[must_use]
+    pub fn healthy_real() -> RawTelemetry {
+        nvml_at(Some(NOW))
     }
 
     /// Software-only idle estimates (explicit fallback provenance).
@@ -779,7 +893,7 @@ pub mod fixtures {
     #[must_use]
     pub fn stale() -> RawTelemetry {
         RawTelemetry {
-            observed_at: NOW.saturating_sub(10_000),
+            source_unix_ms: Some(NOW.saturating_sub(10_000)),
             ..healthy_real()
         }
     }
@@ -826,9 +940,100 @@ pub mod fixtures {
             fan_speed_pct: Some(30.0),
             mem_util_pct: Some(0.0),
             vram_temp_c: None,
-            observed_at: NOW,
+            source_unix_ms: Some(NOW),
+            timestamp_origin: TimestampOrigin::LiveAcquire,
             source: TelemetrySource::Nvml,
         }
+    }
+
+    /// Duplicate of [`healthy_real`]'s source timestamp (CSV replay of a repeated row).
+    #[must_use]
+    pub fn duplicate_source_timestamp() -> RawTelemetry {
+        RawTelemetry {
+            timestamp_origin: TimestampOrigin::CsvSource,
+            source_unix_ms: Some(NOW),
+            ..healthy_real()
+        }
+    }
+
+    /// Source timestamp earlier than [`NOW`] (CSV row arrived out of order).
+    #[must_use]
+    pub fn backward_source_timestamp() -> RawTelemetry {
+        RawTelemetry {
+            timestamp_origin: TimestampOrigin::CsvSource,
+            source_unix_ms: Some(NOW.saturating_sub(1_000)),
+            ..healthy_real()
+        }
+    }
+
+    /// CSV cell left blank — no source wall time.
+    #[must_use]
+    pub fn missing_source_timestamp() -> RawTelemetry {
+        RawTelemetry {
+            timestamp_origin: TimestampOrigin::CsvSource,
+            source_unix_ms: None,
+            ..healthy_real()
+        }
+    }
+
+    /// Source timestamp of `u64::MAX` (ns mistakenly stored as ms, or overflow).
+    #[must_use]
+    pub fn very_large_source_timestamp() -> RawTelemetry {
+        RawTelemetry {
+            timestamp_origin: TimestampOrigin::CsvSource,
+            source_unix_ms: Some(u64::MAX),
+            ..healthy_real()
+        }
+    }
+
+    /// Parse one `source_unix_ms,gpu_temp_c,power_w` CSV row into a raw bag.
+    ///
+    /// Empty source cell → missing source time. Used so CSV/replay and live
+    /// collectors share [`crate::time::SampleClock`] stamping.
+    pub fn raw_from_csv_row(line: &str) -> Result<RawTelemetry, String> {
+        let cols: Vec<&str> = line.split(',').collect();
+        if cols.len() != 3 {
+            return Err(format!(
+                "expected 3 CSV columns (source_unix_ms,gpu_temp_c,power_w), got {}: {line}",
+                cols.len()
+            ));
+        }
+        let source_unix_ms = parse_source_timestamp_field(cols[0])?;
+        let gpu_temp_c = parse_optional_f32(cols[1], "gpu_temp_c")?;
+        let power_w = parse_optional_f32(cols[2], "power_w")?;
+        Ok(RawTelemetry {
+            source_unix_ms,
+            timestamp_origin: TimestampOrigin::CsvSource,
+            source: TelemetrySource::SoftwareFallback,
+            gpu_temp_c,
+            vram_temp_c: None,
+            power_w,
+            vddcr_gfx_v: None,
+            gpu_clock_mhz: None,
+            mem_clock_mhz: None,
+            fan_speed_pct: None,
+            mem_util_pct: None,
+        })
+    }
+
+    fn parse_optional_f32(field: &str, name: &str) -> Result<Option<f32>, String> {
+        let trimmed = field.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        trimmed
+            .parse::<f32>()
+            .map(Some)
+            .map_err(|e| format!("invalid {name} {trimmed:?}: {e}"))
+    }
+
+    /// Data rows of [`CSV_SOURCE_TIME_FIXTURE`] (header skipped).
+    pub fn csv_source_time_rows() -> impl Iterator<Item = Result<RawTelemetry, String>> {
+        CSV_SOURCE_TIME_FIXTURE
+            .lines()
+            .filter(|l| !l.is_empty())
+            .skip(1)
+            .map(raw_from_csv_row)
     }
 }
 
@@ -1023,12 +1228,88 @@ mod tests {
     #[test]
     fn future_observed_at_is_invalid_not_valid() {
         let mut raw = fixtures::healthy_real();
-        raw.observed_at = NOW + 5_000;
+        raw.source_unix_ms = Some(NOW + 5_000);
         let frame = assess(&raw, NOW);
         assert_eq!(frame.gpu_temp_c.validity, SampleValidity::Invalid);
         assert_eq!(frame.gpu_temp_c.value, Some(65.0));
         assert_eq!(frame.power_w.validity, SampleValidity::Invalid);
         assert_eq!(frame.gpu_temp_c.normalized(), None);
+        assert_eq!(frame.source_time_status, SourceTimeStatus::Future);
+        assert_eq!(frame.source_unix_ms, Some(NOW + 5_000));
+        assert_eq!(frame.received_at_unix_ms, NOW);
+    }
+
+    #[test]
+    fn mapping_carries_session_batch_and_split_timestamps() {
+        let mut clock = SampleClock::with_session_id("map-sess");
+        let frame = assess_with_clock(&fixtures::healthy_real(), NOW, 100, &mut clock);
+        let mapping = frame.to_sensory_mapping_at(NOW + 50);
+        assert_eq!(mapping.session_id, "map-sess");
+        assert_eq!(mapping.batch_id, 0);
+        assert_eq!(mapping.source_unix_ms, Some(NOW));
+        assert_eq!(mapping.received_at_unix_ms, NOW);
+        assert_eq!(mapping.emitted_at_unix_ms, NOW + 50);
+        assert_ne!(mapping.source_unix_ms.unwrap(), mapping.emitted_at_unix_ms);
+        assert_eq!(mapping.timestamp_origin, TimestampOrigin::LiveAcquire);
+        assert_eq!(mapping.source_time_status, SourceTimeStatus::InOrder);
+    }
+
+    #[test]
+    fn csv_fixture_rows_share_clock_with_live_and_flag_source_anomalies() {
+        let mut clock = SampleClock::with_session_id("csv-live");
+        let live = assess_with_clock(&fixtures::healthy_real(), NOW, 100, &mut clock);
+        assert_eq!(live.timestamp_origin, TimestampOrigin::LiveAcquire);
+        assert_eq!(live.batch_id, 0);
+
+        let rows: Vec<RawTelemetry> = fixtures::csv_source_time_rows()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("CSV fixture must parse");
+        assert_eq!(rows.len(), 5);
+
+        let stamped: Vec<TelemetryFrame> = rows
+            .iter()
+            .map(|raw| assess_with_clock(raw, NOW, 100, &mut clock))
+            .collect();
+        assert!(stamped.iter().all(|f| f.session_id == live.session_id));
+        assert_eq!(stamped[0].batch_id, 1);
+        assert_eq!(stamped[1].batch_id, 2);
+        assert_eq!(stamped[2].batch_id, 3);
+        assert_eq!(stamped[3].batch_id, 4);
+        assert_eq!(stamped[4].batch_id, 5);
+        assert!(stamped.windows(2).all(|w| w[1].batch_id > w[0].batch_id));
+
+        assert_eq!(stamped[0].source_time_status, SourceTimeStatus::Duplicate);
+        assert_eq!(stamped[1].source_time_status, SourceTimeStatus::Duplicate);
+        assert_eq!(stamped[2].source_time_status, SourceTimeStatus::Backward);
+        assert_eq!(stamped[3].source_time_status, SourceTimeStatus::Missing);
+        assert_eq!(stamped[4].source_time_status, SourceTimeStatus::Future);
+        assert_eq!(stamped[4].gpu_temp_c.validity, SampleValidity::Invalid);
+        assert_eq!(stamped[3].source_unix_ms, None);
+        // Missing source uses receive time for sample validity (age ≈ 0).
+        assert_eq!(stamped[3].gpu_temp_c.observed_at, NOW);
+        assert_eq!(stamped[3].gpu_temp_c.validity, SampleValidity::Valid);
+        assert_eq!(stamped[0].timestamp_origin, TimestampOrigin::CsvSource);
+        assert_eq!(
+            fixtures::CSV_SOURCE_TIME_FIXTURE.lines().next().unwrap(),
+            fixtures::CSV_HEADER
+        );
+    }
+
+    #[test]
+    fn named_source_timestamp_fixtures_cover_duplicate_backward_missing_large() {
+        assert_eq!(
+            fixtures::duplicate_source_timestamp().source_unix_ms,
+            Some(NOW)
+        );
+        assert_eq!(
+            fixtures::backward_source_timestamp().source_unix_ms,
+            Some(NOW - 1_000)
+        );
+        assert_eq!(fixtures::missing_source_timestamp().source_unix_ms, None);
+        assert_eq!(
+            fixtures::very_large_source_timestamp().source_unix_ms,
+            Some(u64::MAX)
+        );
     }
 
     #[test]
@@ -1078,5 +1359,127 @@ mod tests {
         assert_eq!(frame.gpu_temp_c.validity, SampleValidity::Missing);
         assert_eq!(frame.power_w.validity, SampleValidity::Missing);
         assert_eq!(frame.gpu_temp_c.value, None);
+    }
+
+    #[test]
+    fn identity_and_degenerate_linear_normalization() {
+        assert_eq!(Normalization::Identity.apply(42.0), 42.0);
+        assert_eq!(Normalization::Identity.apply(-3.5), -3.5);
+        let collapsed = Normalization::Linear {
+            min: 10.0,
+            max: 10.0,
+        };
+        assert_eq!(collapsed.apply(10.0), 0.0);
+        let non_finite = Normalization::Linear {
+            min: f32::NAN,
+            max: 1.0,
+        };
+        assert_eq!(non_finite.apply(0.5), 0.0);
+        let linear = Normalization::Linear {
+            min: 0.0,
+            max: 100.0,
+        };
+        assert_eq!(linear.apply(-10.0), 0.0);
+        assert_eq!(linear.apply(150.0), 1.0);
+        assert_eq!(linear.apply(25.0), 0.25);
+    }
+
+    #[test]
+    fn signal_class_and_name_helpers() {
+        assert!(SignalClass::Both.includes_runtime_input());
+        assert!(SignalClass::Both.includes_safety());
+        assert!(SignalClass::RuntimeInput.includes_runtime_input());
+        assert!(!SignalClass::RuntimeInput.includes_safety());
+        assert!(!SignalClass::SafetyOnly.includes_runtime_input());
+        assert!(SignalClass::SafetyOnly.includes_safety());
+        assert!(!SignalClass::ObservabilityOnly.includes_runtime_input());
+        assert!(!SignalClass::ObservabilityOnly.includes_safety());
+        for id in ALL_SIGNALS {
+            assert_eq!(id.name(), signal_spec(id).name);
+        }
+        assert_eq!(SignalId::GpuTempC.name(), "gpu_temp_c");
+    }
+
+    #[test]
+    fn engineering_range_is_inclusive_and_below_min_is_invalid() {
+        let mut at_min = fixtures::healthy_real();
+        at_min.gpu_temp_c = Some(0.0);
+        let frame = assess_now(&at_min);
+        assert_eq!(frame.gpu_temp_c.validity, SampleValidity::Valid);
+        assert_eq!(frame.gpu_temp_c.value, Some(0.0));
+
+        let mut at_max = fixtures::healthy_real();
+        at_max.gpu_temp_c = Some(125.0);
+        let frame = assess_now(&at_max);
+        assert_eq!(frame.gpu_temp_c.validity, SampleValidity::Valid);
+        assert_eq!(frame.gpu_temp_c.value, Some(125.0));
+        assert_eq!(frame.gpu_temp_c.normalized(), Some(1.0));
+
+        let mut below = fixtures::healthy_real();
+        below.gpu_temp_c = Some(-1.0);
+        let frame = assess_now(&below);
+        assert_eq!(frame.gpu_temp_c.validity, SampleValidity::Invalid);
+        assert_eq!(frame.gpu_temp_c.value, Some(-1.0));
+        assert_eq!(frame.gpu_temp_c.normalized(), None);
+    }
+
+    #[test]
+    fn future_missing_stays_missing_and_future_non_finite_is_invalid() {
+        let mut missing = fixtures::healthy_real();
+        missing.source_unix_ms = Some(NOW + 5_000);
+        missing.gpu_temp_c = None;
+        let frame = assess(&missing, NOW);
+        assert_eq!(frame.gpu_temp_c.validity, SampleValidity::Missing);
+        assert_eq!(frame.gpu_temp_c.value, None);
+
+        let mut nan = fixtures::healthy_real();
+        nan.source_unix_ms = Some(NOW + 5_000);
+        nan.power_w = Some(f32::NAN);
+        let frame = assess(&nan, NOW);
+        assert_eq!(frame.power_w.validity, SampleValidity::Invalid);
+        assert_eq!(frame.power_w.value, None);
+    }
+
+    #[test]
+    fn infinity_is_invalid_with_none_value() {
+        let mut raw = fixtures::healthy_real();
+        raw.gpu_temp_c = Some(f32::INFINITY);
+        let frame = assess_now(&raw);
+        assert_eq!(frame.gpu_temp_c.validity, SampleValidity::Invalid);
+        assert_eq!(frame.gpu_temp_c.value, None);
+        assert_eq!(frame.gpu_temp_c.normalized(), None);
+    }
+
+    #[test]
+    fn at_time_leaves_missing_alone_and_can_stale_a_valid_sample() {
+        let dropout = assess_now(&fixtures::sensor_dropout());
+        let later = dropout.power_w.at_time(NOW + 10_000);
+        assert_eq!(later.validity, SampleValidity::Missing);
+        assert_eq!(later.value, None);
+
+        let healthy = assess_now(&fixtures::healthy_real());
+        assert_eq!(healthy.gpu_temp_c.validity, SampleValidity::Valid);
+        let stale = healthy.gpu_temp_c.at_time(NOW + SAFETY_STALE_AFTER_MS);
+        assert_eq!(stale.validity, SampleValidity::Stale);
+        assert_eq!(stale.value, Some(65.0));
+        assert_eq!(stale.normalized(), None);
+    }
+
+    #[test]
+    fn zero_cadence_is_floored_to_one() {
+        let frame = assess_with_cadence(&fixtures::healthy_real(), NOW, 0);
+        assert_eq!(frame.acquisition_cadence_ms, 1);
+        let mapping = frame.to_sensory_mapping_at(NOW);
+        assert_eq!(mapping.acquisition_cadence_ms, 1);
+        assert!(mapping.stimuli.iter().all(|s| s.cadence_ms == 1));
+    }
+
+    #[test]
+    fn unix_now_ms_is_epoch_based() {
+        let now = unix_now_ms();
+        assert!(
+            now >= NOW,
+            "unix_now_ms={now} should be at/after fixture NOW"
+        );
     }
 }

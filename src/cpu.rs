@@ -1,27 +1,31 @@
-//! Daemon observability plumbing: Prometheus exporter and shared safety gauges.
+//! Prometheus / tracing init and scrape-time gauges for the supervisor.
 //!
-//! Used by the `thalamic-relay` binary. This module does not evaluate safety
-//! policy and does not publish sensory frames. Binding the metrics listener is
-//! a process-global side effect.
+//! Crate-private process plumbing: not part of the public `thalamic_relay` API.
+//! This module does not evaluate safety policy and does not publish sensory
+//! frames. Binding the metrics listener is a process-global side effect.
 
 use metrics::{counter, gauge};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tracing::{Level, info};
 use tracing_subscriber::FmtSubscriber;
 
 use crate::safety::{SafetySnapshot, SafetyState};
-use crate::telemetry::{UnixMillis, unix_now_ms};
+use crate::shutdown::ShutdownPlan;
+use crate::telemetry::UnixMillis;
+use crate::time::freshness_seconds_monotonic;
 
 /// Shared telemetry + safety state populated by the main loop.
-///
-/// Freshness is computed at scrape/export time from [`Self::telemetry_acquired_at`].
+/// Freshness is computed at scrape/export time from receive/emit time
+/// ([`Self::telemetry_acquired_at`] / [`Self::telemetry_received_instant`]),
+/// never from source wall time.
 #[derive(Debug, Clone)]
 pub struct RelayMetrics {
     /// Unix-ms timestamp of the last assessed frame, if any.
     pub telemetry_acquired_at: Option<UnixMillis>,
+    pub telemetry_received_instant: Option<Instant>,
     /// Reported safety state (actuator-failure overlay included).
     pub safety_state: SafetyState,
     /// Policy classification before the actuator-failure overlay.
@@ -30,27 +34,29 @@ pub struct RelayMetrics {
     pub brake_engaged: bool,
     /// Consecutive real Ok evaluations while the brake is engaged.
     pub hysteresis_ok_count: u32,
+    pub shutdown_reason: Option<&'static str>,
+    pub shutdown_unresolved_brake: bool,
+    pub shutdown_unresolved_actuator: bool,
 }
 
 impl Default for RelayMetrics {
     fn default() -> Self {
         Self {
             telemetry_acquired_at: None,
+            telemetry_received_instant: None,
             safety_state: SafetyState::TelemetryMissing,
             policy_state: SafetyState::TelemetryMissing,
             brake_engaged: false,
             hysteresis_ok_count: 0,
+            shutdown_reason: None,
+            shutdown_unresolved_brake: false,
+            shutdown_unresolved_actuator: false,
         }
     }
 }
 
-/// Age of the last sample in seconds. `None` acquired_at is 0 (no sample yet).
-#[must_use]
-pub fn freshness_seconds(acquired_at: Option<UnixMillis>, now: UnixMillis) -> f64 {
-    acquired_at
-        .map(|ts| now.saturating_sub(ts) as f64 / 1000.0)
-        .unwrap_or(0.0)
-}
+#[cfg(test)]
+use crate::time::freshness_seconds;
 
 /// Copy a safety snapshot into shared metrics and increment event counters.
 pub fn record_safety_snapshot(metrics: &mut RelayMetrics, snap: &SafetySnapshot) {
@@ -93,6 +99,17 @@ pub fn export_safety_gauges(
     gauge!("safety_hysteresis_ok_count").set(f64::from(hysteresis_ok_count));
 }
 
+/// Record shutdown reason and unresolved brake/actuator gauges.
+pub fn record_shutdown(metrics: &mut RelayMetrics, plan: &ShutdownPlan) {
+    metrics.shutdown_reason = Some(plan.reason.as_str());
+    metrics.shutdown_unresolved_brake = plan.unresolved_brake;
+    metrics.shutdown_unresolved_actuator = plan.unresolved_actuator;
+    counter!("shutdown_total", "reason" => plan.reason.as_str()).increment(1);
+    gauge!("shutdown_unresolved_brake").set(if plan.unresolved_brake { 1.0 } else { 0.0 });
+    gauge!("shutdown_unresolved_actuator").set(if plan.unresolved_actuator { 1.0 } else { 0.0 });
+    gauge!("shutdown_brake_left_engaged").set(if plan.leave_brake_engaged { 1.0 } else { 0.0 });
+}
+
 /// Sets up our logging and metrics engines.
 /// Binds the Prometheus HTTP listener on `metrics_addr`.
 /// RUST_LOG (or future log-level arg) still controls tracing via env filter where applicable.
@@ -119,20 +136,28 @@ pub fn init_telemetry(metrics_addr: std::net::SocketAddr) {
 }
 
 /// Spawns a background task to track relay telemetry metrics.
-/// Reads from shared state populated by the main loop.
-pub async fn run_metrics_collector(metrics: Arc<Mutex<RelayMetrics>>) {
+/// Reads from shared state populated by the main loop. Exits when `shutdown`
+/// is set to `true` (or the sender is dropped).
+pub async fn run_metrics_collector(
+    metrics: Arc<Mutex<RelayMetrics>>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
     info!("Starting Metrics Collector...");
 
     loop {
-        // Read from shared state populated by the main loop
+        if *shutdown.borrow() {
+            info!("Metrics collector stopping");
+            break;
+        }
+
         let snapshot = {
             let guard = metrics.lock().unwrap();
             guard.clone()
         };
 
-        gauge!("telemetry_freshness_s").set(freshness_seconds(
-            snapshot.telemetry_acquired_at,
-            unix_now_ms(),
+        gauge!("telemetry_freshness_s").set(freshness_seconds_monotonic(
+            snapshot.telemetry_received_instant,
+            Instant::now(),
         ));
         export_safety_gauges(
             snapshot.safety_state,
@@ -141,7 +166,15 @@ pub async fn run_metrics_collector(metrics: Arc<Mutex<RelayMetrics>>) {
             snapshot.hysteresis_ok_count,
         );
 
-        sleep(Duration::from_secs(2)).await;
+        tokio::select! {
+            result = shutdown.changed() => {
+                if result.is_err() || *shutdown.borrow() {
+                    info!("Metrics collector stopping");
+                    break;
+                }
+            }
+            _ = sleep(Duration::from_secs(2)) => {}
+        }
     }
 }
 
@@ -155,6 +188,7 @@ mod tests {
     fn relay_metrics_default_values() {
         let m = RelayMetrics::default();
         assert_eq!(m.telemetry_acquired_at, None);
+        assert_eq!(m.telemetry_received_instant, None);
         assert_eq!(m.safety_state, SafetyState::TelemetryMissing);
         assert_eq!(m.policy_state, SafetyState::TelemetryMissing);
         assert!(!m.brake_engaged);
@@ -172,6 +206,16 @@ mod tests {
     }
 
     #[test]
+    fn freshness_seconds_ignores_regressing_source_wall_time() {
+        let received_at = Some(5_000);
+        let source_regressed = Some(1_000);
+        assert_eq!(freshness_seconds(received_at, 5_000), 0.0);
+        assert!((freshness_seconds(source_regressed, 5_000) - 4.0).abs() < f64::EPSILON);
+        // Callers must pass receive time; source age is validity, not this gauge.
+        assert!(freshness_seconds(received_at, 5_000) < freshness_seconds(source_regressed, 5_000));
+    }
+
+    #[test]
     fn record_safety_snapshot_copies_state_and_brake() {
         let mut metrics = RelayMetrics::default();
         let mut machine = SafetyMachine::new();
@@ -183,5 +227,46 @@ mod tests {
         assert_eq!(metrics.safety_state, SafetyState::CriticalBraked);
         assert!(!metrics.brake_engaged);
         assert_eq!(metrics.policy_state, SafetyState::CriticalBraked);
+    }
+
+    #[test]
+    fn record_shutdown_copies_unresolved_flags() {
+        use crate::shutdown::{InFlightActuation, ShutdownReason, plan_shutdown};
+
+        let mut machine = SafetyMachine::new();
+        machine.seed_brake_applied();
+        let plan = plan_shutdown(
+            ShutdownReason::Sigterm,
+            &machine.snapshot(),
+            InFlightActuation::None,
+        );
+        let mut metrics = RelayMetrics::default();
+        record_shutdown(&mut metrics, &plan);
+        assert_eq!(metrics.shutdown_reason, Some("sigterm"));
+        assert!(metrics.shutdown_unresolved_brake);
+        assert!(!metrics.shutdown_unresolved_actuator);
+    }
+
+    #[test]
+    fn freshness_seconds_is_zero_when_acquired_at_now() {
+        assert_eq!(freshness_seconds(Some(5_000), 5_000), 0.0);
+        assert_eq!(freshness_seconds(Some(8_000), 5_000), 0.0);
+    }
+
+    #[test]
+    fn record_safety_snapshot_tracks_hysteresis_and_actuator_overlay() {
+        use crate::safety::ActuatorOutcome;
+
+        let mut metrics = RelayMetrics::default();
+        let mut machine = SafetyMachine::new();
+        let mut raw = fixtures::healthy_real();
+        raw.gpu_temp_c = Some(90.0);
+        let _ = machine.evaluate(&assess(&raw, fixtures::NOW));
+        let failed = machine.record_actuator(ActuatorOutcome::ApplyFailed("pl".into()));
+        record_safety_snapshot(&mut metrics, &failed);
+        assert_eq!(metrics.safety_state, SafetyState::ActuatorFailure);
+        assert_eq!(metrics.policy_state, SafetyState::CriticalBraked);
+        assert!(!metrics.brake_engaged);
+        assert_eq!(metrics.hysteresis_ok_count, 0);
     }
 }
