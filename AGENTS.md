@@ -18,10 +18,17 @@ in-process SNN it used to step was removed in RM-1143. Build with a plain
 
 ### Toolchain / system deps
 
-- Requires Rust edition 2024 with MSRV 1.98.1 (toolchain >= 1.98.1; `u64::is_multiple_of` and
-  clippy lints are used in CI; stable is set as the rustup default in this
-  environment). `cargo`/`cargo build`/`cargo test`/`cargo clippy` all work from
-  `/workspace`.
+- **Edition vs MSRV (do not conflate):** `edition = "2024"` needs rustc/Cargo ≥ 1.85
+  to parse the manifest. The **MSRV** is `package.rust-version = "1.98.1"` in
+  `Cargo.toml` (authoritative policy pin; CI installs exactly that string).
+  `rust-toolchain.toml` must match it so local and Cloud rustup do not keep an
+  older default (this image has shipped rustc 1.83, which cannot parse edition
+  2024 until rustup installs 1.98.1). Language features in tree do not require
+  1.98: `u64::is_multiple_of` is 1.87, let-chains (`&& let`) need 1.88 + 2024.
+  After the toolchain is installed, `cargo`/`cargo build`/`cargo test`/
+  `cargo clippy` work from `/workspace`. CI also runs exact-MSRV tests, `RUSTDOCFLAGS="-D warnings" cargo doc`,
+  `cargo package --locked`, a packaged-source smoke test, and
+  `cargo publish --dry-run --locked`. Real `cargo publish` is not automated.
 - `pkg-config` may be used by native dependencies. `libudev-dev` is no longer
   required: the serial backend (`serialport`, via `silicon-bridge`) was removed,
   and `nvml-wrapper` (NVML — NVIDIA Management Library) loads `libnvidia-ml.so` at runtime without linking libudev.
@@ -41,12 +48,15 @@ in-process SNN it used to step was removed in RM-1143. Build with a plain
 
 ### Interfaces (used for end-to-end testing)
 
-- No control/query IPC surface currently — the prior UDP protocol
-  (`Stimuli`/`LearningReward`/`GetNeuroState`) was removed in RM-1143 along
-  with the in-process SNN it existed to drive. See [`docs/ipc.md`](docs/ipc.md)
-  for the removal note and the planned `corpus-ipc`-based replacement.
-- Prometheus metrics on `http://localhost:9000/metrics` (bind IP (Internet Protocol) configurable via --metrics-ip).
-- Binds on startup, so only one instance can run at a time.
+- Sensory publish: fire-and-forget UDP `IpcMessage::Stimuli` JSON to
+  `127.0.0.1:9900` by default (`--ipc-endpoint`). This is not a control/query
+  surface — the retired UDP protocol (`Stimuli`/`LearningReward`/`GetNeuroState`)
+  was removed in RM-1143. See [`docs/ipc.md`](docs/ipc.md).
+- Binds the Prometheus exporter on startup, so only one instance can run at a time.
+- Frozen hardware-telemetry CSV interchange (corinth ingest):
+  `timestamp_ms,gpu_temp_c,gpu_power_w,cpu_tctl_c,cpu_package_power_w`.
+  Reader/validator: `thalamic_relay::telemetry_csv` /
+  [`docs/telemetry_csv.md`](docs/telemetry_csv.md). Do not change that schema.
 
 ### Responding to automated PR review bots
 
@@ -59,6 +69,14 @@ a short reply explaining why) on anything already handled, restated, or
 wrong, and don't let a "fix" overstate a guarantee the code doesn't actually
 provide. See `CLAUDE.md` for more detail and the concrete lessons from PR
 #38 (`docs/ipc.md`).
+
+## Packaging
+
+`Cargo.toml` uses an `include` allowlist for crates.io. Do not add
+contributor-only files (`AGENTS.md`, `CLAUDE.md`, `REVIEW.md`, CI, local
+tool configs) to `include`. After changing packaged paths, run
+`cargo package --list` and `cargo publish --dry-run --locked`. Never run the
+real `cargo publish` without explicit maintainer approval (#44 / #48).
 
 ## Boundaries
 
