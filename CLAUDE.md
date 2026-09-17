@@ -24,7 +24,9 @@ cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-Requires Rust edition 2024, MSRV 1.98.1. No sibling path dependencies — a
+**Edition** is Rust 2024 (rustc/Cargo ≥ 1.85 to parse the manifest). **MSRV** is
+1.98.1 (`package.rust-version`; authoritative). CI installs exactly that
+toolchain; `rust-toolchain.toml` must match. No sibling path dependencies — a
 plain `cargo build` from the repo root is sufficient. CI also qualifies
 packaging (`cargo package --locked`, packaged-source tests, token-free
 `cargo publish --dry-run --locked`) and rustdoc with warnings denied.

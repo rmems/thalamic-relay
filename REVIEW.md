@@ -178,9 +178,11 @@ cargo run -- --step-interval-ms 50           # faster tick interval
 
 ## CI Checks
 
-The CI workflow (`.github/workflows/ci.yml`) installs the declared
-`package.rust-version` (currently 1.98.1) and runs three jobs. None of them
-perform a real `cargo publish`. `cargo-semver-checks` is deferred until a
+The CI workflow (`.github/workflows/ci.yml`) reads `package.rust-version`
+from `Cargo.toml` (currently 1.98.1) and installs **that** toolchain. It
+asserts `rustc` and `rust-toolchain.toml` `channel` equal the declared MSRV.
+Edition 2024 is independent of that pin (usable since rustc 1.85). None of the
+jobs perform a real `cargo publish`. `cargo-semver-checks` is deferred until a
 crates.io API baseline exists (GH#45).
 
 **Build & Test**

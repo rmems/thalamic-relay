@@ -18,10 +18,15 @@ in-process SNN it used to step was removed in RM-1143. Build with a plain
 
 ### Toolchain / system deps
 
-- Requires Rust edition 2024 with MSRV 1.98.1 (toolchain >= 1.98.1; `u64::is_multiple_of` and
-  clippy lints are used in CI; stable is set as the rustup default in this
-  environment). `cargo`/`cargo build`/`cargo test`/`cargo clippy` all work from
-  `/workspace`. CI also runs exact-MSRV tests, `RUSTDOCFLAGS="-D warnings" cargo doc`,
+- **Edition vs MSRV (do not conflate):** `edition = "2024"` needs rustc/Cargo ≥ 1.85
+  to parse the manifest. The **MSRV** is `package.rust-version = "1.98.1"` in
+  `Cargo.toml` (authoritative policy pin; CI installs exactly that string).
+  `rust-toolchain.toml` must match it so local and Cloud rustup do not keep an
+  older default (this image has shipped rustc 1.83, which cannot parse edition
+  2024 until rustup installs 1.98.1). Language features in tree do not require
+  1.98: `u64::is_multiple_of` is 1.87, let-chains (`&& let`) need 1.88 + 2024.
+  After the toolchain is installed, `cargo`/`cargo build`/`cargo test`/
+  `cargo clippy` work from `/workspace`. CI also runs exact-MSRV tests, `RUSTDOCFLAGS="-D warnings" cargo doc`,
   `cargo package --locked`, a packaged-source smoke test, and
   `cargo publish --dry-run --locked`. Real `cargo publish` is not automated.
 - `pkg-config` may be used by native dependencies. `libudev-dev` is no longer

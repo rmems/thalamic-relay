@@ -84,7 +84,8 @@ no authority to override Thalamic hard-safety.
 
 ### Prerequisites
 
-- Rust 2024 edition (MSRV 1.98.1)
+- **Edition:** Rust 2024 (requires rustc/Cargo ≥ 1.85 to parse `edition = "2024"`)
+- **MSRV:** 1.98.1 (`package.rust-version` in `Cargo.toml` is authoritative; CI installs exactly that toolchain). Edition and MSRV are not the same number: 2024 became usable in 1.85, while this crate’s declared floor is the policy pin 1.98.1.
 - `pkg-config` (used by some native dependencies)
 - Linux operating system (tested on Linux)
 - Optional: an NVIDIA GPU with NVML support
