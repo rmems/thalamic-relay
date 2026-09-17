@@ -16,7 +16,7 @@ use crate::safety::{SafetyMachine, SafetySnapshot};
 use crate::telemetry::{
     SampleValidity, SensoryMapping, TelemetryFrame, TelemetrySource, UnixMillis,
 };
-use corpus_ipc::{BatchMetadata, IpcMessage, StimulusBatch};
+use corpus_ipc::{BatchMetadata, IpcMessage, StimulusBatch, Validate};
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
@@ -182,7 +182,7 @@ impl SensoryPublisher for CorpusIpcPublisher {
         let batch_id = self.batch_id.fetch_add(1, Ordering::Relaxed);
         let batch = mapping_to_stimulus_batch(mapping, self.session_id.clone(), batch_id);
         if let Err(err) = batch.validate() {
-            return Err(PublishError::SendFailed(err));
+            return Err(PublishError::SendFailed(err.to_string()));
         }
         self.queue.try_enqueue(IpcMessage::Stimuli(batch))
     }
