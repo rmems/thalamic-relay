@@ -81,7 +81,8 @@ the corresponding `values[i]` is the corpus-ipc placeholder `0.0` and is
 `mem_util_pct = 0.0` while `Valid`) has `valid_mask[i] = true`.
 
 `timestamp` is unix nanoseconds (Thalamic's unix-ms `observed_at` × 1e6).
-`batch_id` increments per successful enqueue. `session_id` comes from
+`batch_id` is allocated per publish attempt before validation and queue
+admission; rejected attempts can leave gaps. `session_id` comes from
 `--ipc-session-id` / `THALAMIC_IPC_SESSION_ID` (default `thalamic-relay`).
 
 Channel order is the GH#41 runtime-input inventory (no observability filler):

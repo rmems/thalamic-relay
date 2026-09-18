@@ -388,6 +388,7 @@ struct QueueInner<T> {
     capacity: usize,
     policy: QueueFullPolicy,
     connected: bool,
+    producers: usize,
     enqueued_total: u64,
     dropped_by_reason: [u64; DropReason::ALL.len()],
 }
@@ -423,9 +424,29 @@ impl<T> QueueInner<T> {
 ///
 /// The safety supervisor uses [`Self::try_enqueue`] (never wait). A slow or
 /// missing consumer cannot stall evaluation. Depth is always `<= capacity`.
-#[derive(Debug, Clone)]
+/// Dropping the last producer lets a drain worker exit after remaining frames.
+#[derive(Debug)]
 pub struct IsolatedPublishQueue<T> {
     inner: Arc<Mutex<QueueInner<T>>>,
+}
+
+impl<T> Clone for IsolatedPublishQueue<T> {
+    fn clone(&self) -> Self {
+        let mut inner = self.inner.lock().expect("sensory queue mutex poisoned");
+        inner.producers = inner.producers.saturating_add(1);
+        drop(inner);
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<T> Drop for IsolatedPublishQueue<T> {
+    fn drop(&mut self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.producers = inner.producers.saturating_sub(1);
+        }
+    }
 }
 
 /// Receiving end of [`IsolatedPublishQueue`]. Dropping it marks the queue
@@ -447,6 +468,7 @@ impl<T: Send> IsolatedPublishQueue<T> {
             capacity: config.capacity(),
             policy: config.policy(),
             connected: true,
+            producers: 1,
             enqueued_total: 0,
             dropped_by_reason: [0; DropReason::ALL.len()],
         }));
@@ -528,6 +550,22 @@ impl<T> SensoryQueueConsumer<T> {
         let item = inner.buf.pop_front();
         inner.emit_gauges();
         item
+    }
+
+    fn producers_gone(&self) -> bool {
+        self.inner
+            .lock()
+            .map(|inner| inner.producers == 0)
+            .unwrap_or(true)
+    }
+
+    fn record_loss(&self, reason: DropReason) {
+        let Ok(mut inner) = self.inner.lock() else {
+            record_drop(reason);
+            return;
+        };
+        inner.record_drop(reason);
+        inner.emit_gauges();
     }
 }
 
@@ -613,6 +651,7 @@ impl SensoryPublisher for CorpusIpcPublisher {
         let batch_id = self.batch_id.fetch_add(1, Ordering::Relaxed);
         let batch = mapping_to_stimulus_batch(mapping, self.session_id.clone(), batch_id);
         if let Err(err) = batch.validate() {
+            record_drop(DropReason::SendFailed);
             return Err(PublishError::SendFailed(err.to_string()));
         }
         self.queue.try_enqueue(IpcMessage::Stimuli(batch))
@@ -628,20 +667,28 @@ fn local_bind_for(dest: SocketAddr) -> SocketAddr {
 
 fn run_udp_worker(consumer: SensoryQueueConsumer<IpcMessage>, socket: UdpSocket, dest: SocketAddr) {
     loop {
-        let Some(msg) = consumer.try_recv() else {
-            thread::sleep(Duration::from_millis(1));
-            continue;
-        };
-        let Ok(bytes) = serde_json::to_vec(&msg) else {
-            tracing::debug!("corpus-ipc: failed to serialize IpcMessage; dropping frame");
-            continue;
-        };
-        match socket.send_to(&bytes, dest) {
-            Ok(_) => {}
-            Err(err) => {
-                tracing::debug!("corpus-ipc: UDP send failed ({err}); dropping frame");
-            }
+        match consumer.try_recv() {
+            Some(msg) => send_dequeued_message(&consumer, &socket, dest, &msg),
+            None if consumer.producers_gone() => break,
+            None => thread::sleep(Duration::from_millis(1)),
         }
+    }
+}
+
+fn send_dequeued_message(
+    consumer: &SensoryQueueConsumer<IpcMessage>,
+    socket: &UdpSocket,
+    dest: SocketAddr,
+    msg: &IpcMessage,
+) {
+    let Ok(bytes) = serde_json::to_vec(msg) else {
+        tracing::debug!("corpus-ipc: failed to serialize IpcMessage; dropping frame");
+        consumer.record_loss(DropReason::SendFailed);
+        return;
+    };
+    if let Err(err) = socket.send_to(&bytes, dest) {
+        tracing::debug!("corpus-ipc: UDP send failed ({err}); dropping frame");
+        consumer.record_loss(DropReason::SendFailed);
     }
 }
 
@@ -1326,5 +1373,67 @@ mod tests {
             crate::telemetry::TelemetrySource::Nvml
         );
         assert!(consumer.try_recv().is_none());
+    }
+
+    #[test]
+    fn last_producer_drop_marks_queue_closed_for_worker() {
+        let (queue, consumer) = IsolatedPublishQueue::<SensoryMapping>::bounded(1).unwrap();
+        let clone = queue.clone();
+        assert!(!consumer.producers_gone());
+        drop(queue);
+        assert!(!consumer.producers_gone());
+        drop(clone);
+        assert!(consumer.producers_gone());
+    }
+
+    #[test]
+    fn corpus_ipc_publisher_records_send_failed_on_invalid_batch() {
+        let oversized = "x".repeat(1025);
+        let (publisher, _consumer) =
+            CorpusIpcPublisher::channel(Some(oversized), QueueConfig::default())
+                .expect("valid queue config");
+        let err = publisher
+            .try_publish(&mapping_at_now(&healthy_frame()))
+            .unwrap_err();
+        assert!(
+            matches!(err, PublishError::SendFailed(_)),
+            "expected SendFailed, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn udp_worker_records_send_failed_and_exits_when_producers_drop() {
+        let dest: SocketAddr = "255.255.255.255:9".parse().expect("broadcast destination");
+        let socket = UdpSocket::bind("0.0.0.0:0").expect("bind ephemeral UDP socket");
+        socket.set_nonblocking(true).unwrap();
+        let (queue, consumer) =
+            IsolatedPublishQueue::<IpcMessage>::new(QueueConfig::default()).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            run_udp_worker(consumer, socket, dest);
+            let _ = done_tx.send(());
+        });
+
+        let mapping = mapping_at_now(&healthy_frame());
+        queue
+            .try_enqueue(mapping_to_ipc_message(&mapping, Some("sess".into()), 1))
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        loop {
+            if queue.snapshot().dropped(DropReason::SendFailed) >= 1 {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "worker did not record send_failed"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        drop(queue);
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker should exit after the last producer drops");
     }
 }

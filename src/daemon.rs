@@ -117,7 +117,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if cli.force_software_only {
         println!("[relay] running in software-only mode (forced via --force-software-only)");
     } else {
-        println!("[relay] running in software-only mode (no FPGA/silicon-bridge)");
+        println!("[relay] NVML telemetry and actuation enabled; FPGA/silicon-bridge unavailable");
     }
 
     let mut step_count: u64 = 0;
