@@ -1,0 +1,35 @@
+src/daemon.rs
+  s_7908480f6caa81::t_c631108a1aa109 120
+REVIEW.md
+  s_7908480f6caa81::t_63aec8dda53eba 126-131
+  s_7908480f6caa81::t_48c8943a809c9d 139-143
+docs/ipc.md
+  s_7908480f6caa81::t_2e5770edb06153 84-85
+src/publish.rs
+  s_7908480f6caa81::t_ef300ff22610fe 554-569
+  s_7908480f6caa81::t_c5fe1e1f67b11d 670-673,678-691
+  s_7908480f6caa81::t_1967c5055d97d8 427
+  s_7908480f6caa81::t_739e12200b04bc 391
+  s_7908480f6caa81::t_bc226706badf9f 654
+  s_7908480f6caa81::t_b90b8043bf3caa 428,433-449
+  s_7908480f6caa81::t_2d01841982bd7f 1377-1438
+  s_7908480f6caa81::t_0d708ed501c695 471
+CHANGELOG.md
+  s_7908480f6caa81::t_4d019494809a47 10
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "903527c6d33567c32bc3b4342a19fd523ceac025",
+  "prompts": {},
+  "sessions": {
+    "s_7908480f6caa81": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "5495605a-b520-4c82-acf0-b69d7764a9a4",
+        "model": "grok-4.6"
+      },
+      "human_author": "Raul Cardenas Montoya <montoyaraul34@gmail.com>"
+    }
+  }
+}
