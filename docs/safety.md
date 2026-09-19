@@ -11,7 +11,10 @@ brake.
 
 Privileged `nvidia-smi` actuation stays in private `src/gpu.rs` (used only by
 the `thalamic-relay` executable). The state machine in `src/safety.rs` only
-emits **intents**; hardware side effects go through [`SafetyActuator`].
+emits **intents**; hardware side effects go through [`SafetyActuator`]
+(`NvmlActuator` in production, `FakeActuator` in tests). Apply/release is
+best-effort and requires Linux, NVML, and passwordless `sudo -n nvidia-smi`
+(see the crate README).
 
 ## Ownership
 

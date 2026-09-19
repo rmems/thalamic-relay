@@ -1,6 +1,8 @@
 //! Prometheus / tracing init and scrape-time gauges for the supervisor.
 //!
 //! Crate-private process plumbing: not part of the public `thalamic_relay` API.
+//! This module does not evaluate safety policy and does not publish sensory
+//! frames. Binding the metrics listener is a process-global side effect.
 
 use metrics::{counter, gauge};
 use metrics_exporter_prometheus::PrometheusBuilder;
@@ -21,11 +23,16 @@ use crate::time::freshness_seconds_monotonic;
 /// never from source wall time.
 #[derive(Debug, Clone)]
 pub struct RelayMetrics {
+    /// Unix-ms timestamp of the last assessed frame, if any.
     pub telemetry_acquired_at: Option<UnixMillis>,
     pub telemetry_received_instant: Option<Instant>,
+    /// Reported safety state (actuator-failure overlay included).
     pub safety_state: SafetyState,
+    /// Policy classification before the actuator-failure overlay.
     pub policy_state: SafetyState,
+    /// Last successful brake apply still claimed by the machine.
     pub brake_engaged: bool,
+    /// Consecutive real Ok evaluations while the brake is engaged.
     pub hysteresis_ok_count: u32,
     pub shutdown_reason: Option<&'static str>,
     pub shutdown_unresolved_brake: bool,

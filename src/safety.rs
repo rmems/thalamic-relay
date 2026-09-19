@@ -7,7 +7,8 @@
 //! through [`SafetyActuator`]; sensory publication lives in [`crate::publish`]
 //! and must never be awaited on this path.
 //!
-//! Transition rules: [`docs/safety.md`](../../docs/safety.md).
+//! Named states and hysteresis are documented in the repository file
+//! `docs/safety.md`. This machine does not run neural computation.
 
 use crate::telemetry::{SampleValidity, TelemetryFrame, TelemetrySample, TelemetrySource};
 use std::sync::Mutex;

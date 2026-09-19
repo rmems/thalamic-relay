@@ -1,4 +1,4 @@
-//! Hardware Bridge — GPU telemetry acquisition & privileged NVML actuation.
+//! GPU telemetry acquisition and privileged NVML / `nvidia-smi` actuation.
 //!
 //! Crate-private: the `thalamic-relay` executable uses this adapter; it is not
 //! public library API.
@@ -6,13 +6,17 @@
 //! Raw NVML acquisition lives on [`HardwareBridge`]; the `nvidia-smi`
 //! brake/release backend lives on [`NvmlActuator`]. Validation, normalization,
 //! freshness, and provenance live in [`crate::telemetry`]. Deterministic safety
-//! classification, hysteresis, and the [`SafetyActuator`] boundary live in
-//! [`crate::safety`].
+//! classification, hysteresis, and the [`crate::safety::SafetyActuator`]
+//! boundary live in [`crate::safety`].
 //!
-//! [`NvmlActuator`] is a hardware *adapter*: it implements [`SafetyActuator`]
-//! against NVML / `nvidia-smi`, but defines none of the generic safety
-//! semantics (thresholds, hysteresis, fail-closed policy) — those belong to
-//! [`crate::safety`].
+//! [`NvmlActuator`] is a hardware *adapter*: it implements
+//! [`crate::safety::SafetyActuator`] against NVML / `nvidia-smi`, but defines
+//! none of the generic safety semantics (thresholds, hysteresis, fail-closed
+//! policy) — those belong to [`crate::safety`].
+//!
+//! Apply/release uses `sudo -n nvidia-smi -pl` (passwordless sudo, Linux).
+//! Acquisition without `--force-software-only` that cannot open NVML is
+//! [`crate::telemetry::TelemetrySource::NvmlUnavailable`], not simulated idle.
 
 use crate::safety::{ActuatorError, SafetyActuator};
 #[cfg(test)]
@@ -33,6 +37,12 @@ lazy_static! {
 
 // ── Hardware Bridge ─────────────────────────────────────────────────
 
+/// GPU telemetry acquisition facade (NVML + software-fallback / unavailable).
+///
+/// This type does **not** run inference or own neural state. It only reads
+/// sensors (or documented estimates) and forwards frames to
+/// [`crate::telemetry`] validation. Privileged power-limit mutation lives on
+/// [`NvmlActuator`].
 pub struct HardwareBridge;
 
 impl HardwareBridge {
@@ -160,6 +170,10 @@ impl HardwareBridge {
 pub struct NvmlActuator;
 
 impl NvmlActuator {
+    /// Construct the NVML / `nvidia-smi` actuator adapter.
+    ///
+    /// Construction does not open a device. Apply/release still require a live
+    /// NVIDIA GPU and passwordless `sudo -n nvidia-smi` (see crate-level docs).
     #[must_use]
     pub fn new() -> Self {
         Self

@@ -111,8 +111,10 @@ classified **both**. Thermal (85 °C critical / 75 °C warn) and power (350 W
 critical / 300 W warn) thresholds are safety *policy* (#47 will make them
 configurable) and are **not** the sensor engineering range.
 
-`vddcr_gfx_v` is not an NVML voltage sensor. It is derived from board power
-for observability and is omitted from the sensory mapping (no filler rails).
+`vddcr_gfx_v` is not an NVML voltage sensor. The identifier is historical
+(AMD `VDDCR_GFX` rail naming). It is derived from board power for
+observability and is omitted from the sensory mapping (no fabricated extra
+signals).
 
 `vram_temp_c` is not fabricated as `gpu_temp + 8`. `nvml-wrapper` 0.10 only
 exposes `TemperatureSensor::Gpu`, so VRAM temperature is `Missing` until a
@@ -125,10 +127,11 @@ future adapter can read it.
   thresholds because provenance says there is no real GPU to protect.
   `NvmlUnavailable` does **not** skip: missing safety samples are Critical.
 - **Runtime-input candidates**: `gpu_temp_c`, `power_w`, `gpu_clock_mhz`,
-  `mem_util_pct`. These are the only channels in `SensoryMapping`.
+  `mem_util_pct`. These are the only channels in `SensoryMapping` (a mapping
+  hook, not a live Brainstem feed).
 - **Observability-only**: `vram_temp_c`, `vddcr_gfx_v`, `mem_clock_mhz`,
   `fan_speed_pct`. Present in `ObservabilitySnapshot` with raw values even
-  when invalid; never used as silent model-input zeros.
+  when invalid; never used as silent sensory-mapping zeros.
 
 A legitimate zero (for example `mem_util_pct = 0.0` while `Valid`) is
 distinct from missing (`value = None`, `validity = Missing`).
@@ -150,10 +153,12 @@ fail-closes. This is not software-only confirmation.
 `MappedStimulus` with `session_id`, `batch_id`, source vs receive vs emit
 timestamps, source-time status, acquisition source, validity (re-evaluated
 at `now`), raw engineering value, normalized `[0, 1]` (only when `Valid`
-at `now`), `stale_after_ms`, and the actual `cadence_ms`. `src/publish.rs` (#40)
-maps this into published `corpus-ipc` `StimulusBatch` / `IpcMessage::Stimuli`
-off the safety path. `telemetry` does not depend on `corpus-ipc` and does not
-duplicate the wire schema.
+at `now`), `stale_after_ms`, and the actual `cadence_ms`. The type name
+`MappedStimulus` is historical (retired UDP `Stimuli` protocol); it is
+**not** a neural stimulus and Thalamic does not run an SNN. `src/publish.rs`
+(#40) maps this into published `corpus-ipc` `StimulusBatch` /
+`IpcMessage::Stimuli` off the safety path. `telemetry` does not depend on
+`corpus-ipc` and does not duplicate the wire schema.
 
 ## Fixtures
 

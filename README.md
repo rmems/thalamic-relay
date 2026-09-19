@@ -35,9 +35,6 @@ pre-1.0 crate: the library API is intentional, not frozen.
 
 ## Overview
 
-Thalamic Relay is the hardware-facing **sensory + deterministic safety**
-process for the Spikenaut runtime stack:
-
 ```text
 hardware telemetry
       ↓
@@ -56,20 +53,48 @@ brainstem-daemon
   - tick loop
 ```
 
-It collects GPU telemetry, runs deterministic thermal/power safety
-checks, and exposes observability over Prometheus metrics. It does **not**
-run any neural computation itself — that lives in `brainstem-daemon`. The
-relay is platform-agnostic: it degrades gracefully to a software-only mode
-when no GPU is present, and **hardware safety is an isolated failure domain**:
-it keeps evaluating with `brainstem-daemon` absent or crashed, and IPC
-send/disconnect/slow-consumer cannot stall the safety loop. Brainstem has
-no authority to override Thalamic hard-safety.
+Hardware safety is an isolated failure domain: it keeps evaluating with
+`brainstem-daemon` absent or crashed, and a missing/slow publisher cannot
+stall the safety loop. Brainstem has no authority to override Thalamic
+hard-safety.
+
+## Software-only versus real hardware
+
+| Provenance | How you get it | What the numbers are | Safety |
+| --- | --- | --- | --- |
+| `TelemetrySource::Nvml` | Live NVIDIA device via NVML | Real sensors | Thresholds apply; missing/stale/invalid **fail closed** |
+| `TelemetrySource::SoftwareFallback` | `--force-software-only` **only** | Documented idle **estimates** | `simulated_software_only`; does **not** apply a new brake |
+| `TelemetrySource::NvmlUnavailable` | NVML/driver/device lookup failed without that flag | Every channel **missing** | **Fail closed** (not simulated) |
+
+Simulated idle is never inferred from magic numbers such as
+`temperature <= 0 && power <= 25`. `--force-software-only` is the only
+simulated path. Running the daemon without a GPU and without that flag is
+**not** software-only: it is `NvmlUnavailable` and fail-closes.
+
+## GPU power-limit actuation (privileges)
+
+Policy (`SafetyMachine`) is deterministic and unprivileged. Applying or
+releasing a brake is a best-effort Linux side effect:
+
+`timeout -k 2 5s sudo -n nvidia-smi -pl <watts>`
+
+That requires:
+
+- Linux
+- a working NVIDIA driver and NVML (`libnvidia-ml.so`)
+- **passwordless sudo** for `nvidia-smi` (`sudo -n`; a password prompt is a
+  failure, not a hang — the command is non-interactive)
+
+Without those, actuation returns `ActuatorError` and the machine records
+`actuator_failure` while continuing to evaluate. A fail-closed *intent* does
+not guarantee the board power limit changed. This is not a substitute for GPU
+firmware thermal protection.
 
 ## Features
 
-- **GPU Telemetry**: Real-time monitoring of GPU sensors via NVML (temperature,
-  power, clocks, fan, utilization) with an explicit software-fallback
-  provenance tag — missing sensors stay absent (`None`), never a silent `0.0`
+- **GPU Telemetry**: NVML sensors (temperature, power, clocks, fan,
+  utilization) with explicit provenance — missing sensors stay absent
+  (`None`), never a silent `0.0`
 - **Deterministic Hardware Safety**: Isolated state machine (healthy-real,
   warning, critical/braked, recovering/hysteresis, telemetry
   missing/stale/invalid, simulated/software-only, actuator-failure) with
@@ -90,6 +115,8 @@ no authority to override Thalamic hard-safety.
 - `pkg-config` (used by some native dependencies)
 - Linux operating system (tested on Linux)
 - Optional: an NVIDIA GPU with NVML support
+- Optional, for actual power-limit actuation: passwordless `sudo` for
+  `nvidia-smi`
 
 ### Build
 
@@ -97,18 +124,23 @@ no authority to override Thalamic hard-safety.
 cargo build --release
 ```
 
-### Run
+### Run the daemon
 
 ```bash
 cargo run --bin thalamic-relay
 ```
 
+Force documented idle estimates (no NVML attempt):
+
+```bash
+cargo run --bin thalamic-relay -- --force-software-only
+```
+
 ## Usage
 
-The relay runs in software-only mode and continuously monitors GPU telemetry
-and hardware safety when available.
-
-While running it exposes (address configurable via CLI/env; see Configuration):
+The daemon acquires telemetry on `--step-interval-ms` (default 100 ms) and
+evaluates safety on a ~1 s cadence. While running it exposes (address
+configurable via CLI/env; see Configuration):
 
 - **Prometheus metrics** on `http://localhost:9000/metrics` (bind IP configurable via --metrics-ip)
 - **corpus-ipc sensory publish** on UDP `127.0.0.1:9900` by default (`--ipc-endpoint`): fire-and-forget `IpcMessage::Stimuli` JSON. This is not a control/query socket and is not the retired neural UDP protocol; see [`docs/ipc.md`](docs/ipc.md).
@@ -141,12 +173,22 @@ brainstem-daemon
 
 | Owner | Guarantees |
 | --- | --- |
-| **Thalamic** | Hardware telemetry contract; fail-closed protection on missing/stale/invalid telemetry; brake apply/release; observable safety/brake state **without** querying neural state; continues with Brainstem absent |
-| **Brainstem** | SNN execution, neural state, reward/plasticity. Consumes sensory mappings if transport exists. **Cannot** inhibit or override the Thalamic brake |
+| **Thalamic** | Hardware telemetry contract; fail-closed **intent** on missing/stale/invalid telemetry; brake apply/release **attempts**; observable safety/brake state **without** querying neural state; continues with Brainstem absent |
+| **Brainstem** | SNN execution, neural state, reward/plasticity. Consumes sensory mappings over corpus-ipc UDP. **Cannot** inhibit or override the Thalamic brake |
 | **corpus-ipc** | Transport only. Send failure is not a safety pause |
 
 See [`docs/safety.md`](docs/safety.md) for named states and hysteresis
 rules, and [`docs/telemetry.md`](docs/telemetry.md) for the sample contract.
+
+### Deterministic versus best-effort
+
+**Deterministic** (pure; GPU-less testable): `assess` / `TelemetryFrame`,
+freshness/validity/normalization, `to_sensory_mapping_at`,
+`SafetyMachine::evaluate`.
+
+**Best-effort** (can fail or time out): NVML acquisition, `nvidia-smi`
+liveness, privileged power-limit apply/release, leftover-brake detection,
+Prometheus, best-effort sensory publication.
 
 ### Public library modules
 
@@ -184,7 +226,8 @@ actuation, Prometheus initialization, CLI, process lock, supervisor loop, SIGINT
 
 ## Configuration
 
-The relay supports CLI flags **and** environment variables (clap derive + "env" feature; added for #11). Defaults preserve prior hardcoded behavior.
+The daemon supports CLI flags **and** environment variables (clap derive +
+"env" feature). Defaults preserve prior hardcoded behavior.
 
 Run `thalamic-relay --help` (or `-V`) for the full documented surface.
 
@@ -212,8 +255,8 @@ THALAMIC_METRICS_IP=0.0.0.0 \
 
 ### Prometheus Metrics
 
-The relay exports metrics compatible with Prometheus monitoring. Safety
-state is observable here; there is no neural-state query:
+The daemon exports metrics compatible with Prometheus. Safety state is
+observable here; there is no neural-state query:
 
 - `telemetry_freshness_s` — sample age at scrape time (monotonic receive instant, not source wall time)
 - `safety_state{state=...}` / `safety_state_id` — current named safety state
@@ -241,7 +284,7 @@ Structured logging via `tracing` with configurable output levels.
 - **Instance Protection**: Lockfile mechanism prevents multiple relay instances (lock acquired before port binding)
 - **Independent safety loop**: `SafetyMachine::evaluate` has no publisher argument and is not awaited on IPC. Production uses `CorpusIpcPublisher` (bounded `IsolatedPublishQueue` enqueue with explicit full-queue policy + detached UDP worker). `--ipc-disabled` or a bind failure falls back to `AbsentPublisher`.
 - **GPU Safety Monitoring**: Safety cadence every ~1 second (every 10 ticks); named states for healthy-real, warning, critical/braked, recovering, missing/stale/invalid, simulated, actuator-failure
-- **Emergency Brakes**: Automatically throttles GPU power limit to 50% via `nvidia-smi -pl` on fail-closed or critical; 3 consecutive real Ok readings to release; warn immediately after release re-applies
+- **Emergency Brakes**: Automatically throttles GPU power limit to 50% via `nvidia-smi -pl` on fail-closed or critical **when actuation succeeds**; 3 consecutive real Ok readings to release; warn immediately after release re-applies
 - **Fail-closed shutdown / restart**: Ctrl-C and SIGTERM stop the run loop, join background tasks with a timeout, and release `/tmp/thalamic_relay.lock`. Shutdown **does not** restore the default GPU power limit. A persistent relay-owned brake (current PL matching the 50% target) is adopted on the next start and released only through the same Ok-streak hysteresis. An operator-configured sub-default cap is left unchanged. Simulated/software-only telemetry cannot authorize release of a real brake. SIGKILL/power loss have no cleanup promise.
 - **Graceful Degradation**: Continues in software-only mode when
   `--force-software-only` is set (`TelemetrySource::SoftwareFallback`).
@@ -269,7 +312,7 @@ corinth will read. The CSV schema is frozen; do not add columns.
 | `gpu_temp_c`, `power_w` | safety + runtime-input | Missing/invalid/stale fail closed |
 | `gpu_clock_mhz`, `mem_util_pct` | runtime-input | Sensory mapping → `StimulusBatch` |
 | `vram_temp_c`, `mem_clock_mhz`, `fan_speed_pct` | observability-only | Raw preserved; not model input |
-| `vddcr_gfx_v` | observability-only (derived) | Estimated from power; not an NVML voltage sensor |
+| `vddcr_gfx_v` | observability-only (derived) | Historical GFX-rail name; estimated from power; not an NVML voltage sensor |
 
 A legitimate zero (for example 0% memory utilization) is distinct from a
 missing sensor. Simulated idle estimates are tagged
@@ -309,7 +352,8 @@ coding standards and include appropriate tests.
 ## Releasing
 
 This crate is not yet published to crates.io. The first intended registry
-release is `0.2.0` and is gated on the publication epic (#44); do **not** run
+release is `0.2.0` and is gated on the publication epic
+([GH#44](https://github.com/rmems/thalamic-relay/issues/44)); do **not** run
 the real `cargo publish` without explicit maintainer approval. Packaging
 hygiene for that gate is `cargo package --locked` and
 `cargo publish --dry-run --locked` from a clean checkout.
@@ -325,6 +369,7 @@ To cut a tag and GitHub Release for a `0.1.x` patch:
    cargo fmt --check
    cargo clippy --all-targets --all-features -- -D warnings
    cargo test --all-features
+   RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
    cargo build --release
    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
    cargo package --locked
@@ -346,9 +391,12 @@ For a hotfix, bump the patch version in `Cargo.toml` (e.g. `0.1.1`) and use the 
 
 ### Common Issues
 
-1. **Telemetry**: GPU access requires NVML; runs without it in software mode.
-2. **GPU Access**: Verify NVML installation and proper permissions
-3. **Instance Conflicts**: Check for an existing relay process holding the lockfile
+1. **Telemetry**: GPU access requires NVML. Without `--force-software-only`,
+   a missing GPU is `NvmlUnavailable` (fail-closed), not simulated idle.
+2. **GPU Access**: Verify NVML installation and proper permissions.
+3. **Brake actuation**: Requires passwordless `sudo -n nvidia-smi`. Failures
+   are `ActuatorError` / `actuator_failure`, not a frozen safety loop.
+4. **Instance Conflicts**: Check for an existing relay process holding the lockfile
    at `/tmp/thalamic_relay.lock`
 
 ### Debug Mode
