@@ -47,6 +47,9 @@ pub enum PublishError {
 }
 
 /// Best-effort sensory publisher. Must not block the safety loop.
+///
+/// There is currently no `corpus-ipc` implementation of this trait in-tree.
+/// Production uses [`AbsentPublisher`].
 pub trait SensoryPublisher: Send + Sync {
     /// Attempt to publish `mapping` without waiting on a consumer.
     ///

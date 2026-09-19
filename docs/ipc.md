@@ -6,7 +6,10 @@ retired UDP **control** surface (`Stimuli` / `LearningReward` / `GetNeuroState`
 at `127.0.0.1:9898`) is gone. That protocol existed only to drive and query the
 relay's own SNN.
 
-Thalamic is a sensory + hardware-safety relay. It publishes validated,
+Thalamic is a sensory + hardware-safety relay: it collects, validates,
+and safety-gates GPU telemetry, independent of whether any downstream neural
+runtime (`brainstem-daemon`) is present. Safety evaluation is documented in
+[`docs/safety.md`](safety.md) and does not wait on this transport. It publishes validated,
 normalized runtime-input channels to Brainstem as canonical
 [`corpus-ipc`](https://github.com/Limen-Neural/corpus-ipc) `IpcMessage`
 values ([GH#40](https://github.com/rmems/thalamic-relay/issues/40) /
