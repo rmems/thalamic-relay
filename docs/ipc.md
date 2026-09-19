@@ -28,10 +28,14 @@ corpus-ipc `StimulusBatch`, source wall time is preserved separately from
 receive/emit time, and a restart is a new `session_id` with `batch_id`
 reset to 0. `TelemetryFrame::to_sensory_mapping()` is the
 deterministic mapping surface toward `corpus-ipc`; it is **not** a second
-wire schema. `publish` maps that into `corpus_ipc::StimulusBatch` and sends
-`IpcMessage::Stimuli` via `CorpusIpcPublisher`, using `AbsentPublisher` or
-`IsolatedPublishQueue` off the safety path so transport failures never stall
-`SafetyMachine::evaluate`.
+wire schema and does not implement transport. `publish` maps that into
+`corpus_ipc::StimulusBatch` and sends `IpcMessage::Stimuli` via
+`CorpusIpcPublisher`: a bounded `IsolatedPublishQueue` (capacity finite and
+configurable, full-queue policy explicit `drop-oldest` or `reject-newest`,
+overflow visible on Prometheus) feeding a detached UDP worker.
+`AbsentPublisher` remains the GH#42 isolation stub for “no consumer at all”.
+A stalled consumer, full queue, or missing drain cannot stall the safety
+loop, and transport failures never stall `SafetyMachine::evaluate`.
 
 ## Ownership
 
@@ -80,7 +84,8 @@ the corresponding `values[i]` is the corpus-ipc placeholder `0.0` and is
 `mem_util_pct = 0.0` while `Valid`) has `valid_mask[i] = true`.
 
 `timestamp` is unix nanoseconds (Thalamic's unix-ms `observed_at` × 1e6).
-`batch_id` increments per successful enqueue. `session_id` comes from
+`batch_id` is allocated per publish attempt before validation and queue
+admission; rejected attempts can leave gaps. `session_id` comes from
 `--ipc-session-id` / `THALAMIC_IPC_SESSION_ID` (default `thalamic-relay`).
 
 Channel order is the GH#41 runtime-input inventory (no observability filler):

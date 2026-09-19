@@ -13,8 +13,8 @@ use tokio::time::sleep;
 use crate::cpu::{self, RelayMetrics};
 use crate::gpu::{HardwareBridge, NvmlActuator};
 use crate::publish::{
-    AbsentPublisher, CorpusIpcPublisher, DEFAULT_IPC_ENDPOINT, DEFAULT_IPC_QUEUE_CAPACITY,
-    DEFAULT_IPC_SESSION_ID, SensoryPublisher, evaluate_then_try_publish,
+    AbsentPublisher, CorpusIpcPublisher, DEFAULT_IPC_ENDPOINT, DEFAULT_IPC_SESSION_ID, QueueConfig,
+    QueueFullPolicy, SensoryPublisher, evaluate_then_try_publish,
 };
 use crate::safety::{
     ActuatorError, ActuatorOutcome, BRAKE_FRACTION, BrakeIntent, PowerLimitObservation,
@@ -119,6 +119,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             "[relay] software-only telemetry (--force-software-only): documented idle estimates, not real GPU sensors"
         );
     } else {
+        println!("[relay] NVML telemetry and actuation enabled; FPGA/silicon-bridge unavailable");
         println!(
             "[relay] sensory + hardware-safety relay (NVML when available; NvmlUnavailable fail-closes)"
         );
@@ -429,24 +430,26 @@ fn build_publisher(cli: &Cli) -> Box<dyn SensoryPublisher> {
     } else {
         Some(cli.ipc_session_id.clone())
     };
+    let queue_config = QueueConfig::new(cli.sensory_queue_capacity, cli.sensory_queue_full_policy)
+        .expect("CLI parser already validated sensory queue capacity");
     match cli.ipc_endpoint.parse::<std::net::SocketAddr>() {
-        Ok(endpoint) => {
-            match CorpusIpcPublisher::spawn(endpoint, session_id, DEFAULT_IPC_QUEUE_CAPACITY) {
-                Ok(publisher) => {
-                    println!(
-                        "[relay] corpus-ipc: publishing IpcMessage::Stimuli to udp://{endpoint} \
-                     (best-effort; safety does not wait)"
-                    );
-                    Box::new(publisher)
-                }
-                Err(err) => {
-                    eprintln!(
-                        "[relay] corpus-ipc: publisher unavailable ({err}); continuing without Brainstem"
-                    );
-                    Box::new(AbsentPublisher)
-                }
+        Ok(endpoint) => match CorpusIpcPublisher::spawn(endpoint, session_id, queue_config) {
+            Ok(publisher) => {
+                println!(
+                    "[relay] corpus-ipc: publishing IpcMessage::Stimuli to udp://{endpoint} \
+                     (best-effort; safety does not wait; queue capacity={} policy={})",
+                    queue_config.capacity(),
+                    queue_config.policy(),
+                );
+                Box::new(publisher)
             }
-        }
+            Err(err) => {
+                eprintln!(
+                    "[relay] corpus-ipc: publisher unavailable ({err}); continuing without Brainstem"
+                );
+                Box::new(AbsentPublisher)
+            }
+        },
         Err(err) => {
             eprintln!(
                 "[relay] corpus-ipc: invalid --ipc-endpoint '{}': {err}; continuing without Brainstem",
@@ -601,6 +604,32 @@ struct Cli {
     /// Session id stamped on each `StimulusBatch` (`session_id`). Empty omits it.
     #[arg(long, default_value = DEFAULT_IPC_SESSION_ID, env = "THALAMIC_IPC_SESSION_ID")]
     ipc_session_id: String,
+
+    /// Outbound sensory-queue capacity (frames). Finite; never unbounded.
+    #[arg(
+        long,
+        default_value_t = QueueConfig::DEFAULT_CAPACITY,
+        env = "THALAMIC_SENSORY_QUEUE_CAPACITY",
+        value_parser = parse_sensory_queue_capacity
+    )]
+    sensory_queue_capacity: usize,
+
+    /// Full-queue policy: `drop-oldest` (keep newest) or `reject-newest`.
+    #[arg(
+        long,
+        default_value_t = QueueFullPolicy::DropOldest,
+        env = "THALAMIC_SENSORY_QUEUE_FULL_POLICY"
+    )]
+    sensory_queue_full_policy: QueueFullPolicy,
+}
+
+fn parse_sensory_queue_capacity(s: &str) -> Result<usize, String> {
+    let raw: u64 = s
+        .parse()
+        .map_err(|e| format!("invalid --sensory-queue-capacity: {e}"))?;
+    let capacity =
+        usize::try_from(raw).map_err(|_| "sensory-queue-capacity exceeds usize".to_string())?;
+    QueueConfig::validate_capacity(capacity).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -640,6 +669,39 @@ mod tests {
         assert_eq!(cli.ipc_endpoint, DEFAULT_IPC_ENDPOINT);
         assert!(!cli.ipc_disabled);
         assert_eq!(cli.ipc_session_id, DEFAULT_IPC_SESSION_ID);
+        assert_eq!(cli.sensory_queue_capacity, QueueConfig::DEFAULT_CAPACITY);
+        assert_eq!(cli.sensory_queue_full_policy, QueueFullPolicy::DropOldest);
+    }
+
+    #[test]
+    fn parses_sensory_queue_config() {
+        let cli = Cli::try_parse_from([
+            "thalamic-relay",
+            "--sensory-queue-capacity",
+            "8",
+            "--sensory-queue-full-policy",
+            "reject-newest",
+        ])
+        .unwrap();
+        assert_eq!(cli.sensory_queue_capacity, 8);
+        assert_eq!(cli.sensory_queue_full_policy, QueueFullPolicy::RejectNewest);
+    }
+
+    #[test]
+    fn rejects_zero_queue_capacity() {
+        assert!(Cli::try_parse_from(["thalamic-relay", "--sensory-queue-capacity", "0"]).is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_queue_policy() {
+        assert!(
+            Cli::try_parse_from([
+                "thalamic-relay",
+                "--sensory-queue-full-policy",
+                "drop-random"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

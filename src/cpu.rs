@@ -165,6 +165,8 @@ pub async fn run_metrics_collector(
             snapshot.brake_engaged,
             snapshot.hysteresis_ok_count,
         );
+        // Queue gauges are updated on enqueue/dequeue/drop in `publish`.
+        // Capacity and policy series are registered when the queue is created.
 
         tokio::select! {
             result = shutdown.changed() => {
@@ -181,6 +183,7 @@ pub async fn run_metrics_collector(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::publish::{DropReason, IsolatedPublishQueue, QueueFullPolicy};
     use crate::safety::{BrakeIntent, SafetyMachine, SafetyState};
     use crate::telemetry::{assess, fixtures};
 
@@ -203,6 +206,25 @@ mod tests {
         assert!((early - 1.5).abs() < f64::EPSILON);
         assert!((later - 4.0).abs() < f64::EPSILON);
         assert!(later > early);
+    }
+
+    #[test]
+    fn metrics_queue_snapshot_names_are_stable() {
+        let (queue, _rx) =
+            IsolatedPublishQueue::bounded_with_policy(4, QueueFullPolicy::DropOldest).unwrap();
+        let mapping = assess(&fixtures::healthy_real(), fixtures::NOW).to_sensory_mapping();
+        queue.try_enqueue(mapping.clone()).unwrap();
+        queue.try_enqueue(mapping.clone()).unwrap();
+        queue.try_enqueue(mapping.clone()).unwrap();
+        queue.try_enqueue(mapping.clone()).unwrap();
+        queue.try_enqueue(mapping).unwrap();
+        let text = queue.snapshot().prometheus_exposition();
+        assert!(text.contains("sensory_queue_depth 4"));
+        assert!(text.contains("sensory_queue_capacity 4"));
+        assert!(text.contains("sensory_queue_enqueued_total 5"));
+        assert!(text.contains("sensory_queue_dropped_total{reason=\"drop_oldest\"} 1"));
+        assert!(text.contains("sensory_queue_full_policy{policy=\"drop_oldest\"} 1"));
+        assert_eq!(DropReason::ALL.len(), 5);
     }
 
     #[test]

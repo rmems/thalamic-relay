@@ -16,6 +16,7 @@ use thalamic_relay::safety::{
     ActuatorOutcome, BRAKE_FRACTION, BrakeIntent, FakeActuator, SafetyActuator, SafetyMachine,
     SafetyState,
 };
+use thalamic_relay::telemetry::SensoryMapping;
 use thalamic_relay::telemetry::{
     SampleValidity, TelemetrySource, assess, fixtures, software_fallback,
 };
@@ -196,8 +197,9 @@ fn missing_invalid_stale_and_simulated_frames_are_named_states() {
 
 #[test]
 fn slow_and_disconnected_publish_queues_do_not_block_critical_brake() {
-    let (queue, rx) = IsolatedPublishQueue::bounded(1);
-    drop(rx);
+    let (queue, consumer) =
+        IsolatedPublishQueue::<SensoryMapping>::bounded(1).expect("capacity 1 is valid");
+    drop(consumer);
     let mut machine = SafetyMachine::new();
     let mut critical = fixtures::healthy_real();
     critical.gpu_temp_c = Some(90.0);
