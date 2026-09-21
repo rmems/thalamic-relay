@@ -249,6 +249,9 @@ fn plan_brake_apply(
 }
 
 fn plan_brake_release(current: Option<u32>, default: Option<u32>) -> Result<u32, ActuatorError> {
+    if current.is_none_or(|w| w == 0) || default.is_none_or(|w| w == 0) {
+        return Err(ActuatorError::PowerLimitUnavailable);
+    }
     match crate::safety::classify_power_limit(current, default, crate::safety::BRAKE_FRACTION) {
         crate::safety::PowerLimitObservation::RelayOwnedBrake(m)
             if m.default_w > 0 && m.current_w > 0 =>
@@ -677,6 +680,17 @@ mod power_limit_ownership_tests {
         assert_eq!(plan_brake_release(Some(200), Some(400)).unwrap(), 400);
         assert!(plan_brake_release(Some(100), Some(400)).is_err());
         assert!(plan_brake_release(Some(300), Some(400)).is_err());
-        assert!(plan_brake_release(None, Some(400)).is_err());
+        assert_eq!(
+            plan_brake_release(None, Some(400)),
+            Err(ActuatorError::PowerLimitUnavailable)
+        );
+        assert_eq!(
+            plan_brake_release(Some(200), None),
+            Err(ActuatorError::PowerLimitUnavailable)
+        );
+        assert_eq!(
+            plan_brake_release(None, None),
+            Err(ActuatorError::PowerLimitUnavailable)
+        );
     }
 }
