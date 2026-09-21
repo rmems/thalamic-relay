@@ -456,3 +456,7 @@ Enable debug logging for detailed troubleshooting:
 ```bash
 RUST_LOG=debug cargo run --bin thalamic-relay
 ```
+
+Brake targets whose ±2 W matching band overlaps the device-default band are
+refused as ambiguous (including default limits of 8 W or less with the 50%
+strategy). They cannot be adopted as an already-engaged relay brake.

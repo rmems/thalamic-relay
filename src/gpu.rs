@@ -224,12 +224,8 @@ fn plan_brake_apply(
     else {
         return Err(ActuatorError::PowerLimitUnavailable);
     };
-    if !pct.is_finite() || !(0.1..1.0).contains(&pct) {
-        return Err(ActuatorError::CommandFailed(
-            "invalid brake fraction".into(),
-        ));
-    }
-    let target = (default as f32 * pct) as u32;
+    let target = crate::safety::unambiguous_brake_target(default, pct)
+        .ok_or(ActuatorError::PowerLimitUnavailable)?;
     if current < target.saturating_sub(crate::safety::BRAKE_MATCH_TOLERANCE_W) {
         return Err(ActuatorError::CommandFailed(
             "power limit is below relay target; preserving operator/device cap".into(),
@@ -692,5 +688,23 @@ mod power_limit_ownership_tests {
             plan_brake_release(None, None),
             Err(ActuatorError::PowerLimitUnavailable)
         );
+    }
+}
+
+#[cfg(test)]
+mod ambiguous_power_limit_tests {
+    use super::*;
+    #[test]
+    fn tiny_limits_cannot_be_mistaken_for_a_relay_owned_brake() {
+        for default in 1..=8 {
+            assert!(plan_brake_apply(Some(default), Some(default), 0.5).is_err());
+            assert!(plan_brake_release(Some(default / 2), Some(default)).is_err());
+            assert_eq!(
+                crate::safety::classify_power_limit(Some(default), Some(default), 0.5),
+                crate::safety::PowerLimitObservation::Unreadable
+            );
+        }
+        assert_eq!(plan_brake_apply(Some(10), Some(10), 0.5).unwrap(), Some(5));
+        assert_eq!(plan_brake_release(Some(5), Some(10)).unwrap(), 10);
     }
 }

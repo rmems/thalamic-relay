@@ -185,3 +185,7 @@ Exported without querying Brainstem:
 Numeric ids: 0 `healthy_real`, 1 `warning`, 2 `critical_braked`,
 3 `recovering`, 4 `telemetry_missing`, 5 `telemetry_stale`,
 6 `telemetry_invalid`, 7 `simulated_software_only`, 8 `actuator_failure`.
+
+Brake targets whose ±2 W matching band overlaps the device-default band are
+refused as ambiguous (including default limits of 8 W or less with the 50%
+strategy). They cannot be adopted as an already-engaged relay brake.

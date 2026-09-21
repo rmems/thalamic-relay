@@ -753,9 +753,20 @@ impl PowerLimitObservation {
     }
 }
 
+// Both ±2 W bands must be disjoint; otherwise a default or foreign cap
+// could be classified as a relay-owned brake. Also reject zero/invalid targets.
+pub(crate) fn unambiguous_brake_target(default_w: u32, pct: f32) -> Option<u32> {
+    if !pct.is_finite() || !(0.1..1.0).contains(&pct) {
+        return None;
+    }
+    let target = (default_w as f32 * pct) as u32;
+    (target > 0 && default_w.saturating_sub(target) > 2 * BRAKE_MATCH_TOLERANCE_W).then_some(target)
+}
+
 /// Classify current vs default power limits against this relay's brake fraction.
 ///
-/// Pure function: no NVML, no mutation. `None` for either limit is unreadable.
+/// Pure function: no NVML, no mutation. Missing limits or overlapping
+/// default/target tolerance bands are unreadable.
 #[must_use]
 pub fn classify_power_limit(
     current_w: Option<u32>,
@@ -765,8 +776,9 @@ pub fn classify_power_limit(
     let (Some(current_w), Some(default_w)) = (current_w, default_w) else {
         return PowerLimitObservation::Unreadable;
     };
-    let pct = brake_fraction.clamp(0.1, 1.0);
-    let expected_brake_w = (default_w as f32 * pct) as u32;
+    let Some(expected_brake_w) = unambiguous_brake_target(default_w, brake_fraction) else {
+        return PowerLimitObservation::Unreadable;
+    };
     if current_w.abs_diff(expected_brake_w) <= BRAKE_MATCH_TOLERANCE_W {
         return PowerLimitObservation::RelayOwnedBrake(BrakeMatch {
             current_w,
