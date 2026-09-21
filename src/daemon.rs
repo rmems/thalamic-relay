@@ -18,7 +18,8 @@ use crate::publish::{
 };
 use crate::safety::{
     ActuatorError, ActuatorOutcome, BRAKE_FRACTION, BrakeIntent, PowerLimitObservation,
-    SafetyActuator, SafetyMachine, SafetySnapshot, SafetyState, classify_power_limit,
+    SafetyActuator, SafetyMachine, SafetyPolicyConfig, SafetySnapshot, SafetyState,
+    classify_power_limit,
 };
 use crate::shutdown::{
     InFlightActuation, InFlightJoin, SHUTDOWN_ACTUATOR_TIMEOUT, SHUTDOWN_METRICS_TIMEOUT,
@@ -90,6 +91,35 @@ fn try_acquire_lock(lock_path: &str) -> Result<LockGuard, String> {
 /// in-process use.
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    let config = cli.safety_policy_config();
+    // Reject contradictory operator inputs before NVML, locks, ports or workers.
+    config.resolve(None)?;
+    if cli.step_interval_ms > config.max_acquisition_interval_ms
+        || cli.step_interval_ms.saturating_mul(10) > config.max_sample_age_ms
+    {
+        return Err("step interval exceeds safety acquisition limit or ten-tick evaluation exceeds sample-age limit".into());
+    }
+    let actuator: Arc<dyn SafetyActuator> = Arc::new(NvmlActuator::new());
+    // Read-only startup query also detects a persistent brake in software-only mode.
+    let (current_w, default_w) = actuator.query_power_limits_w();
+    let policy = config.resolve(if cli.force_software_only {
+        None
+    } else {
+        default_w.map(|w| w as f32)
+    })?;
+    let (power_warn, power_critical) = policy
+        .power_limits_w()
+        .map_or((None, None), |(w, c)| (Some(w), Some(c)));
+    eprintln!(
+        "[relay] effective_safety_policy temp_warn_c={} temp_critical_c={} power_warn_w={power_warn:?} power_critical_w={power_critical:?} power_source={} release_ok_streak={} max_sample_age_ms={} max_acquisition_interval_ms={} brake_fraction={}",
+        config.temp_warn_c,
+        config.temp_critical_c,
+        policy.power_limit_source(),
+        config.release_ok_streak,
+        config.max_sample_age_ms,
+        config.max_acquisition_interval_ms,
+        policy.brake_fraction()
+    );
 
     // Acquire the single-instance lock atomically BEFORE binding any ports.
     // This ensures the clean "Another instance is already active" message
@@ -125,7 +155,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut step_count: u64 = 0;
-    let mut machine = SafetyMachine::new();
+    let mut machine = SafetyMachine::with_policy(policy);
     let publisher = build_publisher(&cli);
     let mut warned_brake_held_sim = false;
     let mut brake_task: Option<ActuationTask> = None;
@@ -134,14 +164,11 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Privileged NVML/nvidia-smi actuation backend. The supervisor only ever
     // reaches hardware through this `SafetyActuator`; all safety semantics live
     // in `crate::safety`, never in the NVIDIA adapter (GH#46).
-    let actuator: Arc<dyn SafetyActuator> = Arc::new(NvmlActuator::new());
-
     // Detect leftover throttle from a prior crash (hardware PL persists across process restarts).
     // Only seed brake_applied when the current limit matches this relay's expected 50% brake
     // target, so deliberate operator-set sub-default caps are not auto-restored to default.
     // This query uses the real actuator even under `--force-software-only`: simulated
     // telemetry must not hide or authorize release of a real persistent brake.
-    let (current_w, default_w) = actuator.query_power_limits_w();
     match classify_power_limit(current_w, default_w, BRAKE_FRACTION) {
         PowerLimitObservation::RelayOwnedBrake(m) => {
             eprintln!(
@@ -574,6 +601,36 @@ fn format_live_reading(sample: &TelemetrySample<f32>, fmt_val: impl Fn(f32) -> S
     long_about = "thalamic-relay observes GPU telemetry, validates it, and evaluates an isolated thermal/power safety policy. It does not run a spiking neural network or own neural state.\n\nWithout --force-software-only it attempts NVML. Driver/device failure is NvmlUnavailable (fail-closed), not simulated idle. --force-software-only uses documented idle estimates tagged SoftwareFallback.\n\nBrake apply/release is best-effort: timeout + sudo -n nvidia-smi -pl on Linux (passwordless sudo for nvidia-smi). There is no control/query IPC; sensory publication is best-effort corpus-ipc UDP and Prometheus is served on :9000/metrics."
 )]
 struct Cli {
+    /// Explicit thermal warning limit (C); not inferred from vendor capabilities.
+    #[arg(long, default_value_t = 75.0, env = "THALAMIC_SAFETY_TEMP_WARN_C")]
+    safety_temp_warn_c: f32,
+    /// Explicit thermal critical limit (C).
+    #[arg(long, default_value_t = 85.0, env = "THALAMIC_SAFETY_TEMP_CRITICAL_C")]
+    safety_temp_critical_c: f32,
+    /// Power warning override (W); requires a critical override.
+    #[arg(long, env = "THALAMIC_SAFETY_POWER_WARN_W")]
+    safety_power_warn_w: Option<f32>,
+    /// Power critical override (W); cannot exceed a known device default.
+    #[arg(long, env = "THALAMIC_SAFETY_POWER_CRITICAL_W")]
+    safety_power_critical_w: Option<f32>,
+    /// Consecutive healthy real evaluations required to release a brake.
+    #[arg(long, default_value_t = 3, env = "THALAMIC_SAFETY_RELEASE_OK_STREAK")]
+    safety_release_ok_streak: u32,
+    /// Maximum sample age (ms); can tighten the 2000 ms telemetry limit.
+    #[arg(
+        long,
+        default_value_t = 2000,
+        env = "THALAMIC_SAFETY_MAX_SAMPLE_AGE_MS"
+    )]
+    safety_max_sample_age_ms: u64,
+    /// Maximum declared acquisition interval (ms).
+    #[arg(
+        long,
+        default_value_t = 100,
+        env = "THALAMIC_SAFETY_MAX_ACQUISITION_INTERVAL_MS"
+    )]
+    safety_max_acquisition_interval_ms: u64,
+
     /// Prometheus metrics listen IP (port is always 9000 per compliance)
     #[arg(long, default_value = "127.0.0.1", env = "THALAMIC_METRICS_IP", value_parser = clap::value_parser!(std::net::IpAddr))]
     metrics_ip: std::net::IpAddr,
@@ -601,6 +658,20 @@ struct Cli {
     /// Session id stamped on each `StimulusBatch` (`session_id`). Empty omits it.
     #[arg(long, default_value = DEFAULT_IPC_SESSION_ID, env = "THALAMIC_IPC_SESSION_ID")]
     ipc_session_id: String,
+}
+
+impl Cli {
+    fn safety_policy_config(&self) -> SafetyPolicyConfig {
+        SafetyPolicyConfig {
+            temp_warn_c: self.safety_temp_warn_c,
+            temp_critical_c: self.safety_temp_critical_c,
+            power_warn_w: self.safety_power_warn_w,
+            power_critical_w: self.safety_power_critical_w,
+            release_ok_streak: self.safety_release_ok_streak,
+            max_sample_age_ms: self.safety_max_sample_age_ms,
+            max_acquisition_interval_ms: self.safety_max_acquisition_interval_ms,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -730,7 +801,7 @@ mod tests {
 
     #[tokio::test]
     async fn orderly_shutdown_leaves_seeded_brake_and_stops_metrics() {
-        let mut machine = SafetyMachine::new();
+        let mut machine = crate::safety::test_machine();
         machine.seed_brake_applied();
         let mut brake_task = None;
         let mut release_task = None;
@@ -766,7 +837,7 @@ mod tests {
 
         let fake = Arc::new(FakeActuator::new());
         let fake_task = Arc::clone(&fake);
-        let mut machine = SafetyMachine::new();
+        let mut machine = crate::safety::test_machine();
         let mut raw = fixtures::healthy_real();
         raw.gpu_temp_c = Some(90.0);
         let snap = machine.evaluate(&assess(&raw, fixtures::NOW));
@@ -807,7 +878,7 @@ mod tests {
         let guard = try_acquire_lock(lock_path).unwrap();
         assert!(std::path::Path::new(lock_path).exists());
 
-        let mut machine = SafetyMachine::new();
+        let mut machine = crate::safety::test_machine();
         let mut brake_task = None;
         let mut release_task = None;
         let relay_metrics = Arc::new(Mutex::new(RelayMetrics::default()));

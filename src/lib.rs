@@ -11,7 +11,9 @@
 //! use thalamic_relay::telemetry::{assess, fixtures};
 //!
 //! let frame = assess(&fixtures::healthy_real(), fixtures::NOW);
-//! let mut machine = SafetyMachine::new();
+//! let policy = thalamic_relay::safety::SafetyPolicyConfig::default()
+//!     .resolve(Some(400.0)).unwrap(); // Example device default: 400 W
+//! let mut machine = SafetyMachine::with_policy(policy);
 //! let snapshot = machine.evaluate(&frame);
 //! assert_eq!(snapshot.state, SafetyState::HealthyReal);
 //! assert!(!snapshot.desired_brake);

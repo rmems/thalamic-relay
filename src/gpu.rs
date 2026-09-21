@@ -20,7 +20,7 @@
 
 use crate::safety::{ActuatorError, SafetyActuator};
 #[cfg(test)]
-use crate::safety::{SafetyStatus, instant_status};
+use crate::safety::{SafetyStatus, instant_status_with_policy};
 #[cfg(test)]
 use crate::telemetry::DEFAULT_ACQUISITION_CADENCE_MS;
 use crate::telemetry::{
@@ -153,7 +153,7 @@ impl HardwareBridge {
     /// Returns `(SafetyStatus, is_simulated)`.
     #[cfg(test)]
     pub fn check_safety(frame: &TelemetryFrame) -> (SafetyStatus, bool) {
-        instant_status(frame)
+        instant_status_with_policy(frame, &crate::safety::test_policy())
     }
 }
 
@@ -186,27 +186,12 @@ impl SafetyActuator for NvmlActuator {
     /// (not the current limit) to avoid compounding throttle across restarts.
     /// Fails closed if NVML cannot report a real limit — never invents a hardcoded wattage.
     fn apply_emergency_brake(&self, pct: f32) -> Result<(), ActuatorError> {
-        // Prefer default PL as base so restarts cannot stack 50% on an already-braked limit.
-        let base_limit = query_default_power_limit_w()
-            .or_else(query_power_limit_w)
-            .ok_or(ActuatorError::PowerLimitUnavailable)?;
-        let pct = pct.clamp(0.1, 1.0);
-        let target_pl = (base_limit as f32 * pct) as u32;
-
-        // Already at or below target (e.g. leftover brake from a previous process).
-        if let Some(current) = query_power_limit_w().filter(|&c| c <= target_pl) {
-            println!(
-                "[hardware_bridge] EMERGENCY BRAKE: already at or below target {target_pl}W (current {current}W)"
-            );
+        let Some(target_pl) =
+            plan_brake_apply(query_power_limit_w(), query_default_power_limit_w(), pct)?
+        else {
             return Ok(());
-        }
-
-        println!(
-            "[hardware_bridge] EMERGENCY BRAKE: Setting PL to {}W ({}% of {}W default)",
-            target_pl,
-            (pct * 100.0) as u32,
-            base_limit
-        );
+        };
+        println!("[hardware_bridge] EMERGENCY BRAKE: setting PL to {target_pl}W");
 
         set_power_limit_w(target_pl)
     }
@@ -215,7 +200,7 @@ impl SafetyActuator for NvmlActuator {
     /// Fails closed if the default cannot be queried (never restores a fabricated wattage).
     fn release_emergency_brake(&self) -> Result<(), ActuatorError> {
         let default_limit =
-            query_default_power_limit_w().ok_or(ActuatorError::PowerLimitUnavailable)?;
+            plan_brake_release(query_power_limit_w(), query_default_power_limit_w())?;
         println!(
             "[hardware_bridge] RELEASING BRAKE: Restoring PL to {}W (device default)",
             default_limit
@@ -226,6 +211,53 @@ impl SafetyActuator for NvmlActuator {
 
     fn query_power_limits_w(&self) -> (Option<u32>, Option<u32>) {
         (query_power_limit_w(), query_default_power_limit_w())
+    }
+}
+
+// Read-only command planning: never adopt a lower operator cap as a relay brake.
+fn plan_brake_apply(
+    current: Option<u32>,
+    default: Option<u32>,
+    pct: f32,
+) -> Result<Option<u32>, ActuatorError> {
+    let (Some(current), Some(default)) = (current.filter(|w| *w > 0), default.filter(|w| *w > 0))
+    else {
+        return Err(ActuatorError::PowerLimitUnavailable);
+    };
+    if !pct.is_finite() || !(0.1..1.0).contains(&pct) {
+        return Err(ActuatorError::CommandFailed(
+            "invalid brake fraction".into(),
+        ));
+    }
+    let target = (default as f32 * pct) as u32;
+    if current < target.saturating_sub(crate::safety::BRAKE_MATCH_TOLERANCE_W) {
+        return Err(ActuatorError::CommandFailed(
+            "power limit is below relay target; preserving operator/device cap".into(),
+        ));
+    }
+    if current.abs_diff(target) <= crate::safety::BRAKE_MATCH_TOLERANCE_W {
+        return Ok(None);
+    }
+    // A sub-default foreign cap above target also must not later be raised to
+    // default by release. Refuse to claim ownership of any foreign cap.
+    if current < default.saturating_sub(crate::safety::BRAKE_MATCH_TOLERANCE_W) {
+        return Err(ActuatorError::CommandFailed(
+            "foreign sub-default power cap; refusing relay ownership".into(),
+        ));
+    }
+    Ok(Some(target))
+}
+
+fn plan_brake_release(current: Option<u32>, default: Option<u32>) -> Result<u32, ActuatorError> {
+    match crate::safety::classify_power_limit(current, default, crate::safety::BRAKE_FRACTION) {
+        crate::safety::PowerLimitObservation::RelayOwnedBrake(m)
+            if m.default_w > 0 && m.current_w > 0 =>
+        {
+            Ok(m.default_w)
+        }
+        _ => Err(ActuatorError::CommandFailed(
+            "current power limit does not match relay brake; refusing restore".into(),
+        )),
     }
 }
 
@@ -594,5 +626,57 @@ mod tests {
             frame.source,
             TelemetrySource::Nvml | TelemetrySource::NvmlUnavailable
         ));
+    }
+}
+
+#[cfg(test)]
+mod power_limit_ownership_tests {
+    use super::*;
+
+    #[test]
+    fn apply_never_adopts_an_operator_cap_below_the_relay_target() {
+        assert!(plan_brake_apply(Some(100), Some(400), 0.5).is_err());
+        assert!(plan_brake_apply(Some(300), Some(400), 0.5).is_err());
+        assert_eq!(plan_brake_apply(Some(200), Some(400), 0.5).unwrap(), None);
+        assert_eq!(
+            plan_brake_apply(Some(400), Some(400), 0.5).unwrap(),
+            Some(200)
+        );
+    }
+
+    #[test]
+    fn foreign_cap_failure_never_authorizes_a_later_default_restore() {
+        use crate::safety::{ActuatorOutcome, BrakeIntent};
+        use crate::telemetry::{assess, fixtures};
+        for cap in [100, 300] {
+            let mut machine = crate::safety::test_machine();
+            let mut raw = fixtures::healthy_real();
+            raw.gpu_temp_c = Some(95.0);
+            assert_eq!(
+                machine.evaluate(&assess(&raw, fixtures::NOW)).intent,
+                BrakeIntent::Apply
+            );
+            let err = plan_brake_apply(Some(cap), Some(400), 0.5).unwrap_err();
+            let _ = machine.record_actuator(ActuatorOutcome::ApplyFailed(err.to_string()));
+            for _ in 0..5 {
+                let snap = machine.evaluate(&assess(&fixtures::healthy_real(), fixtures::NOW));
+                assert_eq!(snap.intent, BrakeIntent::None);
+                assert!(!snap.brake_engaged);
+            }
+        }
+    }
+
+    #[test]
+    fn missing_default_cannot_compound_a_previous_brake() {
+        assert!(plan_brake_apply(Some(200), None, 0.5).is_err());
+        assert!(plan_brake_apply(None, Some(400), 0.5).is_err());
+    }
+
+    #[test]
+    fn release_requires_current_power_to_still_match_the_relay_brake() {
+        assert_eq!(plan_brake_release(Some(200), Some(400)).unwrap(), 400);
+        assert!(plan_brake_release(Some(100), Some(400)).is_err());
+        assert!(plan_brake_release(Some(300), Some(400)).is_err());
+        assert!(plan_brake_release(None, Some(400)).is_err());
     }
 }

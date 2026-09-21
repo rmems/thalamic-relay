@@ -93,7 +93,7 @@ Channel order is the GH#41 runtime-input inventory (no observability filler):
 | 3 | `mem_util_pct` | linear 0…100 % → `[0, 1]` |
 
 `acquisition_source` is `nvml`, `software_fallback`, or `nvml_unavailable`.
-Hardware-policy thresholds (85 °C / 350 W) are **not** part of this schema.
+Configurable hardware-policy thresholds are **not** part of this schema.
 
 ## Transport
 

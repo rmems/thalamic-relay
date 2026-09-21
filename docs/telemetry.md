@@ -98,7 +98,7 @@ the documented default (100 ms). Future `observed_at > now` is `Invalid`.
 | Signal | Unit | Range | Origin | Class | Normalization | Cadence | Stale after |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `gpu_temp_c` | °C | 0…125 | measured | **both** (safety + runtime-input) | linear 0…100 → `[0, 1]` | 100 ms | 2 s |
-| `power_w` | W | 0…500 | measured | **both** | linear 0…350 → `[0, 1]` | 100 ms | 2 s |
+| `power_w` | W | 0…2000 | measured | **both** | linear 0…350 → `[0, 1]` | 100 ms | 2 s |
 | `gpu_clock_mhz` | MHz | 0…3000 | measured | runtime-input | linear 0…2500 → `[0, 1]` | 100 ms | 5 s |
 | `mem_util_pct` | % | 0…100 | measured | runtime-input | linear 0…100 → `[0, 1]` | 100 ms | 5 s |
 | `vram_temp_c` | °C | 0…125 | measured | observability-only | linear 0…100 → `[0, 1]` | 100 ms | 5 s |
@@ -106,10 +106,13 @@ the documented default (100 ms). Future `observed_at > now` is `Invalid`.
 | `fan_speed_pct` | % | 0…100 | measured | observability-only | linear 0…100 → `[0, 1]` | 100 ms | 5 s |
 | `vddcr_gfx_v` | V | 0.4…1.5 | **derived** from power | observability-only | linear 0.5…1.2 → `[0, 1]` | 100 ms | 5 s |
 
-There is currently no safety-only-only channel: temperature and power are
-classified **both**. Thermal (85 °C critical / 75 °C warn) and power (350 W
-critical / 300 W warn) thresholds are safety *policy* (#47 will make them
-configurable) and are **not** the sensor engineering range.
+Temperature and power are classified **both**. Configurable safety limits
+(`SafetyPolicyConfig`) are separate from sensor sanity ranges and sensory
+normalization. Defaults are 75/85 C and 85%/100% of the reported device default
+power limit, with validated operator overrides. The 2000 W sanity ceiling permits
+high-power devices; it is not a safety recommendation. The existing 0…350 W
+sensory normalization remains unchanged and saturates at 1 above 350 W.
+See [safety policy](safety.md).
 
 `vddcr_gfx_v` is not an NVML voltage sensor. The identifier is historical
 (AMD `VDDCR_GFX` rail naming). It is derived from board power for

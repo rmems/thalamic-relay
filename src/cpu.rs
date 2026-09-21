@@ -181,7 +181,7 @@ pub async fn run_metrics_collector(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::safety::{BrakeIntent, SafetyMachine, SafetyState};
+    use crate::safety::{BrakeIntent, SafetyState};
     use crate::telemetry::{assess, fixtures};
 
     #[test]
@@ -218,7 +218,7 @@ mod tests {
     #[test]
     fn record_safety_snapshot_copies_state_and_brake() {
         let mut metrics = RelayMetrics::default();
-        let mut machine = SafetyMachine::new();
+        let mut machine = crate::safety::test_machine();
         let mut raw = fixtures::healthy_real();
         raw.gpu_temp_c = Some(90.0);
         let snap = machine.evaluate(&assess(&raw, fixtures::NOW));
@@ -233,7 +233,7 @@ mod tests {
     fn record_shutdown_copies_unresolved_flags() {
         use crate::shutdown::{InFlightActuation, ShutdownReason, plan_shutdown};
 
-        let mut machine = SafetyMachine::new();
+        let mut machine = crate::safety::test_machine();
         machine.seed_brake_applied();
         let plan = plan_shutdown(
             ShutdownReason::Sigterm,
@@ -258,7 +258,7 @@ mod tests {
         use crate::safety::ActuatorOutcome;
 
         let mut metrics = RelayMetrics::default();
-        let mut machine = SafetyMachine::new();
+        let mut machine = crate::safety::test_machine();
         let mut raw = fixtures::healthy_real();
         raw.gpu_temp_c = Some(90.0);
         let _ = machine.evaluate(&assess(&raw, fixtures::NOW));

@@ -235,8 +235,7 @@ pub async fn shutdown_metrics_collector(
 mod tests {
     use super::*;
     use crate::safety::{
-        ActuatorOutcome, BRAKE_FRACTION, BrakeIntent, SafetyMachine, SafetyState,
-        classify_power_limit,
+        ActuatorOutcome, BRAKE_FRACTION, BrakeIntent, SafetyState, classify_power_limit,
     };
     use crate::telemetry::{assess, fixtures};
 
@@ -248,35 +247,35 @@ mod tests {
     }
 
     fn snap_healthy() -> SafetySnapshot {
-        let mut m = SafetyMachine::new();
+        let mut m = crate::safety::test_machine();
         m.evaluate(&nvml(65.0, 200.0))
     }
 
     fn snap_warned() -> SafetySnapshot {
-        let mut m = SafetyMachine::new();
+        let mut m = crate::safety::test_machine();
         m.evaluate(&nvml(78.0, 200.0))
     }
 
     fn snap_brake_requested() -> SafetySnapshot {
-        let mut m = SafetyMachine::new();
+        let mut m = crate::safety::test_machine();
         m.evaluate(&nvml(90.0, 200.0))
     }
 
     fn snap_brake_active() -> SafetySnapshot {
-        let mut m = SafetyMachine::new();
+        let mut m = crate::safety::test_machine();
         let _ = m.evaluate(&nvml(90.0, 200.0));
         m.record_actuator(ActuatorOutcome::Applied)
     }
 
     fn snap_recovering() -> SafetySnapshot {
-        let mut m = SafetyMachine::new();
+        let mut m = crate::safety::test_machine();
         let _ = m.evaluate(&nvml(90.0, 200.0));
         let _ = m.record_actuator(ActuatorOutcome::Applied);
         m.evaluate(&nvml(65.0, 200.0))
     }
 
     fn snap_release_pending() -> SafetySnapshot {
-        let mut m = SafetyMachine::new();
+        let mut m = crate::safety::test_machine();
         let _ = m.evaluate(&nvml(90.0, 200.0));
         let _ = m.record_actuator(ActuatorOutcome::Applied);
         let ok = nvml(65.0, 200.0);
@@ -286,33 +285,33 @@ mod tests {
     }
 
     fn snap_actuator_failed() -> SafetySnapshot {
-        let mut m = SafetyMachine::new();
+        let mut m = crate::safety::test_machine();
         let _ = m.evaluate(&nvml(90.0, 200.0));
         m.record_actuator(ActuatorOutcome::ApplyFailed("nvidia-smi -pl failed".into()))
     }
 
     fn snap_missing() -> SafetySnapshot {
-        let mut m = SafetyMachine::new();
+        let mut m = crate::safety::test_machine();
         m.evaluate(&assess(&fixtures::sensor_dropout(), fixtures::NOW))
     }
 
     fn snap_stale() -> SafetySnapshot {
-        let mut m = SafetyMachine::new();
+        let mut m = crate::safety::test_machine();
         m.evaluate(&assess(&fixtures::stale(), fixtures::NOW))
     }
 
     fn snap_invalid() -> SafetySnapshot {
-        let mut m = SafetyMachine::new();
+        let mut m = crate::safety::test_machine();
         m.evaluate(&assess(&fixtures::out_of_range(), fixtures::NOW))
     }
 
     fn snap_sim() -> SafetySnapshot {
-        let mut m = SafetyMachine::new();
+        let mut m = crate::safety::test_machine();
         m.evaluate(&assess(&fixtures::software_fallback(), fixtures::NOW))
     }
 
     fn snap_sim_braked() -> SafetySnapshot {
-        let mut m = SafetyMachine::new();
+        let mut m = crate::safety::test_machine();
         m.seed_brake_applied();
         m.evaluate(&assess(&fixtures::software_fallback(), fixtures::NOW))
     }

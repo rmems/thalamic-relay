@@ -13,6 +13,9 @@
 use crate::telemetry::{SampleValidity, TelemetryFrame, TelemetrySample, TelemetrySource};
 use std::sync::Mutex;
 
+mod policy;
+pub use policy::{PolicyError, SafetyPolicy, SafetyPolicyConfig};
+
 /// Consecutive real [`AssessmentKind::Ok`] evaluations required before a release intent.
 pub const RELEASE_OK_STREAK: u32 = 3;
 /// Emergency-brake fraction of the device default power limit.
@@ -23,10 +26,10 @@ pub const BRAKE_MATCH_TOLERANCE_W: u32 = 2;
 pub const TEMP_WARN_C: f32 = 75.0;
 /// Thermal critical threshold (°C).
 pub const TEMP_CRITICAL_C: f32 = 85.0;
-/// Power warning band (W), inclusive of this threshold.
-pub const POWER_WARN_W: f32 = 300.0;
-/// Power critical threshold (W).
-pub const POWER_CRITICAL_W: f32 = 350.0;
+#[cfg(test)]
+const POWER_WARN_W: f32 = 300.0;
+#[cfg(test)]
+const POWER_CRITICAL_W: f32 = 350.0;
 
 /// Instantaneous Ok / Warn / Critical used by logs and [`instant_status`].
 ///
@@ -209,13 +212,16 @@ impl SafetySnapshot {
 /// use thalamic_relay::safety::{SafetyMachine, SafetyState};
 /// use thalamic_relay::telemetry::{assess, fixtures};
 ///
-/// let mut machine = SafetyMachine::new();
+/// let policy = thalamic_relay::safety::SafetyPolicyConfig::default()
+///     .resolve(Some(400.0)).unwrap(); // Example device default: 400 W
+/// let mut machine = SafetyMachine::with_policy(policy);
 /// let frame = assess(&fixtures::healthy_real(), fixtures::NOW);
 /// let snap = machine.evaluate(&frame);
 /// assert_eq!(snap.state, SafetyState::HealthyReal);
 /// ```
 #[derive(Debug, Clone)]
 pub struct SafetyMachine {
+    policy: SafetyPolicy,
     brake_engaged: bool,
     ok_count: u32,
     just_released: bool,
@@ -235,10 +241,22 @@ impl Default for SafetyMachine {
 }
 
 impl SafetyMachine {
-    /// Fail-closed until the first frame is evaluated: missing telemetry.
+    /// Fail-closed without a device power envelope. For real telemetry use
+    /// [`Self::with_policy`]; software-only frames remain simulated.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_policy(
+            SafetyPolicyConfig::default()
+                .resolve(None)
+                .expect("valid default policy"),
+        )
+    }
+
+    /// Construct with a validated immutable policy. No hardware access.
+    #[must_use]
+    pub fn with_policy(policy: SafetyPolicy) -> Self {
         Self {
+            policy,
             brake_engaged: false,
             ok_count: 0,
             just_released: false,
@@ -282,7 +300,7 @@ impl SafetyMachine {
     /// Evaluate one telemetry frame. Does not publish, sleep, or actuate.
     #[must_use]
     pub fn evaluate(&mut self, frame: &TelemetryFrame) -> SafetySnapshot {
-        let assessment = classify_frame(frame);
+        let assessment = classify_frame_with_policy(frame, &self.policy);
         let just_released = self.just_released;
         self.just_released = false;
 
@@ -352,7 +370,7 @@ impl SafetyMachine {
             }
             AssessmentKind::Ok if self.brake_engaged => {
                 self.ok_count = self.ok_count.saturating_add(1);
-                let desired = self.ok_count < RELEASE_OK_STREAK;
+                let desired = self.ok_count < self.policy.config.release_ok_streak;
                 (SafetyState::Recovering, desired)
             }
             AssessmentKind::Ok => {
@@ -372,7 +390,7 @@ impl SafetyMachine {
             SafetyState::HealthyReal => false,
             SafetyState::SimulatedSoftwareOnly => self.brake_engaged,
             SafetyState::Warning => self.brake_engaged || self.just_released,
-            SafetyState::Recovering => self.ok_count < RELEASE_OK_STREAK,
+            SafetyState::Recovering => self.ok_count < self.policy.config.release_ok_streak,
             SafetyState::CriticalBraked
             | SafetyState::TelemetryMissing
             | SafetyState::TelemetryStale
@@ -433,7 +451,19 @@ impl SafetyMachine {
 /// Instantaneous status (no hysteresis). Same classification as [`classify_frame`].
 #[must_use]
 pub fn instant_status(frame: &TelemetryFrame) -> (SafetyStatus, bool) {
-    let assessment = classify_frame(frame);
+    let policy = SafetyPolicyConfig::default()
+        .resolve(None)
+        .expect("valid default policy");
+    instant_status_with_policy(frame, &policy)
+}
+
+/// Instantaneous status using a validated operator/device envelope.
+#[must_use]
+pub fn instant_status_with_policy(
+    frame: &TelemetryFrame,
+    policy: &SafetyPolicy,
+) -> (SafetyStatus, bool) {
+    let assessment = classify_frame_with_policy(frame, policy);
     match assessment.kind {
         AssessmentKind::Simulated => (SafetyStatus::Ok, true),
         AssessmentKind::Missing
@@ -445,9 +475,22 @@ pub fn instant_status(frame: &TelemetryFrame) -> (SafetyStatus, bool) {
     }
 }
 
-/// Classify a frame without hysteresis. Simulation is provenance-only.
+/// Classify without a device envelope: real telemetry fails closed.
+/// Use [`classify_frame_with_policy`] to authorize healthy real readings.
 #[must_use]
 pub fn classify_frame(frame: &TelemetryFrame) -> FrameAssessment {
+    let policy = SafetyPolicyConfig::default()
+        .resolve(None)
+        .expect("valid default policy");
+    classify_frame_with_policy(frame, &policy)
+}
+
+/// Classify using validated operator/device policy; does not access hardware.
+#[must_use]
+pub fn classify_frame_with_policy(
+    frame: &TelemetryFrame,
+    policy: &SafetyPolicy,
+) -> FrameAssessment {
     if frame.source == TelemetrySource::SoftwareFallback {
         return FrameAssessment {
             kind: AssessmentKind::Simulated,
@@ -469,27 +512,45 @@ pub fn classify_frame(frame: &TelemetryFrame) -> FrameAssessment {
         }
     };
 
-    if gpu_temp_c > TEMP_CRITICAL_C {
+    if frame.acquisition_cadence_ms > policy.config.max_acquisition_interval_ms
+        || [&frame.gpu_temp_c, &frame.power_w].iter().any(|sample| {
+            frame.acquired_at.saturating_sub(sample.observed_at) >= policy.config.max_sample_age_ms
+        })
+    {
         return FrameAssessment {
-            kind: AssessmentKind::Critical,
-            reason: format!("GPU thermal: {gpu_temp_c:.0}°C exceeds {TEMP_CRITICAL_C:.0}°C"),
+            kind: AssessmentKind::Stale,
+            reason: "sample age or acquisition interval exceeds safety policy".into(),
         };
     }
-    if power_w > POWER_CRITICAL_W {
+    let Some((power_warn_w, power_critical_w)) = policy.power_limits_w else {
+        return FrameAssessment {
+            kind: AssessmentKind::Missing,
+            reason: "power policy unavailable: provide device default or explicit limits".into(),
+        };
+    };
+    let temp_warn_c = policy.config.temp_warn_c;
+    let temp_critical_c = policy.config.temp_critical_c;
+    if gpu_temp_c > temp_critical_c {
         return FrameAssessment {
             kind: AssessmentKind::Critical,
-            reason: format!("GPU power: {power_w:.0}W exceeds {POWER_CRITICAL_W:.0}W safety limit"),
+            reason: format!("GPU thermal: {gpu_temp_c:.0}°C exceeds {temp_critical_c:.0}°C"),
         };
     }
-    if gpu_temp_c >= TEMP_WARN_C {
+    if power_w > power_critical_w {
+        return FrameAssessment {
+            kind: AssessmentKind::Critical,
+            reason: format!("GPU power: {power_w:.0}W exceeds {power_critical_w:.0}W safety limit"),
+        };
+    }
+    if gpu_temp_c >= temp_warn_c {
         return FrameAssessment {
             kind: AssessmentKind::Warn,
             reason: format!(
-                "GPU thermal: {gpu_temp_c:.0}°C approaching {TEMP_CRITICAL_C:.0}°C limit"
+                "GPU thermal: {gpu_temp_c:.0}°C approaching {temp_critical_c:.0}°C limit"
             ),
         };
     }
-    if power_w >= POWER_WARN_W {
+    if power_w >= power_warn_w {
         return FrameAssessment {
             kind: AssessmentKind::Warn,
             reason: format!("GPU power: {power_w:.0}W approaching safety limit"),
@@ -506,16 +567,16 @@ pub fn classify_frame(frame: &TelemetryFrame) -> FrameAssessment {
 #[cfg(test)]
 #[must_use]
 fn warn_from_frame(frame: &TelemetryFrame) -> Option<SafetyStatus> {
-    match classify_frame(frame).kind {
+    match classify_frame_with_policy(frame, &test_policy()).kind {
         AssessmentKind::Missing
         | AssessmentKind::Invalid
         | AssessmentKind::Stale
         | AssessmentKind::Critical => {
-            let (status, _) = instant_status(frame);
+            let (status, _) = instant_status_with_policy(frame, &test_policy());
             Some(status)
         }
         AssessmentKind::Warn => {
-            let (status, _) = instant_status(frame);
+            let (status, _) = instant_status_with_policy(frame, &test_policy());
             Some(status)
         }
         AssessmentKind::Ok | AssessmentKind::Simulated => None,
@@ -950,7 +1011,7 @@ mod actuator_tests {
         }
 
         let fake = FakeActuator::new();
-        let mut machine = SafetyMachine::new();
+        let mut machine = crate::safety::test_machine();
 
         // Overheat → Apply intent → drive the fake actuator.
         let snap = machine.evaluate(&frame(95.0, 200.0));
@@ -982,7 +1043,30 @@ mod actuator_tests {
 }
 
 #[cfg(test)]
+pub(crate) fn test_policy() -> SafetyPolicy {
+    SafetyPolicyConfig {
+        power_warn_w: Some(300.0),
+        power_critical_w: Some(350.0),
+        ..Default::default()
+    }
+    .resolve(None)
+    .unwrap()
+}
+
+#[cfg(test)]
+pub(crate) fn test_machine() -> SafetyMachine {
+    SafetyMachine::with_policy(test_policy())
+}
+
+#[cfg(test)]
 mod tests {
+    fn classify_frame_with_policy_test(frame: &super::TelemetryFrame) -> super::FrameAssessment {
+        super::classify_frame_with_policy(frame, &super::test_policy())
+    }
+    fn instant_status_test(frame: &super::TelemetryFrame) -> (super::SafetyStatus, bool) {
+        super::instant_status_with_policy(frame, &super::test_policy())
+    }
+
     use super::*;
     use crate::telemetry::{SampleValidity, assess, fixtures};
 
@@ -994,13 +1078,13 @@ mod tests {
     }
 
     fn eval_once(raw: crate::telemetry::RawTelemetry) -> SafetySnapshot {
-        let mut machine = SafetyMachine::new();
+        let mut machine = crate::safety::test_machine();
         machine.evaluate(&assess(&raw, fixtures::NOW))
     }
 
     #[test]
     fn new_is_fail_closed_telemetry_missing() {
-        let snap = SafetyMachine::new().snapshot();
+        let snap = crate::safety::test_machine().snapshot();
         assert_eq!(snap.state, SafetyState::TelemetryMissing);
         assert_eq!(snap.policy_state, SafetyState::TelemetryMissing);
         assert!(snap.desired_brake);
@@ -1101,14 +1185,14 @@ mod tests {
         assert_eq!(snap.state, SafetyState::SimulatedSoftwareOnly);
         assert_eq!(snap.intent, BrakeIntent::None);
         let (status, is_sim) =
-            instant_status(&assess(&fixtures::software_fallback(), fixtures::NOW));
+            instant_status_test(&assess(&fixtures::software_fallback(), fixtures::NOW));
         assert_eq!(status, SafetyStatus::Ok);
         assert!(is_sim);
     }
 
     #[test]
     fn simulated_holds_existing_brake_and_resets_hysteresis() {
-        let mut machine = SafetyMachine::new();
+        let mut machine = crate::safety::test_machine();
         let critical = nvml_temp_power(90.0, 200.0);
         let snap = machine.evaluate(&critical);
         assert_eq!(snap.intent, BrakeIntent::Apply);
@@ -1126,7 +1210,7 @@ mod tests {
 
     #[test]
     fn hysteresis_requires_three_real_ok_before_release() {
-        let mut machine = SafetyMachine::new();
+        let mut machine = crate::safety::test_machine();
         let _ = machine.evaluate(&nvml_temp_power(90.0, 200.0));
         let _ = machine.record_actuator(ActuatorOutcome::Applied);
 
@@ -1149,7 +1233,7 @@ mod tests {
 
     #[test]
     fn warn_or_critical_resets_hysteresis_streak() {
-        let mut machine = SafetyMachine::new();
+        let mut machine = crate::safety::test_machine();
         let _ = machine.evaluate(&nvml_temp_power(90.0, 200.0));
         let _ = machine.record_actuator(ActuatorOutcome::Applied);
         let ok = nvml_temp_power(65.0, 200.0);
@@ -1167,7 +1251,7 @@ mod tests {
 
     #[test]
     fn warn_after_release_reapplies_brake() {
-        let mut machine = SafetyMachine::new();
+        let mut machine = crate::safety::test_machine();
         let _ = machine.evaluate(&nvml_temp_power(90.0, 200.0));
         let _ = machine.record_actuator(ActuatorOutcome::Applied);
         let ok = nvml_temp_power(65.0, 200.0);
@@ -1186,7 +1270,7 @@ mod tests {
 
     #[test]
     fn ok_after_release_is_healthy_real() {
-        let mut machine = SafetyMachine::new();
+        let mut machine = crate::safety::test_machine();
         let _ = machine.evaluate(&nvml_temp_power(90.0, 200.0));
         let _ = machine.record_actuator(ActuatorOutcome::Applied);
         let ok = nvml_temp_power(65.0, 200.0);
@@ -1201,7 +1285,7 @@ mod tests {
 
     #[test]
     fn actuator_failure_is_named_state_and_does_not_stop_evaluation() {
-        let mut machine = SafetyMachine::new();
+        let mut machine = crate::safety::test_machine();
         let critical = nvml_temp_power(90.0, 200.0);
         let _ = machine.evaluate(&critical);
         let snap = machine.record_actuator(ActuatorOutcome::ApplyFailed(
@@ -1229,7 +1313,7 @@ mod tests {
 
     #[test]
     fn healthy_evaluate_clears_stale_actuator_failure_overlay() {
-        let mut machine = SafetyMachine::new();
+        let mut machine = crate::safety::test_machine();
         let critical = nvml_temp_power(90.0, 200.0);
         let _ = machine.evaluate(&critical);
         let _ = machine.record_actuator(ActuatorOutcome::ApplyFailed(
@@ -1248,7 +1332,7 @@ mod tests {
 
     #[test]
     fn release_failure_keeps_brake_and_retries() {
-        let mut machine = SafetyMachine::new();
+        let mut machine = crate::safety::test_machine();
         let _ = machine.evaluate(&nvml_temp_power(90.0, 200.0));
         let _ = machine.record_actuator(ActuatorOutcome::Applied);
         let ok = nvml_temp_power(65.0, 200.0);
@@ -1266,7 +1350,7 @@ mod tests {
 
     #[test]
     fn leftover_brake_seed_enters_recovering() {
-        let mut machine = SafetyMachine::new();
+        let mut machine = crate::safety::test_machine();
         machine.seed_brake_applied();
         let snap = machine.evaluate(&nvml_temp_power(65.0, 200.0));
         assert_eq!(snap.state, SafetyState::Recovering);
@@ -1276,7 +1360,7 @@ mod tests {
 
     #[test]
     fn leftover_brake_plus_simulated_never_releases() {
-        let mut machine = SafetyMachine::new();
+        let mut machine = crate::safety::test_machine();
         machine.seed_brake_applied();
         let sim = assess(&fixtures::software_fallback(), fixtures::NOW);
         for _ in 0..RELEASE_OK_STREAK + 2 {
@@ -1293,7 +1377,7 @@ mod tests {
     fn nvml_old_magic_is_healthy_real_not_simulated() {
         let snap = eval_once(fixtures::nvml_looks_like_old_magic());
         assert_eq!(snap.state, SafetyState::HealthyReal);
-        let (status, is_sim) = instant_status(&assess(
+        let (status, is_sim) = instant_status_test(&assess(
             &fixtures::nvml_looks_like_old_magic(),
             fixtures::NOW,
         ));
@@ -1323,7 +1407,7 @@ mod tests {
         assert!(
             matches!(warn_from_frame(&frame), Some(SafetyStatus::Critical(ref msg)) if msg.contains("power_w"))
         );
-        let (status, is_sim) = instant_status(&frame);
+        let (status, is_sim) = instant_status_test(&frame);
         assert!(matches!(status, SafetyStatus::Critical(_)));
         assert!(!matches!(status, SafetyStatus::Warn(_)));
         assert!(!is_sim);
@@ -1342,14 +1426,14 @@ mod tests {
         frame.gpu_temp_c.validity = SampleValidity::Stale;
         frame.power_w.value = None;
         frame.power_w.validity = SampleValidity::Missing;
-        let assessment = classify_frame(&frame);
+        let assessment = classify_frame_with_policy_test(&frame);
         assert_eq!(assessment.kind, AssessmentKind::Missing);
         assert!(assessment.reason.contains("power_w"));
     }
 
     #[test]
     fn transitions_are_counted() {
-        let mut machine = SafetyMachine::new();
+        let mut machine = crate::safety::test_machine();
         let _ = machine.evaluate(&nvml_temp_power(65.0, 200.0));
         let before = machine.transitions_total();
         let snap = machine.evaluate(&nvml_temp_power(90.0, 200.0));
@@ -1492,7 +1576,7 @@ mod tests {
         let mut invalid_over_stale = nvml_temp_power(65.0, 200.0);
         invalid_over_stale.gpu_temp_c.validity = SampleValidity::Stale;
         invalid_over_stale.power_w.validity = SampleValidity::Invalid;
-        let assessment = classify_frame(&invalid_over_stale);
+        let assessment = classify_frame_with_policy_test(&invalid_over_stale);
         assert_eq!(assessment.kind, AssessmentKind::Invalid);
         assert!(assessment.reason.contains("power_w"));
 
@@ -1500,7 +1584,7 @@ mod tests {
         missing_over_invalid.gpu_temp_c.validity = SampleValidity::Invalid;
         missing_over_invalid.power_w.value = None;
         missing_over_invalid.power_w.validity = SampleValidity::Missing;
-        let assessment = classify_frame(&missing_over_invalid);
+        let assessment = classify_frame_with_policy_test(&missing_over_invalid);
         assert_eq!(assessment.kind, AssessmentKind::Missing);
         assert!(assessment.reason.contains("power_w"));
     }
@@ -1510,14 +1594,14 @@ mod tests {
         let mut both_stale = nvml_temp_power(65.0, 200.0);
         both_stale.gpu_temp_c.validity = SampleValidity::Stale;
         both_stale.power_w.validity = SampleValidity::Stale;
-        let assessment = classify_frame(&both_stale);
+        let assessment = classify_frame_with_policy_test(&both_stale);
         assert_eq!(assessment.kind, AssessmentKind::Stale);
         assert!(assessment.reason.contains("gpu_temp_c"));
 
         let mut both_invalid = nvml_temp_power(65.0, 200.0);
         both_invalid.gpu_temp_c.validity = SampleValidity::Invalid;
         both_invalid.power_w.validity = SampleValidity::Invalid;
-        let assessment = classify_frame(&both_invalid);
+        let assessment = classify_frame_with_policy_test(&both_invalid);
         assert_eq!(assessment.kind, AssessmentKind::Invalid);
         assert!(assessment.reason.contains("gpu_temp_c"));
 
@@ -1526,7 +1610,7 @@ mod tests {
         both_missing.gpu_temp_c.validity = SampleValidity::Missing;
         both_missing.power_w.value = None;
         both_missing.power_w.validity = SampleValidity::Missing;
-        let assessment = classify_frame(&both_missing);
+        let assessment = classify_frame_with_policy_test(&both_missing);
         assert_eq!(assessment.kind, AssessmentKind::Missing);
         assert!(assessment.reason.contains("gpu_temp_c"));
     }
@@ -1545,7 +1629,7 @@ mod tests {
 
     #[test]
     fn leftover_brake_plus_simulated_holds_and_does_not_apply() {
-        let mut machine = SafetyMachine::new();
+        let mut machine = crate::safety::test_machine();
         machine.seed_brake_applied();
         let snap = machine.evaluate(&assess(&fixtures::software_fallback(), fixtures::NOW));
         assert_eq!(snap.state, SafetyState::SimulatedSoftwareOnly);

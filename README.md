@@ -22,7 +22,9 @@ use thalamic_relay::safety::{SafetyMachine, SafetyState};
 use thalamic_relay::telemetry::{assess, fixtures};
 
 let frame = assess(&fixtures::healthy_real(), fixtures::NOW);
-let mut machine = SafetyMachine::new();
+let policy = thalamic_relay::safety::SafetyPolicyConfig::default()
+    .resolve(Some(400.0)).unwrap(); // Example device default: 400 W
+let mut machine = SafetyMachine::with_policy(policy);
 let snapshot = machine.evaluate(&frame);
 assert_eq!(snapshot.state, SafetyState::HealthyReal);
 ```
@@ -116,6 +118,11 @@ firmware thermal protection.
 - Optional: an NVIDIA GPU with NVML support
 - Optional, for actual power-limit actuation: passwordless `sudo` for
   `nvidia-smi`
+
+The first intended crates.io version is **0.2.0**, currently prepared for
+publication. Until the maintainer publishes it, build from this repository.
+After publication, install the CLI with `cargo install thalamic-relay --version
+0.2.0 --locked`, or add `thalamic-relay = "0.2.0"` to a library consumer.
 
 ### Build
 
@@ -246,6 +253,51 @@ THALAMIC_METRICS_IP=0.0.0.0 \
   cargo run --bin thalamic-relay -- --force-software-only --step-interval-ms 50
 ```
 
+### Safety policy
+
+The daemon resolves an immutable `SafetyPolicyConfig` at startup and prints
+`effective_safety_policy` with the effective limits and their provenance.
+Invalid or contradictory settings stop startup before locks, ports or workers.
+
+| Flag (environment variable uses `THALAMIC_` plus the uppercase flag with underscores) | Default / meaning |
+| --- | --- |
+| `--safety-temp-warn-c` / `--safety-temp-critical-c` | 75 / 85 C; explicit operator defaults, not vendor thermal limits |
+| `--safety-power-warn-w` / `--safety-power-critical-w` | Both omitted: 85% / 100% of NVML's device default power limit; supply both to override |
+| `--safety-release-ok-streak` | 3 consecutive healthy real evaluations |
+| `--safety-max-sample-age-ms` | 2000 ms; may tighten the telemetry contract |
+| `--safety-max-acquisition-interval-ms` | 100 ms; bounds the declared acquisition interval |
+
+For example, `--safety-power-warn-w 80 --safety-power-critical-w 95` sets an
+explicit 80/95 W envelope (`THALAMIC_SAFETY_POWER_WARN_W` and
+`THALAMIC_SAFETY_POWER_CRITICAL_W` are equivalent). A reported device default
+below 95 W rejects this configuration. Limits must be finite, positive and
+ordered warning < critical. Thermal critical is at most 125 C; power critical
+and device default are at most the telemetry sanity bound of 2000 W.
+
+Explicit paired watts take precedence over derived watts. If neither a usable
+device default nor paired overrides exists, real frames fail closed as
+`telemetry_missing` with a power-policy-unavailable reason. Tagged software-only
+frames remain simulated and cannot release an adopted real brake. The library's
+`SafetyMachine::new()` also has no device envelope: use
+`SafetyPolicyConfig::resolve` and `SafetyMachine::with_policy` for real telemetry.
+
+The default power limit is a device capability used as a policy ceiling, not a
+claim about safe sustained operation for every workload. NVML queries target
+device index 0; this release is not a multi-GPU supervisor. It does not infer
+vendor thermal limits or overclock settings. The brake remains 50% of default
+to keep restart matching consistent. Foreign sub-default caps are refused by
+the actuator and reported as `actuator_failure`; the relay does not claim them
+as its brake or restore them to default. Detection is a 2 W target match, not
+proof of ownership. An external cap exactly matching the target is indistinguishable,
+and independent operator changes can race the read/command sequence.
+
+The daemon checks `step_interval_ms <= max_acquisition_interval_ms` and
+`10 * step_interval_ms <= max_sample_age_ms`. Evaluation remains every ten
+iterations, plus startup and post-actuation checks. Acquisition and scheduling
+add elapsed time: these checks do not promise a wall-clock response deadline.
+Library sample-age checks use the frame's assessment time; reassess held frames
+before calling `evaluate`. See [the safety contract](docs/safety.md).
+
 ## Monitoring
 
 ### Prometheus Metrics
@@ -275,7 +327,7 @@ Structured logging via `tracing` with configurable output levels.
 - **Instance Protection**: Lockfile mechanism prevents multiple relay instances (lock acquired before port binding)
 - **Independent safety loop**: `SafetyMachine::evaluate` has no publisher argument and is not awaited on IPC. Production uses `CorpusIpcPublisher` (`try_send` + detached UDP worker). `--ipc-disabled` or a bind failure falls back to `AbsentPublisher`.
 - **GPU Safety Monitoring**: Safety cadence every ~1 second (every 10 ticks); named states for healthy-real, warning, critical/braked, recovering, missing/stale/invalid, simulated, actuator-failure
-- **Emergency Brakes**: Automatically throttles GPU power limit to 50% via `nvidia-smi -pl` on fail-closed or critical **when actuation succeeds**; 3 consecutive real Ok readings to release; warn immediately after release re-applies
+- **Emergency Brakes**: Automatically throttles GPU power limit to 50% via `nvidia-smi -pl` on fail-closed or critical **when actuation succeeds**; the configured consecutive real Ok streak (default 3) to release; warn immediately after release re-applies
 - **Fail-closed shutdown / restart**: Ctrl-C and SIGTERM stop the run loop, join background tasks with a timeout, and release `/tmp/thalamic_relay.lock`. Shutdown **does not** restore the default GPU power limit. A persistent relay-owned brake (current PL matching the 50% target) is adopted on the next start and released only through the same Ok-streak hysteresis. An operator-configured sub-default cap is left unchanged. Simulated/software-only telemetry cannot authorize release of a real brake. SIGKILL/power loss have no cleanup promise.
 - **Graceful Degradation**: Continues in software-only mode when
   `--force-software-only` is set (`TelemetrySource::SoftwareFallback`).
@@ -327,7 +379,8 @@ denylist, so development-only files cannot ship by accident. The package
 contains:
 
 - `src/` (library + `thalamic-relay` binary)
-- consumer docs: `README.md`, `CHANGELOG.md`, `docs/`
+- consumer docs: `README.md`, `CHANGELOG.md`, and the four explicit `docs/*.md` contracts
+- `examples/software_only.rs` for a GPU-less library demonstration
 - `Cargo.lock` (this package has a binary)
 - `LICENSE-MIT` and `LICENSE-APACHE-2.0`
 
@@ -342,41 +395,47 @@ coding standards and include appropriate tests.
 
 ## Releasing
 
-This crate is not yet published to crates.io. The first intended registry
-release is `0.2.0` and is gated on the publication epic
-([GH#44](https://github.com/rmems/thalamic-relay/issues/44)); do **not** run
-the real `cargo publish` without explicit maintainer approval. Packaging
-hygiene for that gate is `cargo package --locked` and
-`cargo publish --dry-run --locked` from a clean checkout.
+The first intended registry release is **0.2.0**, gated by
+[GH#44](https://github.com/rmems/thalamic-relay/issues/44). The 0.1.0 changelog
+entry records repository history; it is not evidence of a crates.io release.
+Real publication requires explicit maintainer approval immediately before
+upload. CI performs only a token-free dry run.
 
-To cut a tag and GitHub Release for a `0.1.x` patch:
+1. Merge the reviewed release preparation and confirm a clean `main` at the
+   reviewed commit, with `HEAD` equal to `origin/main`. Check all publication
+   gates and exact-commit CI/reviews. Confirm `Cargo.toml`, `Cargo.lock`, and the
+   0.2.0 changelog agree; finalize its release date before the final checks.
+2. Run qualification on that exact clean commit:
 
-1. Make sure `CHANGELOG.md` is up to date and the version in `Cargo.toml` matches the intended release.
-2. Run the validation suite locally (CI on every `main`/PR run also checks
-   exact MSRV, rustdoc, packaging, and a token-free `cargo publish --dry-run`;
-   see `.github/workflows/ci.yml`). Real `cargo publish` is a manual
-   maintainer action and is **not** performed by CI:
    ```bash
    cargo fmt --check
-   cargo clippy --all-targets --all-features -- -D warnings
-   cargo test --all-features
-   RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
-   cargo build --release
-   RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+   cargo clippy --locked --all-targets --all-features -- -D warnings
+   cargo test --locked --all-features
+   RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
+   cargo build --locked --release
+   cargo package --list --locked
    cargo package --locked
    cargo publish --dry-run --locked
    ```
-3. Create an annotated tag from a clean `main` branch and push it:
-   ```bash
-   git checkout main
-   git pull origin main
-   git tag -a v0.1.0 -m "Release v0.1.0"
-   git push origin v0.1.0
-   ```
-4. On GitHub, create a Release from the new tag and paste the relevant `CHANGELOG.md` section into the release notes.
-5. Optionally attach the `cargo build --release` binary.
 
-For a hotfix, bump the patch version in `Cargo.toml` (e.g. `0.1.1`) and use the same tag pattern (`v0.1.1`).
+   Inspect every archive path and both license files. Unpack the `.crate`
+   outside the repository and run its tests and `software_only` example;
+   verify a separate consumer against the extracted library. The allowlist
+   excludes contributor instructions, plans, CI, and local tool configuration.
+3. Obtain explicit approval for the exact commit and 0.2.0 artifact. Only then
+   run `cargo publish --locked`. A passing dry run does not verify credentials,
+   reserve the crate name, or upload a release.
+4. Confirm the version is retrievable from crates.io with
+   `cargo info thalamic-relay@0.2.0 --registry crates-io` from outside this repo
+   and build a separate consumer using the registry version. Check docs.rs
+   built 0.2.0 successfully before declaring hosted documentation available.
+5. After successful registry verification, create the annotated `v0.2.0` tag
+   on the published commit and push it; create the GitHub Release from that
+   tag using the finalized changelog. Mark the publication gate and Linear
+   release complete only with the actual registry/release evidence.
+
+For later patches, advance all version references together (for example,
+`0.2.1` and `v0.2.1`) and repeat the same qualification and approval procedure.
 
 ## Troubleshooting
 

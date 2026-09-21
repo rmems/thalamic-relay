@@ -245,7 +245,7 @@ pub const fn signal_spec(id: SignalId) -> SignalSpec {
             name: "power_w",
             unit: Unit::Watt,
             min: 0.0,
-            max: 500.0,
+            max: 2_000.0,
             origin: SignalOrigin::Measured,
             class: SignalClass::Both,
             normalization: Normalization::Linear {

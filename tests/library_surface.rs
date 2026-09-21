@@ -9,7 +9,7 @@ use thalamic_relay::publish::{
 };
 use thalamic_relay::safety::{
     ActuatorOutcome, BRAKE_FRACTION, BrakeIntent, FakeActuator, SafetyActuator, SafetyMachine,
-    SafetyState, classify_frame,
+    SafetyState, classify_frame_with_policy,
 };
 use thalamic_relay::telemetry::{
     SampleValidity, SignalClass, SignalId, TelemetrySource, assess, fixtures, signal_spec,
@@ -21,7 +21,7 @@ fn downstream_crate_evaluates_safety_without_gpu_or_daemon() {
     assert_eq!(frame.source, TelemetrySource::Nvml);
     assert_eq!(frame.gpu_temp_c.validity, SampleValidity::Valid);
 
-    let mut machine = SafetyMachine::new();
+    let mut machine = configured_machine();
     let snap = machine.evaluate(&frame);
     assert_eq!(snap.state, SafetyState::HealthyReal);
     assert_eq!(snap.intent, BrakeIntent::None);
@@ -67,12 +67,27 @@ fn downstream_crate_maps_sensory_inputs_and_publishes_best_effort() {
     queue.try_publish(&mapping).unwrap();
     assert_eq!(rx.try_recv().unwrap().stimuli.len(), mapping.stimuli.len());
 
-    let mut machine = SafetyMachine::new();
+    let mut machine = configured_machine();
     let (snap, pub_res) = evaluate_then_try_publish(&mut machine, &frame, &AbsentPublisher);
     assert_eq!(pub_res, Err(PublishError::Absent));
     assert_eq!(snap.state, SafetyState::HealthyReal);
     assert_eq!(
-        classify_frame(&frame).kind,
+        classify_frame_with_policy(
+            &frame,
+            &thalamic_relay::safety::SafetyPolicyConfig::default()
+                .resolve(Some(400.0))
+                .unwrap()
+        )
+        .kind,
         thalamic_relay::safety::AssessmentKind::Ok
     );
+}
+
+fn configured_machine() -> SafetyMachine {
+    let config = thalamic_relay::safety::SafetyPolicyConfig {
+        power_warn_w: Some(300.0),
+        power_critical_w: Some(350.0),
+        ..Default::default()
+    };
+    SafetyMachine::with_policy(config.resolve(None).unwrap())
 }
