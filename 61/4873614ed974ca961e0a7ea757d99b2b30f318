@@ -1,0 +1,22 @@
+src/telemetry.rs
+  s_6bce279daa956d::t_784f1513d2909d 478
+  s_6bce279daa956d::t_b8c305ae7111ef 1471-1486
+docs/telemetry.md
+  s_6bce279daa956d::t_784f1513d2909d 96-98
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "614873614ed974ca961e0a7ea757d99b2b30f318",
+  "prompts": {},
+  "sessions": {
+    "s_6bce279daa956d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c24a-e560-7523-a559-b16172588175",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Raul Cardenas Montoya <montoyaraul34@gmail.com>"
+    }
+  }
+}
