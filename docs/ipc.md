@@ -79,14 +79,21 @@ the corresponding `values[i]` is the corpus-ipc placeholder `0.0` and is
 **not** a real zero. A legitimate idle reading (for example
 `mem_util_pct = 0.0` while `Valid`) has `valid_mask[i] = true`.
 
-`timestamp` is unix nanoseconds (Thalamic's unix-ms `observed_at` × 1e6).
+`timestamp` is the mapping/emission wall time in Unix-epoch nanoseconds:
+Thalamic's `emitted_at_unix_ms` multiplied by 1,000,000 with saturation on
+overflow. It is not `source_unix_ms`, and copying either millisecond field
+without conversion would make the corpus-ipc timestamp 1,000,000× too small.
+Freshness is computed before encoding from the frame's receive time, as
+specified in [`telemetry.md`](telemetry.md); this wire timestamp is not its
+authoritative freshness clock.
 `batch_id` is the strictly increasing per-session sequence stamped at
-acquisition, before publication is attempted. Consequently, a consumer can
-detect loss as a sequence gap even when a frame is replaced under backpressure.
-`session_id` comes from `--ipc-session-id` / `THALAMIC_IPC_SESSION_ID` when
-explicitly configured; otherwise the mapping's process-unique boot/session id
-is used. Consumers use `(session_id, batch_id)` as the idempotency key and may
-discard a duplicate or replayed pair.
+acquisition (via `SampleClock`), before publication is attempted. Consequently,
+a consumer can detect loss as a sequence gap even when a frame is replaced under
+backpressure. `session_id` comes from `--ipc-session-id` / `THALAMIC_IPC_SESSION_ID`
+when explicitly configured (empty CLI default leaves stamping to the process-unique
+boot session on each frame); otherwise the mapping's boot/session id is used.
+Consumers use `(session_id, batch_id)` as the idempotency key and may discard
+a duplicate or replayed pair.
 
 Channel order is the GH#41 runtime-input inventory (no observability filler):
 
