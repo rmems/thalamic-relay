@@ -124,7 +124,7 @@ SafetySnapshot (state, brake, intent)
       │
       ├─ spawn_blocking apply/release   (gpu, not on the eval path)
       └─ SensoryPublisher::try_publish   (best-effort, after eval)
-             IsolatedPublishQueue.try_enqueue  (drop on full)
+             IsolatedPublishQueue.try_enqueue  (drop oldest on full; keep newest)
                    │
                    ▼  CorpusIpcPublisher worker (not awaited)
              IpcMessage::Stimuli JSON → UDP sendto

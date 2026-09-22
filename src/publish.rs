@@ -17,19 +17,18 @@ use crate::telemetry::{
     SampleValidity, SensoryMapping, TelemetryFrame, TelemetrySource, UnixMillis,
 };
 use corpus_ipc::{BatchMetadata, IpcMessage, StimulusBatch, Validate};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{RecvError, TryRecvError};
+use std::sync::{Arc, Condvar, Mutex, TryLockError};
 use std::thread;
 
 /// Canonical `corpus-ipc` identity stamped into [`BatchMetadata::source`].
 pub const SOURCE_IDENTITY: &str = "thalamic-relay";
 /// Default UDP destination for [`IpcMessage::Stimuli`] datagrams.
 pub const DEFAULT_IPC_ENDPOINT: &str = "127.0.0.1:9900";
-/// Default [`StimulusBatch::session_id`] when `--ipc-session-id` is unset.
-pub const DEFAULT_IPC_SESSION_ID: &str = "thalamic-relay";
+/// Empty default means the process-unique telemetry boot/session id is used.
+pub const DEFAULT_IPC_SESSION_ID: &str = "";
 /// Bounded queue depth. A full queue is [`PublishError::SlowConsumer`].
 pub const DEFAULT_IPC_QUEUE_CAPACITY: usize = 8;
 
@@ -40,7 +39,7 @@ pub enum PublishError {
     Absent,
     /// The publisher worker is gone.
     Disconnected,
-    /// Bounded queue is full (slow consumer). The frame is dropped.
+    /// Bounded queue was full. Its oldest frame was dropped and replaced.
     SlowConsumer,
     /// The transport returned a send failure (or the batch failed validation).
     SendFailed(String),
@@ -99,29 +98,120 @@ impl SensoryPublisher for FailingPublisher {
     }
 }
 
-/// Bounded non-blocking enqueue. A full queue is [`PublishError::SlowConsumer`].
+/// Bounded non-blocking, drop-oldest queue.
 ///
 /// The safety supervisor uses [`Self::try_enqueue`] (never `recv` / never
 /// wait). A slow or missing consumer cannot stall evaluation.
 #[derive(Debug, Clone)]
 pub struct IsolatedPublishQueue<T> {
-    tx: SyncSender<T>,
+    shared: Arc<QueueState<T>>,
+}
+
+#[derive(Debug)]
+struct QueueState<T> {
+    inner: Mutex<QueueInner<T>>,
+    ready: Condvar,
+    capacity: usize,
+}
+
+#[derive(Debug)]
+struct QueueInner<T> {
+    items: VecDeque<T>,
+    receiver_alive: bool,
+}
+
+/// Receiving end of an [`IsolatedPublishQueue`].
+#[derive(Debug)]
+pub struct PublishReceiver<T> {
+    shared: Arc<QueueState<T>>,
 }
 
 impl<T: Send> IsolatedPublishQueue<T> {
     /// Capacity-1 (minimum) queue plus the receiving end (for tests or a worker).
     #[must_use]
-    pub fn bounded(capacity: usize) -> (Self, Receiver<T>) {
-        let (tx, rx) = mpsc::sync_channel(capacity.max(1));
-        (Self { tx }, rx)
+    pub fn bounded(capacity: usize) -> (Self, PublishReceiver<T>) {
+        let shared = Arc::new(QueueState {
+            inner: Mutex::new(QueueInner {
+                items: VecDeque::with_capacity(capacity.max(1)),
+                receiver_alive: true,
+            }),
+            ready: Condvar::new(),
+            capacity: capacity.max(1),
+        });
+        (
+            Self {
+                shared: Arc::clone(&shared),
+            },
+            PublishReceiver { shared },
+        )
     }
 
-    /// Non-blocking enqueue. Drops the frame when the consumer is slow.
+    /// Non-blocking enqueue, replacing the oldest queued item when full.
+    ///
+    /// Replacement returns [`PublishError::SlowConsumer`] to report the loss,
+    /// even though `item` becomes the newest queued snapshot. If the mutex is
+    /// momentarily contended, this returns the same error rather than waiting.
     pub fn try_enqueue(&self, item: T) -> Result<(), PublishError> {
-        self.tx.try_send(item).map_err(|err| match err {
-            TrySendError::Full(_) => PublishError::SlowConsumer,
-            TrySendError::Disconnected(_) => PublishError::Disconnected,
+        let mut inner = match self.shared.inner.try_lock() {
+            Ok(inner) => inner,
+            Err(TryLockError::WouldBlock) => return Err(PublishError::SlowConsumer),
+            Err(TryLockError::Poisoned(_)) => return Err(PublishError::Disconnected),
+        };
+        if !inner.receiver_alive {
+            return Err(PublishError::Disconnected);
+        }
+        let replaced = inner.items.len() == self.shared.capacity;
+        if replaced {
+            inner.items.pop_front();
+        }
+        inner.items.push_back(item);
+        self.shared.ready.notify_one();
+        if replaced {
+            Err(PublishError::SlowConsumer)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl<T> PublishReceiver<T> {
+    /// Receive the next queued item, waiting only on the worker side.
+    pub fn recv(&self) -> Result<T, RecvError> {
+        let mut inner = self.shared.inner.lock().map_err(|_| RecvError)?;
+        loop {
+            if let Some(item) = inner.items.pop_front() {
+                return Ok(item);
+            }
+            if Arc::strong_count(&self.shared) == 1 {
+                return Err(RecvError);
+            }
+            inner = self.shared.ready.wait(inner).map_err(|_| RecvError)?;
+        }
+    }
+
+    /// Receive without waiting.
+    pub fn try_recv(&self) -> Result<T, TryRecvError> {
+        let mut inner = self.shared.inner.try_lock().map_err(|err| match err {
+            TryLockError::WouldBlock => TryRecvError::Empty,
+            TryLockError::Poisoned(_) => TryRecvError::Disconnected,
+        })?;
+        inner.items.pop_front().ok_or_else(|| {
+            if Arc::strong_count(&self.shared) == 1 {
+                TryRecvError::Disconnected
+            } else {
+                TryRecvError::Empty
+            }
         })
+    }
+}
+
+impl<T> Drop for PublishReceiver<T> {
+    fn drop(&mut self) {
+        if let Ok(mut inner) = self.shared.inner.lock() {
+            inner.receiver_alive = false;
+            inner.items.clear();
+        }
+        self.shared.ready.notify_all();
     }
 }
 
@@ -139,7 +229,6 @@ impl SensoryPublisher for IsolatedPublishQueue<SensoryMapping> {
 pub struct CorpusIpcPublisher {
     queue: IsolatedPublishQueue<IpcMessage>,
     session_id: Option<String>,
-    batch_id: Arc<AtomicU64>,
 }
 
 impl CorpusIpcPublisher {
@@ -158,32 +247,27 @@ impl CorpusIpcPublisher {
         thread::Builder::new()
             .name("corpus-ipc-publish".to_string())
             .spawn(move || run_udp_worker(rx, socket, endpoint))?;
-        Ok(Self {
-            queue,
-            session_id,
-            batch_id: Arc::new(AtomicU64::new(1)),
-        })
+        Ok(Self { queue, session_id })
     }
 
     /// Enqueue-only publisher (no socket). For tests that inspect `IpcMessage`.
     #[must_use]
-    pub fn channel(session_id: Option<String>, capacity: usize) -> (Self, Receiver<IpcMessage>) {
+    pub fn channel(
+        session_id: Option<String>,
+        capacity: usize,
+    ) -> (Self, PublishReceiver<IpcMessage>) {
         let (queue, rx) = IsolatedPublishQueue::bounded(capacity);
-        (
-            Self {
-                queue,
-                session_id,
-                batch_id: Arc::new(AtomicU64::new(1)),
-            },
-            rx,
-        )
+        (Self { queue, session_id }, rx)
     }
 }
 
 impl SensoryPublisher for CorpusIpcPublisher {
     fn try_publish(&self, mapping: &SensoryMapping) -> Result<(), PublishError> {
-        let batch_id = self.batch_id.fetch_add(1, Ordering::Relaxed);
-        let batch = mapping_to_stimulus_batch(mapping, self.session_id.clone(), batch_id);
+        let session_id = self
+            .session_id
+            .clone()
+            .or_else(|| Some(mapping.session_id.clone()));
+        let batch = mapping_to_stimulus_batch(mapping, session_id, mapping.batch_id);
         if let Err(err) = batch.validate() {
             return Err(PublishError::SendFailed(err.to_string()));
         }
@@ -198,7 +282,7 @@ fn local_bind_for(dest: SocketAddr) -> SocketAddr {
     }
 }
 
-fn run_udp_worker(rx: Receiver<IpcMessage>, socket: UdpSocket, dest: SocketAddr) {
+fn run_udp_worker(rx: PublishReceiver<IpcMessage>, socket: UdpSocket, dest: SocketAddr) {
     while let Ok(msg) = rx.recv() {
         let Ok(bytes) = serde_json::to_vec(&msg) else {
             tracing::debug!("corpus-ipc: failed to serialize IpcMessage; dropping frame");
@@ -379,11 +463,11 @@ mod tests {
 
     #[test]
     fn slow_consumer_try_enqueue_returns_immediately() {
-        let (queue, _rx) = IsolatedPublishQueue::bounded(1);
+        let (queue, rx) = IsolatedPublishQueue::bounded(1);
         let mapping = mapping_at_now(&healthy_frame());
         queue.try_enqueue(mapping.clone()).unwrap();
 
-        let err = queue.try_enqueue(mapping).unwrap_err();
+        let err = queue.try_enqueue(mapping.clone()).unwrap_err();
         assert_eq!(err, PublishError::SlowConsumer);
 
         let mut machine = SafetyMachine::new();
@@ -391,6 +475,9 @@ mod tests {
         assert_eq!(pub_res, Err(PublishError::SlowConsumer));
         assert_eq!(snap.state, SafetyState::CriticalBraked);
         assert_eq!(snap.intent, BrakeIntent::Apply);
+
+        let newest = rx.try_recv().expect("replacement remains queued");
+        assert_eq!(newest.batch_id, mapping.batch_id);
     }
 
     #[test]
@@ -527,6 +614,59 @@ mod tests {
     }
 
     #[test]
+    fn capacity_one_drops_oldest_and_keeps_newest_sequence() {
+        let (publisher, rx) = CorpusIpcPublisher::channel(None, 1);
+        let mut mapping = mapping_at_now(&healthy_frame());
+        mapping.session_id = "boot-a".into();
+
+        for batch_id in 10..=12 {
+            mapping.batch_id = batch_id;
+            let result = publisher.try_publish(&mapping);
+            if batch_id == 10 {
+                assert_eq!(result, Ok(()));
+            } else {
+                assert_eq!(result, Err(PublishError::SlowConsumer));
+            }
+        }
+
+        let IpcMessage::Stimuli(batch) = rx.try_recv().expect("newest frame retained") else {
+            panic!("expected stimuli");
+        };
+        assert_eq!(batch.session_id.as_deref(), Some("boot-a"));
+        assert_eq!(batch.batch_id, 12);
+    }
+
+    #[test]
+    fn paused_consumer_burst_retains_bounded_newest_tail() {
+        let (queue, rx) = IsolatedPublishQueue::bounded(3);
+        for value in 0..10 {
+            let _ = queue.try_enqueue(value);
+        }
+        assert_eq!(rx.try_recv(), Ok(7));
+        assert_eq!(rx.try_recv(), Ok(8));
+        assert_eq!(rx.try_recv(), Ok(9));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn reconnect_uses_new_receiver_and_preserves_frame_identity() {
+        let (old, old_rx) = CorpusIpcPublisher::channel(None, 1);
+        drop(old_rx);
+        let mut mapping = mapping_at_now(&healthy_frame());
+        mapping.session_id = "boot-after-reconnect".into();
+        mapping.batch_id = 41;
+        assert_eq!(old.try_publish(&mapping), Err(PublishError::Disconnected));
+
+        let (connected, rx) = CorpusIpcPublisher::channel(None, 1);
+        connected.try_publish(&mapping).unwrap();
+        let IpcMessage::Stimuli(batch) = rx.try_recv().unwrap() else {
+            panic!("expected stimuli");
+        };
+        assert_eq!(batch.session_id.as_deref(), Some("boot-after-reconnect"));
+        assert_eq!(batch.batch_id, 41);
+    }
+
+    #[test]
     fn software_only_emits_typed_corpus_ipc_frame_without_gpu() {
         let frame = HardwareBridge::read_telemetry_force(true);
         assert_eq!(frame.source, TelemetrySource::SoftwareFallback);
@@ -545,7 +685,16 @@ mod tests {
             .expect("spawn UDP publisher");
 
         let mut machine = SafetyMachine::new();
-        let (snap, pub_res) = evaluate_then_try_publish(&mut machine, &frame, &publisher);
+        let (snap, mut pub_res) = evaluate_then_try_publish(&mut machine, &frame, &publisher);
+        // The worker may briefly own the queue mutex while it begins waiting;
+        // retry exactly as the supervisor will on its next telemetry tick.
+        for _ in 0..100 {
+            if pub_res.is_ok() {
+                break;
+            }
+            std::thread::yield_now();
+            pub_res = publisher.try_publish(&mapping);
+        }
         assert!(pub_res.is_ok(), "enqueue must succeed: {pub_res:?}");
         assert_eq!(snap.state, SafetyState::SimulatedSoftwareOnly);
 
@@ -559,7 +708,7 @@ mod tests {
             panic!("expected IpcMessage::Stimuli, got {decoded:?}");
         };
         assert_eq!(batch.session_id.as_deref(), Some("software-only"));
-        assert_eq!(batch.batch_id, 1);
+        assert_eq!(batch.batch_id, frame.batch_id);
         assert!(!batch.values.is_empty());
         let meta = batch.metadata.expect("provenance");
         assert_eq!(meta.source.as_deref(), Some(SOURCE_IDENTITY));

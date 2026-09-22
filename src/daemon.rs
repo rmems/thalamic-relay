@@ -25,7 +25,10 @@ use crate::shutdown::{
     ShutdownActuation, ShutdownPlan, ShutdownReason, join_in_flight, plan_shutdown,
     shutdown_metrics_collector,
 };
-use crate::telemetry::{SampleValidity, TelemetryFrame, TelemetrySample, TelemetrySource};
+use crate::telemetry::{
+    SampleClock, SampleValidity, TelemetryFrame, TelemetrySample, TelemetrySource,
+    assess_with_clock, unix_now_ms,
+};
 use tokio::signal::unix::{SignalKind, signal};
 
 #[derive(Debug)]
@@ -126,6 +129,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut step_count: u64 = 0;
     let mut machine = SafetyMachine::new();
+    let mut sample_clock = SampleClock::new();
     let publisher = build_publisher(&cli);
     let mut warned_brake_held_sim = false;
     let mut brake_task: Option<ActuationTask> = None;
@@ -180,8 +184,11 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let shutdown_reason = loop {
         step_count += 1;
-        let telemetry =
-            HardwareBridge::read_telemetry_with(cli.force_software_only, cli.step_interval_ms);
+        let telemetry = HardwareBridge::read_telemetry_with_clock(
+            cli.force_software_only,
+            cli.step_interval_ms,
+            &mut sample_clock,
+        );
 
         let mut evaluated_this_iter = false;
 
@@ -193,11 +200,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
                     let force_software_only = cli.force_software_only;
                     let cadence_ms = cli.step_interval_ms;
-                    let post_telemetry = tokio::task::spawn_blocking(move || {
-                        HardwareBridge::read_telemetry_with(force_software_only, cadence_ms)
+                    let raw = tokio::task::spawn_blocking(move || {
+                        HardwareBridge::acquire_raw(force_software_only)
                     })
                     .await
                     .expect("post-brake telemetry read task panicked");
+                    let post_telemetry =
+                        assess_with_clock(&raw, unix_now_ms(), cadence_ms, &mut sample_clock);
                     let (snap, pub_res) = evaluate_then_try_publish(
                         &mut machine,
                         &post_telemetry,
@@ -229,11 +238,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
                     let force_software_only = cli.force_software_only;
                     let cadence_ms = cli.step_interval_ms;
-                    let post_telemetry = tokio::task::spawn_blocking(move || {
-                        HardwareBridge::read_telemetry_with(force_software_only, cadence_ms)
+                    let raw = tokio::task::spawn_blocking(move || {
+                        HardwareBridge::acquire_raw(force_software_only)
                     })
                     .await
                     .expect("post-release telemetry read task panicked");
+                    let post_telemetry =
+                        assess_with_clock(&raw, unix_now_ms(), cadence_ms, &mut sample_clock);
                     let (snap, pub_res) = evaluate_then_try_publish(
                         &mut machine,
                         &post_telemetry,

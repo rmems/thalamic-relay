@@ -80,8 +80,13 @@ the corresponding `values[i]` is the corpus-ipc placeholder `0.0` and is
 `mem_util_pct = 0.0` while `Valid`) has `valid_mask[i] = true`.
 
 `timestamp` is unix nanoseconds (Thalamic's unix-ms `observed_at` × 1e6).
-`batch_id` increments per successful enqueue. `session_id` comes from
-`--ipc-session-id` / `THALAMIC_IPC_SESSION_ID` (default `thalamic-relay`).
+`batch_id` is the strictly increasing per-session sequence stamped at
+acquisition, before publication is attempted. Consequently, a consumer can
+detect loss as a sequence gap even when a frame is replaced under backpressure.
+`session_id` comes from `--ipc-session-id` / `THALAMIC_IPC_SESSION_ID` when
+explicitly configured; otherwise the mapping's process-unique boot/session id
+is used. Consumers use `(session_id, batch_id)` as the idempotency key and may
+discard a duplicate or replayed pair.
 
 Channel order is the GH#41 runtime-input inventory (no observability filler):
 
@@ -120,12 +125,17 @@ SafetySnapshot (state, brake, intent)
       │
       ├─ spawn_blocking apply/release   (gpu, not on the eval path)
       └─ SensoryPublisher::try_publish   (best-effort, after eval)
-             IsolatedPublishQueue.try_enqueue  (drop on full)
+             IsolatedPublishQueue.try_enqueue  (drop oldest on full; keep newest)
                    │
                    ▼  detached worker (not awaited)
              serde_json(IpcMessage::Stimuli) → UDP sendto
 ```
 
-A full or disconnected queue is `SlowConsumer` / `Disconnected`. UDP send
-errors and a missing Brainstem listener are dropped on the worker. None of
-these paths can stall or disable `SafetyMachine::evaluate`.
+Delivery is best-effort, single-producer (so unordered delivery within the
+queue is not applicable), and lossy under backpressure. The bounded queue
+uses **drop-oldest / keep-newest**: a full enqueue replaces the oldest queued
+frame and returns `SlowConsumer` to report that loss. It never waits, receives,
+serializes, or sends UDP on the safety path. A disconnected queue returns
+`Disconnected`. UDP send errors and a missing Brainstem listener are dropped
+on the worker. None of these paths can stall or disable
+`SafetyMachine::evaluate`.
