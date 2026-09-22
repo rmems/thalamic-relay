@@ -181,6 +181,27 @@ pub const SAFETY_STALE_AFTER_MS: u64 = 2_000;
 /// Stale threshold for non-safety signals.
 pub const OBSERVABILITY_STALE_AFTER_MS: u64 = 5_000;
 
+/// Number of acquisition ticks between regular supervisor safety evaluations.
+pub const SAFETY_EVAL_TICKS: u64 = 10;
+
+/// Return the freshness threshold for `signal` at the configured acquisition
+/// cadence. Safety channels remain fresh for two complete evaluation periods,
+/// including when `--step-interval-ms` differs from its default.
+#[must_use]
+pub const fn stale_after_ms(signal: SignalId, acquisition_cadence_ms: u64) -> u64 {
+    if signal_spec(signal).class.includes_safety() {
+        (if acquisition_cadence_ms == 0 {
+            1
+        } else {
+            acquisition_cadence_ms
+        })
+        .saturating_mul(SAFETY_EVAL_TICKS)
+        .saturating_mul(2)
+    } else {
+        signal_spec(signal).stale_after_ms
+    }
+}
+
 /// Per-signal contract: unit, range, origin, class, normalization, cadence, stale.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SignalSpec {
@@ -387,6 +408,18 @@ impl TelemetrySample<f32> {
         now: UnixMillis,
     ) -> Self {
         let spec = signal_spec(signal);
+        Self::from_raw_with_stale_after(signal, raw, observed_at, source, now, spec.stale_after_ms)
+    }
+
+    fn from_raw_with_stale_after(
+        signal: SignalId,
+        raw: Option<f32>,
+        observed_at: UnixMillis,
+        source: TelemetrySource,
+        now: UnixMillis,
+        stale_after_ms: u64,
+    ) -> Self {
+        let spec = signal_spec(signal);
         let (value, validity) = if observed_at > now {
             match raw {
                 None => (None, SampleValidity::Missing),
@@ -399,7 +432,7 @@ impl TelemetrySample<f32> {
                 None => (None, SampleValidity::Missing),
                 Some(v) if !v.is_finite() => (None, SampleValidity::Invalid),
                 Some(v) if v < spec.min || v > spec.max => (Some(v), SampleValidity::Invalid),
-                Some(v) if age_ms >= spec.stale_after_ms => (Some(v), SampleValidity::Stale),
+                Some(v) if age_ms >= stale_after_ms => (Some(v), SampleValidity::Stale),
                 Some(v) => (Some(v), SampleValidity::Valid),
             }
         };
@@ -435,6 +468,21 @@ impl TelemetrySample<f32> {
             return self.clone();
         }
         Self::from_raw(self.signal, self.value, self.observed_at, self.source, now)
+    }
+
+    fn at_time_from(&self, now: UnixMillis, received_at: UnixMillis, stale_after_ms: u64) -> Self {
+        if self.value.is_none() || self.validity == SampleValidity::Invalid {
+            return self.clone();
+        }
+        let mut sample = self.clone();
+        sample.validity = if now < received_at {
+            SampleValidity::Invalid
+        } else if now.saturating_sub(received_at) >= stale_after_ms {
+            SampleValidity::Stale
+        } else {
+            SampleValidity::Valid
+        };
+        sample
     }
 }
 
@@ -599,7 +647,14 @@ impl TelemetryFrame {
         let timing = clock.stamp(raw.source_unix_ms, now, raw.timestamp_origin);
         let observed_at = raw.source_unix_ms.unwrap_or(now);
         let sample = |id: SignalId| {
-            TelemetrySample::from_raw(id, raw.value(id), observed_at, raw.source, now)
+            TelemetrySample::from_raw_with_stale_after(
+                id,
+                raw.value(id),
+                observed_at,
+                raw.source,
+                now,
+                stale_after_ms(id, cadence_ms),
+            )
         };
         Self {
             session_id: timing.session_id,
@@ -669,7 +724,14 @@ impl TelemetryFrame {
             .samples()
             .into_iter()
             .filter(|s| signal_spec(s.signal).class.includes_runtime_input())
-            .map(|s| MappedStimulus::from_sample(&s.at_time(now), self.acquisition_cadence_ms))
+            .map(|s| {
+                let stale_after_ms = stale_after_ms(s.signal, self.acquisition_cadence_ms);
+                MappedStimulus::from_sample(
+                    &s.at_time_from(now, self.received_at_unix_ms, stale_after_ms),
+                    self.acquisition_cadence_ms,
+                    stale_after_ms,
+                )
+            })
             .collect();
         SensoryMapping {
             session_id: self.session_id.clone(),
@@ -707,7 +769,14 @@ impl TelemetryFrame {
             samples: self
                 .samples()
                 .into_iter()
-                .map(|s| MappedStimulus::from_sample(&s.at_time(now), self.acquisition_cadence_ms))
+                .map(|s| {
+                    let stale_after_ms = stale_after_ms(s.signal, self.acquisition_cadence_ms);
+                    MappedStimulus::from_sample(
+                        &s.at_time_from(now, self.received_at_unix_ms, stale_after_ms),
+                        self.acquisition_cadence_ms,
+                        stale_after_ms,
+                    )
+                })
                 .collect(),
         }
     }
@@ -762,7 +831,7 @@ pub struct MappedStimulus {
 }
 
 impl MappedStimulus {
-    fn from_sample(sample: &TelemetrySample<f32>, cadence_ms: u64) -> Self {
+    fn from_sample(sample: &TelemetrySample<f32>, cadence_ms: u64, stale_after_ms: u64) -> Self {
         let spec = signal_spec(sample.signal);
         Self {
             signal: sample.signal,
@@ -773,7 +842,7 @@ impl MappedStimulus {
             validity: sample.validity,
             raw: sample.value,
             normalized: sample.normalized(),
-            stale_after_ms: spec.stale_after_ms,
+            stale_after_ms,
             cadence_ms,
         }
     }
@@ -1350,6 +1419,45 @@ mod tests {
         let mapping = frame.to_sensory_mapping_at(NOW);
         assert_eq!(mapping.acquisition_cadence_ms, 50);
         assert!(mapping.stimuli.iter().all(|s| s.cadence_ms == 50));
+    }
+
+    #[test]
+    fn safety_staleness_tracks_50_and_500_ms_cadences_at_the_boundary() {
+        for (cadence_ms, threshold_ms) in [(50, 1_000), (500, 10_000)] {
+            let frame = assess_with_cadence(&fixtures::healthy_real(), NOW, cadence_ms);
+            let just_fresh = frame.to_sensory_mapping_at(NOW + threshold_ms - 1);
+            let at_boundary = frame.to_sensory_mapping_at(NOW + threshold_ms);
+            for signal in [SignalId::GpuTempC, SignalId::PowerW] {
+                let fresh = just_fresh
+                    .stimuli
+                    .iter()
+                    .find(|stimulus| stimulus.signal == signal)
+                    .unwrap();
+                let stale = at_boundary
+                    .stimuli
+                    .iter()
+                    .find(|stimulus| stimulus.signal == signal)
+                    .unwrap();
+                assert_eq!(fresh.stale_after_ms, threshold_ms);
+                assert_eq!(fresh.validity, SampleValidity::Valid);
+                assert_eq!(stale.validity, SampleValidity::Stale);
+            }
+        }
+    }
+
+    #[test]
+    fn mapping_freshness_uses_receive_time_not_source_wall_time() {
+        let mut jumped_source = fixtures::healthy_real();
+        jumped_source.source_unix_ms = Some(NOW - SAFETY_STALE_AFTER_MS);
+        let frame = assess(&jumped_source, NOW);
+        let mapping = frame.to_sensory_mapping_at(NOW);
+        let temp = mapping
+            .stimuli
+            .iter()
+            .find(|stimulus| stimulus.signal == SignalId::GpuTempC)
+            .unwrap();
+        assert_eq!(temp.validity, SampleValidity::Valid);
+        assert_eq!(temp.normalized, Some(0.65));
     }
 
     #[test]

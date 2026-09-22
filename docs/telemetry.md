@@ -42,7 +42,7 @@ Every assessed / emitted frame is stamped by a process-local
 | `session_id` | Stable boot/session id (corpus-ipc `StimulusBatch.session_id`). A new `SampleClock` (process restart) is a new session. |
 | `batch_id` | Strictly increasing sample sequence within that session (corpus-ipc `batch_id`; first frame is 0). Resets to 0 on restart. |
 | `source_unix_ms` | Original producer wall time (`None` if the CSV cell / producer omitted it). |
-| `received_at_unix_ms` / `acquired_at` | Receive/assess time at the relay. **Freshness uses this**, not source wall time. |
+| `received_at_unix_ms` / `acquired_at` | Unix-epoch milliseconds at receive/assessment. **Mapping freshness uses elapsed time from this receive instant**, not `source_unix_ms`; a source-clock/NTP step therefore cannot age a newly received frame. |
 | `emitted_at_unix_ms` | Mapping-time instant (`to_sensory_mapping_at(now)`). Distinct from receive when a held frame is mapped later. |
 | `timestamp_origin` | `LiveAcquire` \| `CsvSource` \| `Simulated` |
 | `source_time_status` | `InOrder` \| `Duplicate` \| `Backward` \| `Future` \| `Missing` |
@@ -87,18 +87,24 @@ The supervisor currently assesses each acquisition immediately (sample age
 vs source time ≈ 0 for live NVML). The sample sequence still advances when
 CSV/replay source times duplicate or go backward. If NVML is unavailable it emits `NvmlUnavailable` with missing safety samples
 (fail closed), not `SoftwareFallback`. `SoftwareFallback` is reserved for
-`--force-software-only`. `to_sensory_mapping_at(now)` re-evaluates freshness
-so a held frame older than the per-signal stale threshold is `Stale` and
+`--force-software-only`. `to_sensory_mapping_at(now)` takes `now` in
+Unix-epoch milliseconds and re-evaluates freshness against
+`received_at_unix_ms`, so a held frame older than the per-signal stale
+threshold is `Stale` and
 drops its normalized value. Mapping carries `stale_after_ms` and the actual
 `acquisition_cadence_ms` (`--step-interval-ms`). `SignalSpec.cadence_ms` is
-the documented default (100 ms). Future `observed_at > now` is `Invalid`.
+the documented default (100 ms). For safety signals, `stale_after_ms` is
+`2 × 10 × acquisition_cadence_ms`: two complete supervisor safety-evaluation
+periods. Thus 50 ms and 500 ms acquisition intervals yield 1 s and 10 s
+thresholds respectively. Future `observed_at > now` is `Invalid` during
+initial source-timestamp validation; missing values remain `Missing`.
 
 ## Signal inventory
 
 | Signal | Unit | Range | Origin | Class | Normalization | Cadence | Stale after |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `gpu_temp_c` | °C | 0…125 | measured | **both** (safety + runtime-input) | linear 0…100 → `[0, 1]` | 100 ms | 2 s |
-| `power_w` | W | 0…500 | measured | **both** | linear 0…350 → `[0, 1]` | 100 ms | 2 s |
+| `gpu_temp_c` | °C | 0…125 | measured | **both** (safety + runtime-input) | linear 0…100 → `[0, 1]` | 100 ms default | 2 safety-eval periods (2 s at default) |
+| `power_w` | W | 0…500 | measured | **both** | linear 0…350 → `[0, 1]` | 100 ms default | 2 safety-eval periods (2 s at default) |
 | `gpu_clock_mhz` | MHz | 0…3000 | measured | runtime-input | linear 0…2500 → `[0, 1]` | 100 ms | 5 s |
 | `mem_util_pct` | % | 0…100 | measured | runtime-input | linear 0…100 → `[0, 1]` | 100 ms | 5 s |
 | `vram_temp_c` | °C | 0…125 | measured | observability-only | linear 0…100 → `[0, 1]` | 100 ms | 5 s |

@@ -79,7 +79,13 @@ the corresponding `values[i]` is the corpus-ipc placeholder `0.0` and is
 **not** a real zero. A legitimate idle reading (for example
 `mem_util_pct = 0.0` while `Valid`) has `valid_mask[i] = true`.
 
-`timestamp` is unix nanoseconds (Thalamic's unix-ms `observed_at` × 1e6).
+`timestamp` is the mapping/emission wall time in Unix-epoch nanoseconds:
+Thalamic's `emitted_at_unix_ms` multiplied by 1,000,000 with saturation on
+overflow. It is not `source_unix_ms`, and copying either millisecond field
+without conversion would make the corpus-ipc timestamp 1,000,000× too small.
+Freshness is computed before encoding from the frame's receive time, as
+specified in [`telemetry.md`](telemetry.md); this wire timestamp is not its
+authoritative freshness clock.
 `batch_id` increments per successful enqueue. `session_id` comes from
 `--ipc-session-id` / `THALAMIC_IPC_SESSION_ID` (default `thalamic-relay`).
 
