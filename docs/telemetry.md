@@ -42,7 +42,7 @@ Every assessed / emitted frame is stamped by a process-local
 | `session_id` | Stable boot/session id (corpus-ipc `StimulusBatch.session_id`). A new `SampleClock` (process restart) is a new session. |
 | `batch_id` | Strictly increasing sample sequence within that session (corpus-ipc `batch_id`; first frame is 0). Resets to 0 on restart. |
 | `source_unix_ms` | Original producer wall time (`None` if the CSV cell / producer omitted it). |
-| `received_at_unix_ms` / `acquired_at` | Unix-epoch milliseconds at receive/assessment. **Mapping freshness uses elapsed time from this receive instant**, not `source_unix_ms`; a source-clock/NTP step therefore cannot age a newly received frame. |
+| `received_at_unix_ms` / `acquired_at` | Unix-epoch milliseconds at receive/assessment. Held-frame expiry uses elapsed time from this receive instant; initial source-time validation remains separate. |
 | `emitted_at_unix_ms` | Mapping-time instant (`to_sensory_mapping_at(now)`). Distinct from receive when a held frame is mapped later. |
 | `timestamp_origin` | `LiveAcquire` \| `CsvSource` \| `Simulated` |
 | `source_time_status` | `InOrder` \| `Duplicate` \| `Backward` \| `Future` \| `Missing` |
@@ -83,15 +83,17 @@ TelemetryFrame        (per-signal TelemetrySample + session_id/batch_id + split 
         └─ to_observability_snapshot()      every signal, raw preserved
 ```
 
-The supervisor currently assesses each acquisition immediately (sample age
-vs source time ≈ 0 for live NVML). The sample sequence still advances when
+The supervisor initially validates each acquisition against its source time;
+an already-old source reading is `Stale` and fails closed for safety. The
+sample sequence still advances when
 CSV/replay source times duplicate or go backward. If NVML is unavailable it emits `NvmlUnavailable` with missing safety samples
 (fail closed), not `SoftwareFallback`. `SoftwareFallback` is reserved for
 `--force-software-only`. `to_sensory_mapping_at(now)` takes `now` in
 Unix-epoch milliseconds and re-evaluates freshness against
-`received_at_unix_ms`, so a held frame older than the per-signal stale
-threshold is `Stale` and
-drops its normalized value. Mapping carries `stale_after_ms` and the actual
+`received_at_unix_ms` for samples that passed initial validation, so a held
+frame older than the per-signal stale threshold is `Stale` and drops its
+normalized value. Mapping never upgrades an initially `Missing`, `Invalid`,
+or `Stale` sample to `Valid`. Mapping carries `stale_after_ms` and the actual
 `acquisition_cadence_ms` (`--step-interval-ms`). `SignalSpec.cadence_ms` is
 the documented default (100 ms). For safety signals, `stale_after_ms` is
 `2 × 10 × acquisition_cadence_ms`: two complete supervisor safety-evaluation

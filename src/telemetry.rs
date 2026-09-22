@@ -471,7 +471,7 @@ impl TelemetrySample<f32> {
     }
 
     fn at_time_from(&self, now: UnixMillis, received_at: UnixMillis, stale_after_ms: u64) -> Self {
-        if self.value.is_none() || self.validity == SampleValidity::Invalid {
+        if self.value.is_none() || self.validity != SampleValidity::Valid {
             return self.clone();
         }
         let mut sample = self.clone();
@@ -1446,18 +1446,27 @@ mod tests {
     }
 
     #[test]
-    fn mapping_freshness_uses_receive_time_not_source_wall_time() {
+    fn source_stale_frame_stays_stale_for_safety_and_mapping() {
         let mut jumped_source = fixtures::healthy_real();
         jumped_source.source_unix_ms = Some(NOW - SAFETY_STALE_AFTER_MS);
         let frame = assess(&jumped_source, NOW);
+        assert_eq!(frame.gpu_temp_c.observed_at, NOW - SAFETY_STALE_AFTER_MS);
+        assert_eq!(frame.gpu_temp_c.validity, SampleValidity::Stale);
+        assert_eq!(frame.power_w.validity, SampleValidity::Stale);
+        assert!(matches!(
+            crate::safety::instant_status(&frame),
+            (crate::safety::SafetyStatus::Critical(reason), false) if reason.contains("stale")
+        ));
+
         let mapping = frame.to_sensory_mapping_at(NOW);
         let temp = mapping
             .stimuli
             .iter()
             .find(|stimulus| stimulus.signal == SignalId::GpuTempC)
             .unwrap();
-        assert_eq!(temp.validity, SampleValidity::Valid);
-        assert_eq!(temp.normalized, Some(0.65));
+        assert_eq!(temp.validity, SampleValidity::Stale);
+        assert_eq!(temp.raw, Some(65.0));
+        assert_eq!(temp.normalized, None);
     }
 
     #[test]
