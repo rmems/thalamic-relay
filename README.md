@@ -159,7 +159,7 @@ thalamic-relay
   - SafetyMachine (never waits on IPC)
   - privileged brake actuator
   - Prometheus safety/brake state
-      ↓  IsolatedPublishQueue.try_enqueue (drop oldest on full; no queue when absent)
+      ↓  IsolatedPublishQueue.try_enqueue (drop oldest on full; AbsentPublisher if IPC disabled/unavailable)
 corpus-ipc          IpcMessage::Stimuli JSON over UDP (not required for safety)
       ↓
 brainstem-daemon

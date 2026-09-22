@@ -624,7 +624,7 @@ struct Cli {
     #[arg(long, env = "THALAMIC_IPC_DISABLED", num_args = 0..=1, default_missing_value = "true", default_value_t = false, value_parser = clap::value_parser!(bool))]
     ipc_disabled: bool,
 
-    /// Session id stamped on each `StimulusBatch` (`session_id`). Empty omits it.
+    /// Session id stamped on each `StimulusBatch` (`session_id`). Empty keeps the telemetry-generated session id and its sequence.
     #[arg(long, default_value = DEFAULT_IPC_SESSION_ID, env = "THALAMIC_IPC_SESSION_ID")]
     ipc_session_id: String,
 }

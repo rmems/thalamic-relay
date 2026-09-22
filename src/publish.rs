@@ -19,7 +19,7 @@ use crate::telemetry::{
 use corpus_ipc::{BatchMetadata, IpcMessage, StimulusBatch, Validate};
 use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{RecvError, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex, TryLockError};
 use std::thread;
@@ -161,34 +161,27 @@ impl<T: Send> IsolatedPublishQueue<T> {
     /// on mutex contention so the worker can release the lock without blocking
     /// the safety path.
     pub fn try_enqueue(&self, item: T) -> Result<(), PublishError> {
-        for spin in 0..TRY_LOCK_SPINS {
-            match self.shared.inner.try_lock() {
-                Ok(mut inner) => {
-                    if !inner.receiver_alive {
-                        return Err(PublishError::Disconnected);
-                    }
-                    let replaced = inner.items.len() == self.shared.capacity;
-                    if replaced {
-                        inner.items.pop_front();
-                    }
-                    inner.items.push_back(item);
-                    self.shared.ready.notify_one();
-                    return if replaced {
-                        Err(PublishError::SlowConsumer)
-                    } else {
-                        Ok(())
-                    };
-                }
-                Err(TryLockError::WouldBlock) => {
-                    if spin + 1 == TRY_LOCK_SPINS {
-                        return Err(PublishError::SlowConsumer);
-                    }
-                    std::hint::spin_loop();
-                }
-                Err(TryLockError::Poisoned(_)) => return Err(PublishError::Disconnected),
-            }
+        // Brief blocking lock (deque mutate only). A pure try_lock path can
+        // return SlowConsumer and drop the newest frame while the queue still
+        // has capacity whenever the worker momentarily holds the mutex.
+        let mut inner = match self.shared.inner.lock() {
+            Ok(inner) => inner,
+            Err(_) => return Err(PublishError::Disconnected),
+        };
+        if !inner.receiver_alive {
+            return Err(PublishError::Disconnected);
         }
-        Err(PublishError::SlowConsumer)
+        let replaced = inner.items.len() == self.shared.capacity;
+        if replaced {
+            inner.items.pop_front();
+        }
+        inner.items.push_back(item);
+        self.shared.ready.notify_one();
+        if replaced {
+            Err(PublishError::SlowConsumer)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -263,6 +256,9 @@ impl SensoryPublisher for IsolatedPublishQueue<SensoryMapping> {
 #[derive(Debug, Clone)]
 pub struct CorpusIpcPublisher {
     queue: IsolatedPublishQueue<IpcMessage>,
+    session_id: Option<String>,
+    /// Publisher-scoped sequence used when `session_id` overrides the mapping.
+    session_seq: std::sync::Arc<AtomicU64>,
 }
 
 impl CorpusIpcPublisher {
@@ -275,14 +271,17 @@ impl CorpusIpcPublisher {
         session_id: Option<String>,
         capacity: usize,
     ) -> std::io::Result<Self> {
-        let _ = session_id;
         let (queue, rx) = IsolatedPublishQueue::bounded(capacity);
         let socket = UdpSocket::bind(local_bind_for(endpoint))?;
         socket.set_nonblocking(true)?;
         thread::Builder::new()
             .name("corpus-ipc-publish".to_string())
             .spawn(move || run_udp_worker(rx, socket, endpoint))?;
-        Ok(Self { queue })
+        Ok(Self {
+            queue,
+            session_id,
+            session_seq: std::sync::Arc::new(AtomicU64::new(0)),
+        })
     }
 
     /// Enqueue-only publisher (no socket). For tests that inspect `IpcMessage`.
@@ -291,16 +290,28 @@ impl CorpusIpcPublisher {
         session_id: Option<String>,
         capacity: usize,
     ) -> (Self, PublishReceiver<IpcMessage>) {
-        let _ = session_id;
         let (queue, rx) = IsolatedPublishQueue::bounded(capacity);
-        (Self { queue }, rx)
+        (
+            Self {
+                queue,
+                session_id,
+                session_seq: std::sync::Arc::new(AtomicU64::new(0)),
+            },
+            rx,
+        )
     }
 }
 
 impl SensoryPublisher for CorpusIpcPublisher {
     fn try_publish(&self, mapping: &SensoryMapping) -> Result<(), PublishError> {
-        let batch =
-            mapping_to_stimulus_batch(mapping, Some(mapping.session_id.clone()), mapping.batch_id);
+        let (session_id, batch_id) = match &self.session_id {
+            Some(id) => (
+                Some(id.clone()),
+                self.session_seq.fetch_add(1, Ordering::Relaxed),
+            ),
+            None => (Some(mapping.session_id.clone()), mapping.batch_id),
+        };
+        let batch = mapping_to_stimulus_batch(mapping, session_id, batch_id);
         if let Err(err) = batch.validate() {
             return Err(PublishError::SendFailed(err.to_string()));
         }
@@ -668,6 +679,22 @@ mod tests {
         };
         assert_eq!(batch.session_id.as_deref(), Some("boot-a"));
         assert_eq!(batch.batch_id, 12);
+    }
+
+    #[test]
+    fn override_session_uses_publisher_sequence() {
+        let (publisher, rx) = CorpusIpcPublisher::channel(Some("run".into()), 8);
+        let mut mapping = mapping_at_now(&healthy_frame());
+        mapping.session_id = "mapping-session".into();
+        mapping.batch_id = 0;
+        publisher.try_publish(&mapping).unwrap();
+        publisher.try_publish(&mapping).unwrap();
+        let IpcMessage::Stimuli(a) = rx.try_recv().unwrap() else { panic!("stimuli") };
+        let IpcMessage::Stimuli(b) = rx.try_recv().unwrap() else { panic!("stimuli") };
+        assert_eq!(a.session_id.as_deref(), Some("run"));
+        assert_eq!(b.session_id.as_deref(), Some("run"));
+        assert_eq!(a.batch_id, 0);
+        assert_eq!(b.batch_id, 1);
     }
 
     #[test]
