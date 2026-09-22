@@ -686,8 +686,12 @@ mod tests {
         mapping.batch_id = 0;
         publisher.try_publish(&mapping).unwrap();
         publisher.try_publish(&mapping).unwrap();
-        let IpcMessage::Stimuli(a) = rx.try_recv().unwrap() else { panic!("stimuli") };
-        let IpcMessage::Stimuli(b) = rx.try_recv().unwrap() else { panic!("stimuli") };
+        let IpcMessage::Stimuli(a) = rx.try_recv().unwrap() else {
+            panic!("stimuli")
+        };
+        let IpcMessage::Stimuli(b) = rx.try_recv().unwrap() else {
+            panic!("stimuli")
+        };
         assert_eq!(a.session_id.as_deref(), Some("run"));
         assert_eq!(b.session_id.as_deref(), Some("run"));
         assert_eq!(a.batch_id, 0);
