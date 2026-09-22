@@ -475,9 +475,7 @@ impl TelemetrySample<f32> {
             return self.clone();
         }
         let mut sample = self.clone();
-        sample.validity = if now < received_at {
-            SampleValidity::Invalid
-        } else if now.saturating_sub(received_at) >= stale_after_ms {
+        sample.validity = if now.saturating_sub(received_at) >= stale_after_ms {
             SampleValidity::Stale
         } else {
             SampleValidity::Valid
@@ -1467,6 +1465,23 @@ mod tests {
         assert_eq!(temp.validity, SampleValidity::Stale);
         assert_eq!(temp.raw, Some(65.0));
         assert_eq!(temp.normalized, None);
+    }
+
+    #[test]
+    fn mapping_wall_clock_regression_keeps_initially_valid_frame_valid() {
+        let mut slightly_older_source = fixtures::healthy_real();
+        slightly_older_source.source_unix_ms = Some(NOW - 100);
+        let frame = assess(&slightly_older_source, NOW);
+        assert_eq!(frame.gpu_temp_c.validity, SampleValidity::Valid);
+
+        let mapping = frame.to_sensory_mapping_at(NOW - 1);
+        let temp = mapping
+            .stimuli
+            .iter()
+            .find(|stimulus| stimulus.signal == SignalId::GpuTempC)
+            .unwrap();
+        assert_eq!(temp.validity, SampleValidity::Valid);
+        assert_eq!(temp.normalized, Some(0.65));
     }
 
     #[test]

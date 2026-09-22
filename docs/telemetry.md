@@ -93,7 +93,9 @@ Unix-epoch milliseconds and re-evaluates freshness against
 `received_at_unix_ms` for samples that passed initial validation, so a held
 frame older than the per-signal stale threshold is `Stale` and drops its
 normalized value. Mapping never upgrades an initially `Missing`, `Invalid`,
-or `Stale` sample to `Valid`. Mapping carries `stale_after_ms` and the actual
+or `Stale` sample to `Valid`. If the relay wall clock moves backward after
+receipt, elapsed receive time saturates to zero instead of manufacturing an
+`Invalid` sample. Mapping carries `stale_after_ms` and the actual
 `acquisition_cadence_ms` (`--step-interval-ms`). `SignalSpec.cadence_ms` is
 the documented default (100 ms). For safety signals, `stale_after_ms` is
 `2 × 10 × acquisition_cadence_ms`: two complete supervisor safety-evaluation
