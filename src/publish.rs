@@ -20,6 +20,7 @@ use corpus_ipc::{BatchMetadata, IpcMessage, StimulusBatch, Validate};
 use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::mpsc::{RecvError, TryRecvError};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, TryLockError};
 use std::thread;
 
@@ -27,7 +28,8 @@ use std::thread;
 pub const SOURCE_IDENTITY: &str = "thalamic-relay";
 /// Default UDP destination for [`IpcMessage::Stimuli`] datagrams.
 pub const DEFAULT_IPC_ENDPOINT: &str = "127.0.0.1:9900";
-/// Empty default means the process-unique telemetry boot/session id is used.
+/// Empty CLI default: do not override acquisition; [`crate::time::SampleClock`]
+/// stamps a process-unique boot session on each frame (not this literal string).
 pub const DEFAULT_IPC_SESSION_ID: &str = "";
 /// Bounded queue depth. A full queue is [`PublishError::SlowConsumer`].
 pub const DEFAULT_IPC_QUEUE_CAPACITY: usize = 8;
@@ -102,7 +104,7 @@ impl SensoryPublisher for FailingPublisher {
 ///
 /// The safety supervisor uses [`Self::try_enqueue`] (never `recv` / never
 /// wait). A slow or missing consumer cannot stall evaluation.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct IsolatedPublishQueue<T> {
     shared: Arc<QueueState<T>>,
 }
@@ -112,7 +114,12 @@ struct QueueState<T> {
     inner: Mutex<QueueInner<T>>,
     ready: Condvar,
     capacity: usize,
+    /// Live [`IsolatedPublishQueue`] clones (including the initial sender).
+    senders: AtomicUsize,
 }
+
+/// Brief spin before reporting contention so the worker can release the mutex.
+const TRY_LOCK_SPINS: u32 = 128;
 
 #[derive(Debug)]
 struct QueueInner<T> {
@@ -137,6 +144,7 @@ impl<T: Send> IsolatedPublishQueue<T> {
             }),
             ready: Condvar::new(),
             capacity: capacity.max(1),
+            senders: AtomicUsize::new(1),
         });
         (
             Self {
@@ -149,27 +157,56 @@ impl<T: Send> IsolatedPublishQueue<T> {
     /// Non-blocking enqueue, replacing the oldest queued item when full.
     ///
     /// Replacement returns [`PublishError::SlowConsumer`] to report the loss,
-    /// even though `item` becomes the newest queued snapshot. If the mutex is
-    /// momentarily contended, this returns the same error rather than waiting.
+    /// even though `item` becomes the newest queued snapshot. Spins briefly
+    /// on mutex contention so the worker can release the lock without blocking
+    /// the safety path.
     pub fn try_enqueue(&self, item: T) -> Result<(), PublishError> {
-        let mut inner = match self.shared.inner.try_lock() {
-            Ok(inner) => inner,
-            Err(TryLockError::WouldBlock) => return Err(PublishError::SlowConsumer),
-            Err(TryLockError::Poisoned(_)) => return Err(PublishError::Disconnected),
-        };
-        if !inner.receiver_alive {
-            return Err(PublishError::Disconnected);
+        for spin in 0..TRY_LOCK_SPINS {
+            match self.shared.inner.try_lock() {
+                Ok(mut inner) => {
+                    if !inner.receiver_alive {
+                        return Err(PublishError::Disconnected);
+                    }
+                    let replaced = inner.items.len() == self.shared.capacity;
+                    if replaced {
+                        inner.items.pop_front();
+                    }
+                    inner.items.push_back(item);
+                    self.shared.ready.notify_one();
+                    return if replaced {
+                        Err(PublishError::SlowConsumer)
+                    } else {
+                        Ok(())
+                    };
+                }
+                Err(TryLockError::WouldBlock) => {
+                    if spin + 1 == TRY_LOCK_SPINS {
+                        return Err(PublishError::SlowConsumer);
+                    }
+                    std::hint::spin_loop();
+                }
+                Err(TryLockError::Poisoned(_)) => return Err(PublishError::Disconnected),
+            }
         }
-        let replaced = inner.items.len() == self.shared.capacity;
-        if replaced {
-            inner.items.pop_front();
+        Err(PublishError::SlowConsumer)
+    }
+}
+
+impl<T> Clone for IsolatedPublishQueue<T> {
+    fn clone(&self) -> Self {
+        self.shared
+            .senders
+            .fetch_add(1, Ordering::Relaxed);
+        Self {
+            shared: Arc::clone(&self.shared),
         }
-        inner.items.push_back(item);
-        self.shared.ready.notify_one();
-        if replaced {
-            Err(PublishError::SlowConsumer)
-        } else {
-            Ok(())
+    }
+}
+
+impl<T> Drop for IsolatedPublishQueue<T> {
+    fn drop(&mut self) {
+        if self.shared.senders.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.shared.ready.notify_all();
         }
     }
 }
@@ -182,7 +219,7 @@ impl<T> PublishReceiver<T> {
             if let Some(item) = inner.items.pop_front() {
                 return Ok(item);
             }
-            if Arc::strong_count(&self.shared) == 1 {
+            if self.shared.senders.load(Ordering::Acquire) == 0 {
                 return Err(RecvError);
             }
             inner = self.shared.ready.wait(inner).map_err(|_| RecvError)?;
@@ -196,7 +233,7 @@ impl<T> PublishReceiver<T> {
             TryLockError::Poisoned(_) => TryRecvError::Disconnected,
         })?;
         inner.items.pop_front().ok_or_else(|| {
-            if Arc::strong_count(&self.shared) == 1 {
+            if self.shared.senders.load(Ordering::Acquire) == 0 {
                 TryRecvError::Disconnected
             } else {
                 TryRecvError::Empty
@@ -228,7 +265,6 @@ impl SensoryPublisher for IsolatedPublishQueue<SensoryMapping> {
 #[derive(Debug, Clone)]
 pub struct CorpusIpcPublisher {
     queue: IsolatedPublishQueue<IpcMessage>,
-    session_id: Option<String>,
 }
 
 impl CorpusIpcPublisher {
@@ -241,13 +277,14 @@ impl CorpusIpcPublisher {
         session_id: Option<String>,
         capacity: usize,
     ) -> std::io::Result<Self> {
+        let _ = session_id;
         let (queue, rx) = IsolatedPublishQueue::bounded(capacity);
         let socket = UdpSocket::bind(local_bind_for(endpoint))?;
         socket.set_nonblocking(true)?;
         thread::Builder::new()
             .name("corpus-ipc-publish".to_string())
             .spawn(move || run_udp_worker(rx, socket, endpoint))?;
-        Ok(Self { queue, session_id })
+        Ok(Self { queue })
     }
 
     /// Enqueue-only publisher (no socket). For tests that inspect `IpcMessage`.
@@ -256,18 +293,19 @@ impl CorpusIpcPublisher {
         session_id: Option<String>,
         capacity: usize,
     ) -> (Self, PublishReceiver<IpcMessage>) {
+        let _ = session_id;
         let (queue, rx) = IsolatedPublishQueue::bounded(capacity);
-        (Self { queue, session_id }, rx)
+        (Self { queue }, rx)
     }
 }
 
 impl SensoryPublisher for CorpusIpcPublisher {
     fn try_publish(&self, mapping: &SensoryMapping) -> Result<(), PublishError> {
-        let session_id = self
-            .session_id
-            .clone()
-            .or_else(|| Some(mapping.session_id.clone()));
-        let batch = mapping_to_stimulus_batch(mapping, session_id, mapping.batch_id);
+        let batch = mapping_to_stimulus_batch(
+            mapping,
+            Some(mapping.session_id.clone()),
+            mapping.batch_id,
+        );
         if let Err(err) = batch.validate() {
             return Err(PublishError::SendFailed(err.to_string()));
         }
@@ -417,7 +455,8 @@ mod tests {
     use super::*;
     use crate::gpu::HardwareBridge;
     use crate::safety::{BrakeIntent, SafetyState};
-    use crate::telemetry::{SignalId, assess, fixtures};
+    use crate::telemetry::{SignalId, assess, assess_with_clock, fixtures};
+    use crate::time::SampleClock;
     use std::net::UdpSocket;
     use std::time::Duration;
 
@@ -668,7 +707,11 @@ mod tests {
 
     #[test]
     fn software_only_emits_typed_corpus_ipc_frame_without_gpu() {
-        let frame = HardwareBridge::read_telemetry_force(true);
+        use crate::telemetry::DEFAULT_ACQUISITION_CADENCE_MS;
+
+        let raw = HardwareBridge::acquire_raw(true);
+        let mut clock = SampleClock::with_session_id("software-only");
+        let frame = assess_with_clock(&raw, fixtures::NOW, DEFAULT_ACQUISITION_CADENCE_MS, &mut clock);
         assert_eq!(frame.source, TelemetrySource::SoftwareFallback);
         let mapping = frame.to_sensory_mapping();
         assert_eq!(
@@ -681,8 +724,7 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         let dest = listener.local_addr().unwrap();
-        let publisher = CorpusIpcPublisher::spawn(dest, Some("software-only".into()), 8)
-            .expect("spawn UDP publisher");
+        let publisher = CorpusIpcPublisher::spawn(dest, None, 8).expect("spawn UDP publisher");
 
         let mut machine = SafetyMachine::new();
         let (snap, mut pub_res) = evaluate_then_try_publish(&mut machine, &frame, &publisher);
@@ -762,6 +804,15 @@ mod tests {
         let received = rx.try_recv().unwrap();
         assert_eq!(received.acquisition_source, mapping.acquisition_source);
         assert_eq!(received.stimuli.len(), mapping.stimuli.len());
+    }
+
+    #[test]
+    fn dropping_last_sender_wakes_blocked_receiver() {
+        let (queue, rx) = IsolatedPublishQueue::<usize>::bounded(4);
+        let worker = thread::spawn(move || rx.recv());
+        std::thread::sleep(Duration::from_millis(20));
+        drop(queue);
+        assert_eq!(worker.join().unwrap(), Err(RecvError));
     }
 
     #[test]
