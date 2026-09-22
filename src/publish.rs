@@ -118,9 +118,6 @@ struct QueueState<T> {
     senders: AtomicUsize,
 }
 
-/// Brief spin before reporting contention so the worker can release the mutex.
-const TRY_LOCK_SPINS: u32 = 128;
-
 #[derive(Debug)]
 struct QueueInner<T> {
     items: VecDeque<T>,
