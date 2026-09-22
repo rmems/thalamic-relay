@@ -551,15 +551,24 @@ impl<T> SensoryQueueConsumer<T> {
     pub fn try_recv(&self) -> Option<T> {
         let mut inner = self.inner.lock().expect("sensory queue mutex poisoned");
         let item = inner.buf.pop_front();
-        inner.emit_gauges();
+        if item.is_some() {
+            inner.emit_gauges();
+        }
         item
     }
 
-    fn producers_gone(&self) -> bool {
-        self.inner
-            .lock()
-            .map(|inner| inner.producers == 0)
-            .unwrap_or(true)
+    /// Worker-side poll: dequeue, or report idle / all producers dropped.
+    fn poll_worker(&self) -> WorkerPoll<T> {
+        let mut inner = self.inner.lock().expect("sensory queue mutex poisoned");
+        if let Some(msg) = inner.buf.pop_front() {
+            inner.emit_gauges();
+            return WorkerPoll::Message(msg);
+        }
+        if inner.producers == 0 {
+            WorkerPoll::Finished
+        } else {
+            WorkerPoll::Idle
+        }
     }
 
     fn record_loss(&self, reason: DropReason) {
@@ -570,6 +579,12 @@ impl<T> SensoryQueueConsumer<T> {
         inner.record_drop(reason);
         inner.emit_gauges();
     }
+}
+
+enum WorkerPoll<T> {
+    Message(T),
+    Idle,
+    Finished,
 }
 
 impl<T> Drop for SensoryQueueConsumer<T> {
@@ -670,10 +685,10 @@ fn local_bind_for(dest: SocketAddr) -> SocketAddr {
 
 fn run_udp_worker(consumer: SensoryQueueConsumer<IpcMessage>, socket: UdpSocket, dest: SocketAddr) {
     loop {
-        match consumer.try_recv() {
-            Some(msg) => send_dequeued_message(&consumer, &socket, dest, &msg),
-            None if consumer.producers_gone() => break,
-            None => thread::sleep(Duration::from_millis(1)),
+        match consumer.poll_worker() {
+            WorkerPoll::Message(msg) => send_dequeued_message(&consumer, &socket, dest, &msg),
+            WorkerPoll::Finished => break,
+            WorkerPoll::Idle => thread::sleep(Duration::from_millis(1)),
         }
     }
 }
@@ -703,6 +718,15 @@ fn register_drop_reason_series() {
     for reason in DropReason::ALL {
         counter!("sensory_queue_dropped_total", "reason" => reason.as_str()).increment(0);
     }
+}
+
+/// Register the full bounded sensory-queue metric set at process start when no
+/// outbound queue exists (for example `--ipc-disabled` or publisher spawn failure).
+pub fn register_sensory_queue_metrics_without_queue() {
+    let config = QueueConfig::default();
+    export_queue_gauges(0, config.capacity(), config.policy());
+    register_drop_reason_series();
+    counter!("sensory_queue_enqueued_total").increment(0);
 }
 
 fn export_queue_gauges(depth: usize, capacity: usize, policy: QueueFullPolicy) {
@@ -1382,11 +1406,11 @@ mod tests {
     fn last_producer_drop_marks_queue_closed_for_worker() {
         let (queue, consumer) = IsolatedPublishQueue::<SensoryMapping>::bounded(1).unwrap();
         let clone = queue.clone();
-        assert!(!consumer.producers_gone());
+        assert!(matches!(consumer.poll_worker(), WorkerPoll::Idle));
         drop(queue);
-        assert!(!consumer.producers_gone());
+        assert!(matches!(consumer.poll_worker(), WorkerPoll::Idle));
         drop(clone);
-        assert!(consumer.producers_gone());
+        assert!(matches!(consumer.poll_worker(), WorkerPoll::Finished));
     }
 
     #[test]

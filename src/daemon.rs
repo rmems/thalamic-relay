@@ -119,9 +119,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             "[relay] software-only telemetry (--force-software-only): documented idle estimates, not real GPU sensors"
         );
     } else {
-        println!("[relay] NVML telemetry and actuation enabled; FPGA/silicon-bridge unavailable");
         println!(
-            "[relay] sensory + hardware-safety relay (NVML when available; NvmlUnavailable fail-closes)"
+            "[relay] sensory + hardware-safety relay (probes NVML when available; NvmlUnavailable fail-closes)"
         );
     }
 

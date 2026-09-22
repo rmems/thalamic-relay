@@ -12,6 +12,7 @@ use tokio::time::sleep;
 use tracing::{Level, info};
 use tracing_subscriber::FmtSubscriber;
 
+use crate::publish::register_sensory_queue_metrics_without_queue;
 use crate::safety::{SafetySnapshot, SafetyState};
 use crate::shutdown::ShutdownPlan;
 use crate::telemetry::UnixMillis;
@@ -128,6 +129,8 @@ pub fn init_telemetry(metrics_addr: std::net::SocketAddr) {
         .with_http_listener(metrics_addr)
         .install()
         .expect("Failed to install Prometheus recorder");
+
+    register_sensory_queue_metrics_without_queue();
 
     info!(
         "Telemetry initialized. Prometheus metrics available on http://{}/metrics",
