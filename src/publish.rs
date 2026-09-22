@@ -19,8 +19,8 @@ use crate::telemetry::{
 use corpus_ipc::{BatchMetadata, IpcMessage, StimulusBatch, Validate};
 use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::mpsc::{RecvError, TryRecvError};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{RecvError, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex, TryLockError};
 use std::thread;
 
@@ -194,9 +194,7 @@ impl<T: Send> IsolatedPublishQueue<T> {
 
 impl<T> Clone for IsolatedPublishQueue<T> {
     fn clone(&self) -> Self {
-        self.shared
-            .senders
-            .fetch_add(1, Ordering::Relaxed);
+        self.shared.senders.fetch_add(1, Ordering::Relaxed);
         Self {
             shared: Arc::clone(&self.shared),
         }
@@ -301,11 +299,8 @@ impl CorpusIpcPublisher {
 
 impl SensoryPublisher for CorpusIpcPublisher {
     fn try_publish(&self, mapping: &SensoryMapping) -> Result<(), PublishError> {
-        let batch = mapping_to_stimulus_batch(
-            mapping,
-            Some(mapping.session_id.clone()),
-            mapping.batch_id,
-        );
+        let batch =
+            mapping_to_stimulus_batch(mapping, Some(mapping.session_id.clone()), mapping.batch_id);
         if let Err(err) = batch.validate() {
             return Err(PublishError::SendFailed(err.to_string()));
         }
@@ -711,7 +706,12 @@ mod tests {
 
         let raw = HardwareBridge::acquire_raw(true);
         let mut clock = SampleClock::with_session_id("software-only");
-        let frame = assess_with_clock(&raw, fixtures::NOW, DEFAULT_ACQUISITION_CADENCE_MS, &mut clock);
+        let frame = assess_with_clock(
+            &raw,
+            fixtures::NOW,
+            DEFAULT_ACQUISITION_CADENCE_MS,
+            &mut clock,
+        );
         assert_eq!(frame.source, TelemetrySource::SoftwareFallback);
         let mapping = frame.to_sensory_mapping();
         assert_eq!(
