@@ -28,8 +28,8 @@ use std::fmt;
 use std::net::{SocketAddr, UdpSocket};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, TryLockError};
 use std::thread;
 use std::time::Duration;
 
@@ -501,7 +501,15 @@ impl<T: Send> IsolatedPublishQueue<T> {
 
     /// Non-blocking enqueue. Never waits on a consumer.
     pub fn try_enqueue(&self, item: T) -> Result<(), PublishError> {
-        let mut inner = self.inner.lock().expect("sensory queue mutex poisoned");
+        let mut inner = match try_lock_with_spin(&self.inner) {
+            Ok(inner) => inner,
+            Err(TryLockQueueError::Poisoned) => {
+                return Err(PublishError::Disconnected);
+            }
+            Err(TryLockQueueError::Contended) => {
+                return Err(PublishError::SlowConsumer);
+            }
+        };
         if !inner.connected {
             inner.record_drop(DropReason::Disconnected);
             inner.emit_gauges();
@@ -527,6 +535,16 @@ impl<T: Send> IsolatedPublishQueue<T> {
                 inner.emit_gauges();
                 Ok(())
             }
+        }
+    }
+
+    /// Record a publish-time loss without enqueueing (for example validation failure).
+    pub fn record_publish_loss(&self, reason: DropReason) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.record_drop(reason);
+            inner.emit_gauges();
+        } else {
+            record_drop(reason);
         }
     }
 
@@ -669,7 +687,7 @@ impl SensoryPublisher for CorpusIpcPublisher {
         let batch_id = self.batch_id.fetch_add(1, Ordering::Relaxed);
         let batch = mapping_to_stimulus_batch(mapping, self.session_id.clone(), batch_id);
         if let Err(err) = batch.validate() {
-            record_drop(DropReason::SendFailed);
+            self.queue.record_publish_loss(DropReason::SendFailed);
             return Err(PublishError::SendFailed(err.to_string()));
         }
         self.queue.try_enqueue(IpcMessage::Stimuli(batch))
@@ -708,6 +726,31 @@ fn send_dequeued_message(
         tracing::debug!("corpus-ipc: UDP send failed ({err}); dropping frame");
         consumer.record_loss(DropReason::SendFailed);
     }
+}
+
+enum TryLockQueueError {
+    Contended,
+    Poisoned,
+}
+
+const ENQUEUE_TRY_LOCK_SPINS: u32 = 128;
+
+fn try_lock_with_spin<T>(
+    mutex: &Mutex<T>,
+) -> Result<std::sync::MutexGuard<'_, T>, TryLockQueueError> {
+    for spin in 0..ENQUEUE_TRY_LOCK_SPINS {
+        match mutex.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::WouldBlock) => {
+                if spin + 1 == ENQUEUE_TRY_LOCK_SPINS {
+                    return Err(TryLockQueueError::Contended);
+                }
+                std::hint::spin_loop();
+            }
+            Err(TryLockError::Poisoned(_)) => return Err(TryLockQueueError::Poisoned),
+        }
+    }
+    Err(TryLockQueueError::Contended)
 }
 
 fn record_drop(reason: DropReason) {
