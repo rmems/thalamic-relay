@@ -393,8 +393,12 @@ impl QueueSnapshot {
 #[derive(Debug)]
 struct SharedQueue<T> {
     inner: Mutex<QueueInner<T>>,
-    /// Mutex-contended drops recorded without acquiring [`Self::inner`].
-    dropped_mutex_contended: AtomicU64,
+    /// Per-reason drops recorded without acquiring [`Self::inner`] (mutex contended).
+    dropped_lock_free: [AtomicU64; DropReason::ALL.len()],
+}
+
+fn lock_free_dropped_slots() -> [AtomicU64; DropReason::ALL.len()] {
+    std::array::from_fn(|_| AtomicU64::new(0))
 }
 
 #[derive(Debug)]
@@ -492,7 +496,7 @@ impl<T: Send> IsolatedPublishQueue<T> {
                 enqueued_total: 0,
                 dropped_by_reason: [0; DropReason::ALL.len()],
             }),
-            dropped_mutex_contended: AtomicU64::new(0),
+            dropped_lock_free: lock_free_dropped_slots(),
         });
         export_queue_gauges(0, config.capacity(), config.policy());
         register_drop_reason_series();
@@ -560,19 +564,24 @@ impl<T: Send> IsolatedPublishQueue<T> {
 
     /// Record a publish-time loss without enqueueing (for example validation failure).
     pub fn record_publish_loss(&self, reason: DropReason) {
-        if let Ok(mut inner) = self.shared.inner.lock() {
-            inner.record_drop(reason);
-            inner.emit_gauges();
-        } else {
-            record_drop(reason);
+        match try_lock_with_spin(&self.shared.inner) {
+            Ok(mut inner) => {
+                inner.record_drop(reason);
+                inner.emit_gauges();
+            }
+            Err(TryLockQueueError::Poisoned) | Err(TryLockQueueError::Contended) => {
+                self.record_lock_free_drop(reason);
+            }
         }
     }
 
     fn record_mutex_contended_loss(&self) {
-        self.shared
-            .dropped_mutex_contended
-            .fetch_add(1, Ordering::Relaxed);
-        record_drop(DropReason::MutexContended);
+        self.record_lock_free_drop(DropReason::MutexContended);
+    }
+
+    fn record_lock_free_drop(&self, reason: DropReason) {
+        self.shared.dropped_lock_free[reason.as_id()].fetch_add(1, Ordering::Relaxed);
+        record_drop(reason);
     }
 
     /// Current depth, capacity, policy, and counters.
@@ -584,8 +593,10 @@ impl<T: Send> IsolatedPublishQueue<T> {
             .lock()
             .expect("sensory queue mutex poisoned")
             .snapshot();
-        snap.dropped_by_reason[DropReason::MutexContended.as_id()] +=
-            self.shared.dropped_mutex_contended.load(Ordering::Relaxed);
+        for reason in DropReason::ALL {
+            let id = reason.as_id();
+            snap.dropped_by_reason[id] += self.shared.dropped_lock_free[id].load(Ordering::Relaxed);
+        }
         snap
     }
 
@@ -1125,6 +1136,38 @@ mod tests {
         assert_eq!(snap.depth, 0);
         assert_eq!(snap.dropped(DropReason::MutexContended), 1);
         assert_eq!(snap.dropped(DropReason::RejectNewest), 0);
+        holder.join().unwrap();
+    }
+
+    #[test]
+    fn record_publish_loss_does_not_block_under_mutex_hold() {
+        let (queue, _consumer) = IsolatedPublishQueue::<SensoryMapping>::bounded_with_policy(
+            8,
+            QueueFullPolicy::RejectNewest,
+        )
+        .unwrap();
+        let shared = Arc::clone(queue.shared_for_test());
+        let lock_held = Arc::new(AtomicBool::new(false));
+        let holder = thread::spawn({
+            let shared = Arc::clone(&shared);
+            let lock_held = Arc::clone(&lock_held);
+            move || {
+                let _guard = shared.inner.lock().expect("hold queue mutex");
+                lock_held.store(true, Ordering::Release);
+                thread::sleep(Duration::from_millis(50));
+            }
+        });
+        while !lock_held.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+        let started = std::time::Instant::now();
+        queue.record_publish_loss(DropReason::SendFailed);
+        assert!(
+            started.elapsed() < Duration::from_millis(20),
+            "record_publish_loss must not block on the contended mutex"
+        );
+        let snap = queue.snapshot();
+        assert_eq!(snap.dropped(DropReason::SendFailed), 1);
         holder.join().unwrap();
     }
 

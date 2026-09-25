@@ -25,8 +25,9 @@ The typed validity / freshness / provenance / normalization contract
 `thalamic_relay::telemetry`. Frame ordering and timestamp provenance
 (RM-1335) live in `thalamic_relay::time`: `session_id` / `batch_id` match
 corpus-ipc `StimulusBatch`, source wall time is preserved separately from
-receive/emit time, and a restart is a new `session_id` with `batch_id`
-reset to 0. `TelemetryFrame::to_sensory_mapping()` is the
+receive/emit time, and a process restart is a new `session_id`; telemetry
+`SampleClock` in `thalamic_relay::time` resets `batch_id` to 0 (wire
+allocation below). `TelemetryFrame::to_sensory_mapping()` is the
 deterministic mapping surface toward `corpus-ipc`; it is **not** a second
 wire schema and does not implement transport. `publish` maps that into
 `corpus_ipc::StimulusBatch` and sends `IpcMessage::Stimuli` via
@@ -90,8 +91,10 @@ without conversion would make the corpus-ipc timestamp 1,000,000× too small.
 Freshness is computed before encoding from the frame's receive time, as
 specified in [`telemetry.md`](telemetry.md); this wire timestamp is not its
 authoritative freshness clock.
-`batch_id` is allocated per publish attempt before validation and queue
-admission; rejected attempts can leave gaps. `session_id` comes from
+`batch_id` on the wire is allocated by `CorpusIpcPublisher` (counter
+initialized to 1; each attempt uses `fetch_add` before validation, so the
+first emitted batch after process start is `1`, not `0`). Rejected attempts
+can leave gaps. `session_id` comes from
 `--ipc-session-id` / `THALAMIC_IPC_SESSION_ID` (default `thalamic-relay`).
 
 Channel order is the GH#41 runtime-input inventory (no observability filler):
