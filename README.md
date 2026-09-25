@@ -266,7 +266,7 @@ observable here; there is no neural-state query:
 - `safety_transitions_total` / `safety_actuator_failures_total` — counters
 - `sensory_queue_depth` / `sensory_queue_capacity` — current vs configured outbound queue size
 - `sensory_queue_enqueued_total` — frames accepted into the queue
-- `sensory_queue_dropped_total{reason=...}` — drops with a **closed** reason set (`reject_newest`, `drop_oldest`, `absent`, `disconnected`, `send_failed`); never a payload string
+- `sensory_queue_dropped_total{reason=...}` — drops with a **closed** reason set (`reject_newest`, `drop_oldest`, `absent`, `disconnected`, `send_failed`, `mutex_contended`); never a payload string
 - `sensory_queue_full_policy{policy=drop_oldest|reject_newest}` — one-hot configured overflow policy
 - `shutdown_total{reason}` / `shutdown_unresolved_brake` /
   `shutdown_unresolved_actuator` / `shutdown_brake_left_engaged` — last

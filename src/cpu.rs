@@ -227,7 +227,7 @@ mod tests {
         assert!(text.contains("sensory_queue_enqueued_total 5"));
         assert!(text.contains("sensory_queue_dropped_total{reason=\"drop_oldest\"} 1"));
         assert!(text.contains("sensory_queue_full_policy{policy=\"drop_oldest\"} 1"));
-        assert_eq!(DropReason::ALL.len(), 5);
+        assert_eq!(DropReason::ALL.len(), 6);
     }
 
     #[test]

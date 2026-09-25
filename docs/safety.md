@@ -158,7 +158,7 @@ Exported without querying Brainstem:
 | `sensory_queue_depth` | gauge | frames currently buffered |
 | `sensory_queue_capacity` | gauge | configured finite capacity |
 | `sensory_queue_enqueued_total` | counter | frames accepted into the queue |
-| `sensory_queue_dropped_total{reason}` | counter | closed reason set: `reject_newest`, `drop_oldest`, `absent`, `disconnected`, `send_failed` |
+| `sensory_queue_dropped_total{reason}` | counter | closed reason set: `reject_newest`, `drop_oldest`, `absent`, `disconnected`, `send_failed`, `mutex_contended` |
 | `sensory_queue_full_policy{policy}` | gauge 0/1 | one-hot `drop_oldest` / `reject_newest` |
 | `shutdown_total{reason}` | counter | orderly shutdown (`sigint` / `sigterm`) |
 | `shutdown_unresolved_brake` | gauge 0/1 | brake still claimed or still desired at exit |

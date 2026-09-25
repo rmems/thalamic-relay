@@ -177,16 +177,19 @@ pub enum DropReason {
     /// Transport reported a send failure. The label is static; the error
     /// string is not used as a Prometheus label.
     SendFailed,
+    /// Incoming frame dropped after bounded `try_lock` spins (mutex still held).
+    MutexContended,
 }
 
 impl DropReason {
     /// All reasons, in stable metric-id order. Cardinality is this length.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::RejectNewest,
         Self::DropOldest,
         Self::Absent,
         Self::Disconnected,
         Self::SendFailed,
+        Self::MutexContended,
     ];
 
     /// Stable index into [`QueueSnapshot::dropped_by_reason`].
@@ -198,6 +201,7 @@ impl DropReason {
             Self::Absent => 2,
             Self::Disconnected => 3,
             Self::SendFailed => 4,
+            Self::MutexContended => 5,
         }
     }
 
@@ -210,6 +214,7 @@ impl DropReason {
             Self::Absent => "absent",
             Self::Disconnected => "disconnected",
             Self::SendFailed => "send_failed",
+            Self::MutexContended => "mutex_contended",
         }
     }
 }
@@ -386,6 +391,13 @@ impl QueueSnapshot {
 }
 
 #[derive(Debug)]
+struct SharedQueue<T> {
+    inner: Mutex<QueueInner<T>>,
+    /// Mutex-contended drops recorded without acquiring [`Self::inner`].
+    dropped_mutex_contended: AtomicU64,
+}
+
+#[derive(Debug)]
 struct QueueInner<T> {
     buf: VecDeque<T>,
     capacity: usize,
@@ -430,23 +442,27 @@ impl<T> QueueInner<T> {
 /// Dropping the last producer lets a drain worker exit after remaining frames.
 #[derive(Debug)]
 pub struct IsolatedPublishQueue<T> {
-    inner: Arc<Mutex<QueueInner<T>>>,
+    shared: Arc<SharedQueue<T>>,
 }
 
 impl<T> Clone for IsolatedPublishQueue<T> {
     fn clone(&self) -> Self {
-        let mut inner = self.inner.lock().expect("sensory queue mutex poisoned");
+        let mut inner = self
+            .shared
+            .inner
+            .lock()
+            .expect("sensory queue mutex poisoned");
         inner.producers = inner.producers.saturating_add(1);
         drop(inner);
         Self {
-            inner: Arc::clone(&self.inner),
+            shared: Arc::clone(&self.shared),
         }
     }
 }
 
 impl<T> Drop for IsolatedPublishQueue<T> {
     fn drop(&mut self) {
-        if let Ok(mut inner) = self.inner.lock() {
+        if let Ok(mut inner) = self.shared.inner.lock() {
             inner.producers = inner.producers.saturating_sub(1);
         }
     }
@@ -456,7 +472,7 @@ impl<T> Drop for IsolatedPublishQueue<T> {
 /// disconnected; remaining frames are counted as [`DropReason::Disconnected`].
 #[derive(Debug)]
 pub struct SensoryQueueConsumer<T> {
-    inner: Arc<Mutex<QueueInner<T>>>,
+    shared: Arc<SharedQueue<T>>,
 }
 
 impl<T: Send> IsolatedPublishQueue<T> {
@@ -466,23 +482,26 @@ impl<T: Send> IsolatedPublishQueue<T> {
     /// [`QueueConfig::new`].
     pub fn new(config: QueueConfig) -> Result<(Self, SensoryQueueConsumer<T>), QueueConfigError> {
         QueueConfig::validate_capacity(config.capacity())?;
-        let inner = Arc::new(Mutex::new(QueueInner {
-            buf: VecDeque::with_capacity(config.capacity()),
-            capacity: config.capacity(),
-            policy: config.policy(),
-            connected: true,
-            producers: 1,
-            enqueued_total: 0,
-            dropped_by_reason: [0; DropReason::ALL.len()],
-        }));
+        let shared = Arc::new(SharedQueue {
+            inner: Mutex::new(QueueInner {
+                buf: VecDeque::with_capacity(config.capacity()),
+                capacity: config.capacity(),
+                policy: config.policy(),
+                connected: true,
+                producers: 1,
+                enqueued_total: 0,
+                dropped_by_reason: [0; DropReason::ALL.len()],
+            }),
+            dropped_mutex_contended: AtomicU64::new(0),
+        });
         export_queue_gauges(0, config.capacity(), config.policy());
         register_drop_reason_series();
         counter!("sensory_queue_enqueued_total").increment(0);
         Ok((
             Self {
-                inner: Arc::clone(&inner),
+                shared: Arc::clone(&shared),
             },
-            SensoryQueueConsumer { inner },
+            SensoryQueueConsumer { shared },
         ))
     }
 
@@ -501,12 +520,13 @@ impl<T: Send> IsolatedPublishQueue<T> {
 
     /// Non-blocking enqueue. Never waits on a consumer.
     pub fn try_enqueue(&self, item: T) -> Result<(), PublishError> {
-        let mut inner = match try_lock_with_spin(&self.inner) {
+        let mut inner = match try_lock_with_spin(&self.shared.inner) {
             Ok(inner) => inner,
             Err(TryLockQueueError::Poisoned) => {
                 return Err(PublishError::Disconnected);
             }
             Err(TryLockQueueError::Contended) => {
+                self.record_mutex_contended_loss();
                 return Err(PublishError::SlowConsumer);
             }
         };
@@ -540,7 +560,7 @@ impl<T: Send> IsolatedPublishQueue<T> {
 
     /// Record a publish-time loss without enqueueing (for example validation failure).
     pub fn record_publish_loss(&self, reason: DropReason) {
-        if let Ok(mut inner) = self.inner.lock() {
+        if let Ok(mut inner) = self.shared.inner.lock() {
             inner.record_drop(reason);
             inner.emit_gauges();
         } else {
@@ -548,13 +568,30 @@ impl<T: Send> IsolatedPublishQueue<T> {
         }
     }
 
+    fn record_mutex_contended_loss(&self) {
+        self.shared
+            .dropped_mutex_contended
+            .fetch_add(1, Ordering::Relaxed);
+        record_drop(DropReason::MutexContended);
+    }
+
     /// Current depth, capacity, policy, and counters.
     #[must_use]
     pub fn snapshot(&self) -> QueueSnapshot {
-        self.inner
+        let mut snap = self
+            .shared
+            .inner
             .lock()
             .expect("sensory queue mutex poisoned")
-            .snapshot()
+            .snapshot();
+        snap.dropped_by_reason[DropReason::MutexContended.as_id()] +=
+            self.shared.dropped_mutex_contended.load(Ordering::Relaxed);
+        snap
+    }
+
+    #[cfg(test)]
+    fn shared_for_test(&self) -> &Arc<SharedQueue<T>> {
+        &self.shared
     }
 }
 
@@ -567,7 +604,11 @@ impl SensoryPublisher for IsolatedPublishQueue<SensoryMapping> {
 impl<T> SensoryQueueConsumer<T> {
     /// Non-blocking dequeue. `None` if the queue is empty.
     pub fn try_recv(&self) -> Option<T> {
-        let mut inner = self.inner.lock().expect("sensory queue mutex poisoned");
+        let mut inner = self
+            .shared
+            .inner
+            .lock()
+            .expect("sensory queue mutex poisoned");
         let item = inner.buf.pop_front();
         if item.is_some() {
             inner.emit_gauges();
@@ -577,7 +618,11 @@ impl<T> SensoryQueueConsumer<T> {
 
     /// Worker-side poll: dequeue, or report idle / all producers dropped.
     fn poll_worker(&self) -> WorkerPoll<T> {
-        let mut inner = self.inner.lock().expect("sensory queue mutex poisoned");
+        let mut inner = self
+            .shared
+            .inner
+            .lock()
+            .expect("sensory queue mutex poisoned");
         if let Some(msg) = inner.buf.pop_front() {
             inner.emit_gauges();
             return WorkerPoll::Message(msg);
@@ -590,7 +635,7 @@ impl<T> SensoryQueueConsumer<T> {
     }
 
     fn record_loss(&self, reason: DropReason) {
-        let Ok(mut inner) = self.inner.lock() else {
+        let Ok(mut inner) = self.shared.inner.lock() else {
             record_drop(reason);
             return;
         };
@@ -607,7 +652,7 @@ enum WorkerPoll<T> {
 
 impl<T> Drop for SensoryQueueConsumer<T> {
     fn drop(&mut self) {
-        let Ok(mut inner) = self.inner.lock() else {
+        let Ok(mut inner) = self.shared.inner.lock() else {
             return;
         };
         inner.connected = false;
@@ -907,6 +952,10 @@ mod tests {
     use crate::telemetry::{SignalId, assess, fixtures};
     use std::collections::BTreeSet;
     use std::net::UdpSocket;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+    use std::time::Duration;
 
     fn critical_frame() -> TelemetryFrame {
         let mut raw = fixtures::healthy_real();
@@ -1050,6 +1099,33 @@ mod tests {
                 .map(String::as_str),
             Some("100")
         );
+    }
+
+    #[test]
+    fn try_enqueue_mutex_contention_records_drop_without_full_queue() {
+        let (queue, _consumer) =
+            IsolatedPublishQueue::bounded_with_policy(8, QueueFullPolicy::RejectNewest).unwrap();
+        let shared = Arc::clone(queue.shared_for_test());
+        let lock_held = Arc::new(AtomicBool::new(false));
+        let holder = thread::spawn({
+            let shared = Arc::clone(&shared);
+            let lock_held = Arc::clone(&lock_held);
+            move || {
+                let _guard = shared.inner.lock().expect("hold queue mutex");
+                lock_held.store(true, Ordering::Release);
+                thread::sleep(Duration::from_millis(50));
+            }
+        });
+        while !lock_held.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+        let err = queue.try_enqueue(mapping_at(99)).unwrap_err();
+        assert_eq!(err, PublishError::SlowConsumer);
+        let snap = queue.snapshot();
+        assert_eq!(snap.depth, 0);
+        assert_eq!(snap.dropped(DropReason::MutexContended), 1);
+        assert_eq!(snap.dropped(DropReason::RejectNewest), 0);
+        holder.join().unwrap();
     }
 
     #[test]
@@ -1213,7 +1289,8 @@ mod tests {
                 "drop_oldest",
                 "absent",
                 "disconnected",
-                "send_failed"
+                "send_failed",
+                "mutex_contended",
             ]
         );
         let unique: BTreeSet<_> = labels.iter().copied().collect();
