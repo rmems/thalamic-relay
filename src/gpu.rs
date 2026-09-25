@@ -220,6 +220,11 @@ fn plan_brake_apply(
     default: Option<u32>,
     pct: f32,
 ) -> Result<Option<u32>, ActuatorError> {
+    if pct != crate::safety::BRAKE_FRACTION {
+        return Err(ActuatorError::CommandFailed(
+            "unsupported brake fraction".into(),
+        ));
+    }
     let (Some(current), Some(default)) = (current.filter(|w| *w > 0), default.filter(|w| *w > 0))
     else {
         return Err(ActuatorError::PowerLimitUnavailable);
@@ -639,6 +644,19 @@ mod power_limit_ownership_tests {
         assert_eq!(plan_brake_apply(Some(200), Some(400), 0.5).unwrap(), None);
         assert_eq!(
             plan_brake_apply(Some(400), Some(400), 0.5).unwrap(),
+            Some(200)
+        );
+    }
+
+    #[test]
+    fn apply_rejects_fractions_other_than_the_fixed_brake() {
+        let err = plan_brake_apply(Some(400), Some(400), 0.6).unwrap_err();
+        assert!(
+            matches!(err, ActuatorError::CommandFailed(ref msg) if msg.contains("unsupported brake fraction"))
+        );
+        assert!(plan_brake_apply(Some(400), Some(400), 0.0).is_err());
+        assert_eq!(
+            plan_brake_apply(Some(400), Some(400), crate::safety::BRAKE_FRACTION).unwrap(),
             Some(200)
         );
     }

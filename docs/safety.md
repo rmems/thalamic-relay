@@ -61,8 +61,9 @@ worst fault wins: **missing > invalid > stale**. Equal rank prefers
 2. Warn while released (and not immediately post-release) does **not** apply.
 3. Warn or critical **immediately after a successful release** re-applies
    (the restored default PL is not left in a still-hot/warn band).
-4. Release requires **3 consecutive real Ok** evaluations while the brake is
-   engaged (~3 s at the default 100 ms tick × every 10 ticks).
+4. Release requires the configured real `Ok` streak
+   (`SafetyPolicyConfig.release_ok_streak`, default **3**) while the brake is
+   engaged (~3 s at the default streak and 100 ms tick × every 10 ticks).
 5. Simulated telemetry while braked holds the brake and resets the Ok streak.
 6. Actuator failure does not freeze evaluation: the next frame still
    classifies and the intent is retried.
