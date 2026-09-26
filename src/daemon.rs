@@ -26,7 +26,10 @@ use crate::shutdown::{
     ShutdownActuation, ShutdownPlan, ShutdownReason, join_in_flight, plan_shutdown,
     shutdown_metrics_collector,
 };
-use crate::telemetry::{SampleValidity, TelemetryFrame, TelemetrySample, TelemetrySource};
+use crate::telemetry::{
+    RawTelemetry, SampleClock, SampleValidity, TelemetryFrame, TelemetrySample, TelemetrySource,
+    assess_with_clock, unix_now_ms,
+};
 use tokio::signal::unix::{SignalKind, signal};
 
 #[derive(Debug)]
@@ -156,6 +159,11 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut step_count: u64 = 0;
     let mut machine = SafetyMachine::with_policy(policy);
+    let mut sample_clock = if cli.ipc_session_id.is_empty() {
+        SampleClock::new()
+    } else {
+        SampleClock::with_session_id(cli.ipc_session_id.clone())
+    };
     let publisher = build_publisher(&cli);
     let mut warned_brake_held_sim = false;
     let mut brake_task: Option<ActuationTask> = None;
@@ -207,8 +215,11 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let shutdown_reason = loop {
         step_count += 1;
-        let telemetry =
-            HardwareBridge::read_telemetry_with(cli.force_software_only, cli.step_interval_ms);
+        let telemetry = HardwareBridge::read_telemetry_with_clock(
+            cli.force_software_only,
+            cli.step_interval_ms,
+            &mut sample_clock,
+        );
 
         let mut evaluated_this_iter = false;
 
@@ -220,11 +231,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
                     let force_software_only = cli.force_software_only;
                     let cadence_ms = cli.step_interval_ms;
-                    let post_telemetry = tokio::task::spawn_blocking(move || {
-                        HardwareBridge::read_telemetry_with(force_software_only, cadence_ms)
-                    })
-                    .await
-                    .expect("post-brake telemetry read task panicked");
+                    let raw = acquire_raw_with_timeout(force_software_only).await;
+                    let post_telemetry =
+                        assess_with_clock(&raw, unix_now_ms(), cadence_ms, &mut sample_clock);
                     let (snap, pub_res) = evaluate_then_try_publish(
                         &mut machine,
                         &post_telemetry,
@@ -256,11 +265,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
                     let force_software_only = cli.force_software_only;
                     let cadence_ms = cli.step_interval_ms;
-                    let post_telemetry = tokio::task::spawn_blocking(move || {
-                        HardwareBridge::read_telemetry_with(force_software_only, cadence_ms)
-                    })
-                    .await
-                    .expect("post-release telemetry read task panicked");
+                    let raw = acquire_raw_with_timeout(force_software_only).await;
+                    let post_telemetry =
+                        assess_with_clock(&raw, unix_now_ms(), cadence_ms, &mut sample_clock);
                     let (snap, pub_res) = evaluate_then_try_publish(
                         &mut machine,
                         &post_telemetry,
@@ -297,7 +304,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let _ = pub_res;
             store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
             spawn_intent(&snap, &actuator, &mut brake_task, &mut release_task);
-        } else {
+        } else if !evaluated_this_iter {
             // Publication is outside the safety critical path and never awaited.
             let _ = publisher.try_publish(&telemetry.to_sensory_mapping());
         }
@@ -444,6 +451,25 @@ async fn perform_orderly_shutdown(
 
     shutdown_metrics_collector(metrics_shutdown, metrics_task, SHUTDOWN_METRICS_TIMEOUT).await;
     plan
+}
+
+/// Bounded wait for NVML acquisition after actuation so a wedged driver cannot
+/// stall the supervisor loop indefinitely.
+async fn acquire_raw_with_timeout(force_software_only: bool) -> RawTelemetry {
+    const TIMEOUT: Duration = Duration::from_secs(2);
+    match tokio::time::timeout(
+        TIMEOUT,
+        tokio::task::spawn_blocking(move || HardwareBridge::acquire_raw(force_software_only)),
+    )
+    .await
+    {
+        Ok(Ok(raw)) => raw,
+        Ok(Err(_)) => panic!("post-actuation telemetry read task panicked"),
+        Err(_) => {
+            tracing::warn!("post-actuation NVML acquisition timed out; treating as unavailable");
+            RawTelemetry::nvml_unavailable(unix_now_ms())
+        }
+    }
 }
 
 fn build_publisher(cli: &Cli) -> Box<dyn SensoryPublisher> {
@@ -655,7 +681,7 @@ struct Cli {
     #[arg(long, env = "THALAMIC_IPC_DISABLED", num_args = 0..=1, default_missing_value = "true", default_value_t = false, value_parser = clap::value_parser!(bool))]
     ipc_disabled: bool,
 
-    /// Session id stamped on each `StimulusBatch` (`session_id`). Empty omits it.
+    /// Session id stamped on each `StimulusBatch` (`session_id`). Empty keeps the telemetry-generated session id and its sequence.
     #[arg(long, default_value = DEFAULT_IPC_SESSION_ID, env = "THALAMIC_IPC_SESSION_ID")]
     ipc_session_id: String,
 }

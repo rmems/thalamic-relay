@@ -55,6 +55,7 @@ impl HardwareBridge {
     }
 
     /// Acquire + assess with the configured supervisor tick interval.
+    #[cfg(test)]
     pub fn read_telemetry_with(force_software: bool, cadence_ms: u64) -> TelemetryFrame {
         Self::read_telemetry_with_clock(force_software, cadence_ms, &mut SampleClock::new())
     }
