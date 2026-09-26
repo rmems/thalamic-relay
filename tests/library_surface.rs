@@ -63,9 +63,12 @@ fn downstream_crate_maps_sensory_inputs_and_publishes_best_effort() {
         Err(PublishError::Absent)
     );
 
-    let (queue, rx) = IsolatedPublishQueue::bounded(1);
+    let (queue, consumer) = IsolatedPublishQueue::bounded(1).expect("capacity 1 is valid");
     queue.try_publish(&mapping).unwrap();
-    assert_eq!(rx.try_recv().unwrap().stimuli.len(), mapping.stimuli.len());
+    assert_eq!(
+        consumer.try_recv().expect("published frame").stimuli.len(),
+        mapping.stimuli.len()
+    );
 
     let mut machine = SafetyMachine::new();
     let (snap, pub_res) = evaluate_then_try_publish(&mut machine, &frame, &AbsentPublisher);

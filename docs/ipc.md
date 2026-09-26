@@ -25,13 +25,18 @@ The typed validity / freshness / provenance / normalization contract
 `thalamic_relay::telemetry`. Frame ordering and timestamp provenance
 (RM-1335) live in `thalamic_relay::time`: `session_id` / `batch_id` match
 corpus-ipc `StimulusBatch`, source wall time is preserved separately from
-receive/emit time, and a restart is a new `session_id` with `batch_id`
-reset to 0. `TelemetryFrame::to_sensory_mapping()` is the
+receive/emit time, and a process restart is a new `session_id`; telemetry
+`SampleClock` in `thalamic_relay::time` resets `batch_id` to 0 (wire
+allocation below). `TelemetryFrame::to_sensory_mapping()` is the
 deterministic mapping surface toward `corpus-ipc`; it is **not** a second
-wire schema. `publish` maps that into `corpus_ipc::StimulusBatch` and sends
-`IpcMessage::Stimuli` via `CorpusIpcPublisher`, using `AbsentPublisher` or
-`IsolatedPublishQueue` off the safety path so transport failures never stall
-`SafetyMachine::evaluate`.
+wire schema and does not implement transport. `publish` maps that into
+`corpus_ipc::StimulusBatch` and sends `IpcMessage::Stimuli` via
+`CorpusIpcPublisher`: a bounded `IsolatedPublishQueue` (capacity finite and
+configurable, full-queue policy explicit `drop-oldest` or `reject-newest`,
+overflow visible on Prometheus) feeding a detached UDP worker.
+`AbsentPublisher` remains the GH#42 isolation stub for “no consumer at all”.
+A stalled consumer, full queue, or missing drain cannot stall the safety
+loop, and transport failures never stall `SafetyMachine::evaluate`.
 
 ## Ownership
 
@@ -87,13 +92,15 @@ Freshness is computed before encoding from the frame's receive time, as
 specified in [`telemetry.md`](telemetry.md); this wire timestamp is not its
 authoritative freshness clock.
 `batch_id` is the strictly increasing per-session sequence stamped at
-acquisition (via `SampleClock`), before publication is attempted. Consequently,
-a consumer can detect loss as a sequence gap even when a frame is replaced under
-backpressure. `session_id` comes from `--ipc-session-id` / `THALAMIC_IPC_SESSION_ID`
-when explicitly configured (empty CLI default leaves stamping to the process-unique
-boot session on each frame); otherwise the mapping's boot/session id is used.
-Consumers use `(session_id, batch_id)` as the idempotency key and may discard
-a duplicate or replayed pair.
+acquisition (via `SampleClock` in `thalamic_relay::time`), before
+publication is attempted. When `--ipc-session-id` / `THALAMIC_IPC_SESSION_ID`
+overrides the session, `CorpusIpcPublisher` allocates a publisher-scoped
+`batch_id` sequence (starting at `0` on process start) instead of reusing the
+mapping counter. Validation failures and queue policy can leave sequence gaps.
+`session_id` comes from that CLI/env override when configured (empty default
+leaves stamping to the process-unique boot session on each frame); otherwise
+the mapping's boot/session id is used. Consumers use `(session_id, batch_id)` as
+the idempotency key and may discard a duplicate or replayed pair.
 
 Channel order is the GH#41 runtime-input inventory (no observability filler):
 

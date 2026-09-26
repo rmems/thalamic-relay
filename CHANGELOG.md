@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **Outbound sensory queue (RM-1329):** `IsolatedPublishQueue` is a validated finite buffer (`--sensory-queue-capacity` / `THALAMIC_SENSORY_QUEUE_CAPACITY`, default 32, range 1–4096) with an explicit full-queue policy (`--sensory-queue-full-policy` / `THALAMIC_SENSORY_QUEUE_FULL_POLICY`, default `drop-oldest`, also `reject-newest`). Prometheus exposes `sensory_queue_depth`, `sensory_queue_capacity`, `sensory_queue_enqueued_total`, `sensory_queue_dropped_total{reason}` (closed label set), and `sensory_queue_full_policy{policy}`. `CorpusIpcPublisher` enqueues into this buffer, which a detached UDP worker drains. Safety evaluation is unchanged and does not wait on the consumer.
 - **Docs (RM-1223 / GH#49):** Crate-level rustdoc, README, CLI help, and `docs/*.md`
   describe the sensory + deterministic safety boundary only (no in-process SNN).
   Documented software-only vs `NvmlUnavailable`, GPU power-limit privilege
