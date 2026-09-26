@@ -4,16 +4,18 @@
 
 ```bash
 cargo test                    # all tests
-cargo test --lib              # src/lib.rs tests (telemetry + telemetry_csv + gpu + cpu)
-cargo test --bin thalamic-relay  # src/main.rs tests (CLI/lock/spawn_intent)
+cargo test --lib              # telemetry + telemetry_csv + gpu + cpu + safety + publish
 cargo test --test software_only  # GPU-less integration harness (RM-1217)
+cargo test telemetry          # typed contract / fixtures
+cargo test gpu                # gpu acquisition + check_safety facade
+cargo test safety              # SafetyMachine + named states (no GPU)
+cargo test publish             # IPC isolation / StimulusBatch mapping / bounded queue policy
 cargo test time               # sample clock + timestamp provenance
 cargo test freshness          # freshness gauge basis / boundaries
 cargo test telemetry_csv      # frozen CSV header / parse / replay (RM-629)
-cargo test gpu                # gpu acquisition + check_safety facade
-cargo test safety              # SafetyMachine + named states (no GPU)
-cargo test publish             # IPC isolation / corpus-ipc StimulusBatch mapping
 cargo test cpu                # cpu metrics tests
+cargo test queue              # bounded queue capacity, policy, overflow counters
+cargo test metrics            # metrics defaults, safety snapshot copy, queue exposition
 cargo test test_safety        # safety-related tests
 cargo test lock_guard         # single-instance lockfile tests
 ```
@@ -78,24 +80,22 @@ cargo test lock_guard         # single-instance lockfile tests
 | lib.rs | `record_safety_snapshot_copies_state_and_brake` | Shared metrics copy safety snapshot |
 | lib.rs | `healthy_real_is_named_state` … `transitions_are_counted` | `SafetyMachine` GPU-less transitions (`src/safety.rs`) |
 | lib.rs | `absent_brainstem_does_not_block_or_change_safety` … | IPC/Brainstem absence cannot stall safety (`src/publish.rs`) |
+| lib.rs | `queue_capacity_is_validated` … `queue_metrics_exposition_shows_forced_overflow` | Bounded queue, policies, drop-reason cardinality (`src/publish.rs`) |
+| lib.rs | `metrics_queue_snapshot_names_are_stable` | Queue Prometheus names under overflow (`src/cpu.rs`) |
 | lib.rs | `mapping_to_stimulus_batch_carries_timestamp_source_and_validity` | GH#41 fields on canonical `StimulusBatch` |
 | lib.rs | `missing_channel_is_masked_not_a_real_zero` | `valid_mask` vs legitimate zero |
 | lib.rs | `stimulus_batch_round_trips_through_published_corpus_ipc_types` | serde round-trip of `IpcMessage::Stimuli` |
-| lib.rs | `corpus_ipc_publisher_slow_consumer_does_not_block_safety` | Bounded `try_send` isolation |
+| lib.rs | `corpus_ipc_publisher_slow_consumer_does_not_block_safety` | Bounded policy-queue isolation |
 | lib.rs | `software_only_emits_typed_corpus_ipc_frame_without_gpu` | Software-only UDP emit, no GPU |
-| main.rs | `parses_ipc_flags` | `--ipc-endpoint` / `--ipc-disabled` / `--ipc-session-id` |
-| main.rs | `dashboard_shows_only_valid_present_as_live_hardware` | Dashboard hides stale/invalid/missing |
-| main.rs | `parses_custom_args_and_env_equiv` | CLI flag parsing |
-| main.rs | `parses_defaults` | CLI defaults |
-| main.rs | `parses_force_software_only_false` | `--force-software-only=false` |
-| main.rs | `lock_guard_created_and_removed` | Lockfile create/drop lifecycle |
-| main.rs | `lock_guard_rejects_active_pid` | Second instance refused while PID alive |
-| main.rs | `lock_guard_reclaims_stale_lock` | Stale lock (dead PID) reclaimed |
-| main.rs | `lock_guard_rejects_unparseable_pid` | Unreadable/unparseable lock fail-closed |
-| main.rs | `lock_guard_rejects_empty_lock_file` | Empty lock fail-closed |
-| main.rs | `cli_rejects_zero_step_interval` | `--step-interval-ms 0` rejected |
-| main.rs | `spawn_intent_apply_and_release_drive_fake_actuator` | Supervisor intent dispatch, no GPU |
-| main.rs | `spawn_intent_none_does_not_start_tasks` | Healthy snapshot does not actuate |
+| daemon.rs | `parses_ipc_flags` | `--ipc-endpoint` / `--ipc-disabled` / `--ipc-session-id` |
+| daemon.rs | `dashboard_shows_only_valid_present_as_live_hardware` | Dashboard hides stale/invalid/missing |
+| daemon.rs | `parses_custom_args_and_env_equiv` | CLI flag parsing |
+| daemon.rs | `parses_defaults` | CLI defaults (including sensory-queue capacity/policy) |
+| daemon.rs | `parses_sensory_queue_config` / `rejects_zero_queue_capacity` / `rejects_unknown_queue_policy` | Queue CLI validation |
+| daemon.rs | `parses_force_software_only_false` | `--force-software-only=false` |
+| daemon.rs | `lock_guard_created_and_removed` | Lockfile create/drop lifecycle |
+| daemon.rs | `lock_guard_rejects_active_pid` | Second instance refused while PID alive |
+| daemon.rs | `lock_guard_reclaims_stale_lock` | Stale lock (dead PID) reclaimed |
 | tests/software_only.rs | `binary_help_and_version_exit_zero_without_gpu` | CLI `--help`/`-V` without NVML |
 | tests/software_only.rs | `binary_software_only_starts_without_nvidia` | Forced software-only process start |
 | tests/software_only.rs | `software_only_pipeline_evaluates_safety_then_best_effort_publish` | Acquire → evaluate → absent publish |
@@ -123,11 +123,12 @@ locks the remaining edges and adds an integration harness under `tests/`.
 - Safety: exclusive critical thresholds, mixed-fault ranking (missing > invalid
   > stale; equal rank prefers `gpu_temp_c`), leftover-brake + simulated hold,
   `warn_from_frame` None for Ok/simulated.
-- IPC isolation (GH#40 transport **not** implemented yet): hysteresis still
-  reaches release while `FailingPublisher` errors; capacity-0 queue;
-  disconnected/slow `try_enqueue` cannot change `BrakeIntent::Apply`.
-- CLI/lockfile: unparseable/empty lock fail-closed; zero step interval rejected.
-- Supervisor `spawn_intent` apply/release/none via `FakeActuator` (tokio).
+- IPC isolation: hysteresis still reaches release while `FailingPublisher`
+  errors; capacity-0 is rejected by validation; disconnected/slow
+  `try_enqueue` cannot change `BrakeIntent::Apply`.
+- CLI/lockfile: create/drop lifecycle, active-PID rejection, and stale-lock
+  reclaim. Unparseable/empty lock fail-closed and `--step-interval-ms 0`
+  rejection are runtime/clap behavior without dedicated named tests.
 - Software-only integration crate: binary `--help`/`-V`, `--force-software-only`
   process start, acquire→evaluate→publish pipeline, no GPU.
 
@@ -135,8 +136,11 @@ locks the remaining edges and adds an integration harness under `tests/`.
 
 - `cpu::init_telemetry` / `cpu::run_metrics_collector`: bind a network port and run an indefinite loop; not safely unit-testable without an integration harness.
 - `NvmlActuator` live `nvidia-smi` mutation: requires a real NVML-capable GPU; fail-closed-without-GPU is tested. Policy is covered by `SafetyMachine` + `FakeActuator`.
-- Typed `corpus-ipc` round-trips: blocked on GH#40 / RM-1144. Isolation stub (`AbsentPublisher`, `IsolatedPublishQueue`, `FailingPublisher`) is the current contract.
-- The `main` async supervisor loop body (post-brake re-read, every-10-ticks cadence) is still exercised by the software-only binary smoke plus unit tests of `spawn_intent` / `evaluate_then_try_publish`, not a full in-process tick harness.
+- Typed `corpus-ipc` round-trips and UDP emission are covered by the published
+  `IpcMessage` tests (`stimulus_batch_round_trips_through_published_corpus_ipc_types`,
+  `software_only_emits_typed_corpus_ipc_frame_without_gpu`). `AbsentPublisher`
+  remains the disabled or unavailable fallback.
+- The `main` async supervisor loop body (post-brake re-read, every-10-ticks cadence) is still exercised by the software-only binary smoke plus `evaluate_then_try_publish` / orderly-shutdown tests, not a full in-process tick harness.
 
 ## Coverage update (RM-342)
 

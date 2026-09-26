@@ -103,7 +103,8 @@ firmware thermal protection.
   emergency brake and hysteresis-gated release. Independent of Brainstem and
   of any IPC publisher.
 - **Metrics Collection**: Prometheus-compatible metrics export (freshness,
-  safety state, brake state, transition and actuator-failure counters)
+  safety state, brake state, transition and actuator-failure counters,
+  outbound sensory-queue depth / capacity / drops)
 - **Process Safety**: Single-instance protection via a lockfile mechanism;
   SIGINT/SIGTERM orderly shutdown with fail-closed emergency-brake recovery
 
@@ -166,7 +167,7 @@ thalamic-relay
   - SafetyMachine (never waits on IPC)
   - privileged brake actuator
   - Prometheus safety/brake state
-      ↓  IsolatedPublishQueue.try_enqueue (drop oldest on full; AbsentPublisher if IPC disabled/unavailable)
+      ↓  best-effort try_publish into a bounded queue (policy on full; AbsentPublisher if IPC disabled)
 corpus-ipc          IpcMessage::Stimuli JSON over UDP (not required for safety)
       ↓
 brainstem-daemon
@@ -204,7 +205,7 @@ Reusable from a downstream crate (no GPU, no supervisor process):
 - **`time`**: Process-local sample clock (`session_id` + `batch_id`) and timestamp provenance
 - **`telemetry_csv`**: Frozen hardware-telemetry CSV header + reader/validator for corinth ingest (one-way copy; no corinth dependency)
 - **`safety`**: Pure deterministic classification + hysteresis (`SafetyMachine`) and the `SafetyActuator` trait; no NVML, no IPC
-- **`publish`**: Maps `SensoryMapping` → `corpus-ipc` `StimulusBatch` / `IpcMessage::Stimuli` and UDP-publishes off the safety path (`CorpusIpcPublisher`, `AbsentPublisher`, `IsolatedPublishQueue`)
+- **`publish`**: Maps `SensoryMapping` → `corpus-ipc` `StimulusBatch` / `IpcMessage::Stimuli` and UDP-publishes off the safety path (`CorpusIpcPublisher`, `AbsentPublisher`, bounded `IsolatedPublishQueue` with explicit full-queue policy and drop metrics)
 
 Binary-only (not semver-facing): NVML acquisition (`gpu`), CPU metrics (`cpu`), privileged `nvidia-smi`
 actuation, Prometheus initialization, CLI, process lock, supervisor loop, SIGINT/SIGTERM shutdown.
@@ -214,7 +215,7 @@ actuation, Prometheus initialization, CLI, process lock, supervisor loop, SIGINT
 1. **Hardware Bridge**: GPU acquisition and privileged emergency-brake actuator
 2. **Safety machine**: Named relay states, hysteresis, actuator-failure overlay
 3. **Telemetry System**: Real-time metrics collection and export
-4. **Publish sink**: Best-effort, never on the `evaluate` path
+4. **Publish sink**: Bounded, never on the `evaluate` path; overflow is counted
 
 ## Dependencies
 
@@ -242,6 +243,8 @@ Key options (with env var equivalent):
 - `--metrics-ip` / `THALAMIC_METRICS_IP` (default: 127.0.0.1; port is always 9000)
 - `--step-interval-ms` / `THALAMIC_STEP_INTERVAL_MS` (default: 100) — relay loop tick interval
 - `--force-software-only` / `THALAMIC_FORCE_SOFTWARE_ONLY`
+- `--sensory-queue-capacity` / `THALAMIC_SENSORY_QUEUE_CAPACITY` (default: 32, range 1–4096)
+- `--sensory-queue-full-policy` / `THALAMIC_SENSORY_QUEUE_FULL_POLICY` (default: `drop-oldest`; also `reject-newest`)
 - `--ipc-endpoint` / `THALAMIC_IPC_ENDPOINT` (default: `127.0.0.1:9900`) — UDP destination for `IpcMessage::Stimuli`
 - `--ipc-disabled` / `THALAMIC_IPC_DISABLED` — skip publication; safety still runs
 - `--ipc-session-id` / `THALAMIC_IPC_SESSION_ID` (default: process-unique boot/session id)
@@ -250,6 +253,8 @@ Key options (with env var equivalent):
 Example with env + flag:
 ```bash
 THALAMIC_METRICS_IP=0.0.0.0 \
+  THALAMIC_SENSORY_QUEUE_CAPACITY=16 \
+  THALAMIC_SENSORY_QUEUE_FULL_POLICY=reject-newest \
   cargo run --bin thalamic-relay -- --force-software-only --step-interval-ms 50
 ```
 
@@ -311,12 +316,16 @@ observable here; there is no neural-state query:
 - `safety_brake_engaged` — last successful brake still claimed
 - `safety_hysteresis_ok_count` — Ok streak while braked
 - `safety_transitions_total` / `safety_actuator_failures_total` — counters
+- `sensory_queue_depth` / `sensory_queue_capacity` — current vs configured outbound queue size
+- `sensory_queue_enqueued_total` — frames accepted into the queue
+- `sensory_queue_dropped_total{reason=...}` — drops with a **closed** reason set (`reject_newest`, `drop_oldest`, `absent`, `disconnected`, `send_failed`, `mutex_contended`); never a payload string
+- `sensory_queue_full_policy{policy=drop_oldest|reject_newest}` — one-hot configured overflow policy
 - `shutdown_total{reason}` / `shutdown_unresolved_brake` /
   `shutdown_unresolved_actuator` / `shutdown_brake_left_engaged` — last
   orderly shutdown (SIGINT/SIGTERM)
 
-See [`docs/safety.md`](docs/safety.md) for the label set, numeric ids,
-and fail-closed shutdown/restart rules.
+See [`docs/safety.md`](docs/safety.md) for the safety label set, numeric ids,
+fail-closed shutdown/restart rules, and the sensory-queue policy notes.
 
 ### Logging
 
@@ -325,7 +334,7 @@ Structured logging via `tracing` with configurable output levels.
 ## Safety Features
 
 - **Instance Protection**: Lockfile mechanism prevents multiple relay instances (lock acquired before port binding)
-- **Independent safety loop**: `SafetyMachine::evaluate` has no publisher argument and is not awaited on IPC. Production uses `CorpusIpcPublisher` (`try_send` + detached UDP worker). `--ipc-disabled` or a bind failure falls back to `AbsentPublisher`.
+- **Independent safety loop**: `SafetyMachine::evaluate` has no publisher argument and is not awaited on IPC. Production uses `CorpusIpcPublisher` (bounded `IsolatedPublishQueue` enqueue with explicit full-queue policy + detached UDP worker). `--ipc-disabled` or a bind failure falls back to `AbsentPublisher`.
 - **GPU Safety Monitoring**: Safety cadence every ~1 second (every 10 ticks); named states for healthy-real, warning, critical/braked, recovering, missing/stale/invalid, simulated, actuator-failure
 - **Emergency Brakes**: Automatically throttles GPU power limit to 50% via `nvidia-smi -pl` on fail-closed or critical **when actuation succeeds**; the configured consecutive real Ok streak (default 3) to release; warn immediately after release re-applies
 - **Fail-closed shutdown / restart**: Ctrl-C and SIGTERM stop the run loop, join background tasks with a timeout, and release `/tmp/thalamic_relay.lock`. Shutdown **does not** restore the default GPU power limit. A persistent relay-owned brake (current PL matching the 50% target) is adopted on the next start and released only through the same Ok-streak hysteresis. An operator-configured sub-default cap is left unchanged. Simulated/software-only telemetry cannot authorize release of a real brake. SIGKILL/power loss have no cleanup promise.
