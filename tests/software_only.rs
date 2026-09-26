@@ -117,7 +117,7 @@ fn software_only_pipeline_evaluates_safety_then_best_effort_publish() {
     assert_eq!(frame.vram_temp_c.value, None);
     assert_eq!(frame.vram_temp_c.validity, SampleValidity::Missing);
 
-    let mut machine = SafetyMachine::new();
+    let mut machine = configured_machine();
     let (snap, pub_res) = evaluate_then_try_publish(&mut machine, &frame, &AbsentPublisher);
     assert_eq!(pub_res, Err(PublishError::Absent));
     assert_eq!(snap.state, SafetyState::SimulatedSoftwareOnly);
@@ -137,7 +137,7 @@ fn software_only_pipeline_evaluates_safety_then_best_effort_publish() {
 
 #[test]
 fn ipc_failure_cannot_stall_safety_loop_progress() {
-    let mut machine = SafetyMachine::new();
+    let mut machine = configured_machine();
     let publisher = FailingPublisher::send_failed();
     let fake = FakeActuator::new();
 
@@ -179,7 +179,7 @@ fn ipc_failure_cannot_stall_safety_loop_progress() {
 
 #[test]
 fn missing_invalid_stale_and_simulated_frames_are_named_states() {
-    let mut machine = SafetyMachine::new();
+    let mut machine = configured_machine();
     let missing = machine.evaluate(&assess(&fixtures::sensor_dropout(), fixtures::NOW));
     assert_eq!(missing.state, SafetyState::TelemetryMissing);
     assert_eq!(missing.intent, BrakeIntent::Apply);
@@ -200,7 +200,7 @@ fn slow_and_disconnected_publish_queues_do_not_block_critical_brake() {
     let (queue, consumer) =
         IsolatedPublishQueue::<SensoryMapping>::bounded(1).expect("capacity 1 is valid");
     drop(consumer);
-    let mut machine = SafetyMachine::new();
+    let mut machine = configured_machine();
     let mut critical = fixtures::healthy_real();
     critical.gpu_temp_c = Some(90.0);
     let frame = assess(&critical, fixtures::NOW);
@@ -215,4 +215,13 @@ fn acquire_without_force_is_not_simulated_on_ci() {
     let raw = fixtures::nvml_unavailable();
     assert_ne!(raw.source, TelemetrySource::SoftwareFallback);
     assert_eq!(raw.source, TelemetrySource::NvmlUnavailable);
+}
+
+fn configured_machine() -> SafetyMachine {
+    let config = thalamic_relay::safety::SafetyPolicyConfig {
+        power_warn_w: Some(300.0),
+        power_critical_w: Some(350.0),
+        ..Default::default()
+    };
+    SafetyMachine::with_policy(config.resolve(None).unwrap())
 }

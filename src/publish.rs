@@ -1001,7 +1001,7 @@ mod tests {
 
     #[test]
     fn absent_brainstem_does_not_block_or_change_safety() {
-        let mut machine = SafetyMachine::new();
+        let mut machine = crate::safety::test_machine();
         let (snap, pub_res) =
             evaluate_then_try_publish(&mut machine, &critical_frame(), &AbsentPublisher);
         assert_eq!(pub_res, Err(PublishError::Absent));
@@ -1011,7 +1011,7 @@ mod tests {
 
     #[test]
     fn failing_publisher_cannot_stall_or_disable_safety() {
-        let mut machine = SafetyMachine::new();
+        let mut machine = crate::safety::test_machine();
         let publisher = FailingPublisher::send_failed();
         for _ in 0..32 {
             let (snap, pub_res) =
@@ -1035,7 +1035,7 @@ mod tests {
         let err = queue.try_enqueue(mapping).unwrap_err();
         assert_eq!(err, PublishError::SlowConsumer);
 
-        let mut machine = SafetyMachine::new();
+        let mut machine = crate::safety::test_machine();
         let (snap, pub_res) = evaluate_then_try_publish(&mut machine, &critical_frame(), &queue);
         assert_eq!(pub_res, Err(PublishError::SlowConsumer));
         assert_eq!(snap.state, SafetyState::CriticalBraked);
@@ -1046,7 +1046,7 @@ mod tests {
     fn disconnected_queue_does_not_block_safety() {
         let (queue, rx) = IsolatedPublishQueue::bounded(1).unwrap();
         drop(rx);
-        let mut machine = SafetyMachine::new();
+        let mut machine = crate::safety::test_machine();
         let (snap, pub_res) = evaluate_then_try_publish(&mut machine, &critical_frame(), &queue);
         assert_eq!(pub_res, Err(PublishError::Disconnected));
         assert_eq!(snap.state, SafetyState::CriticalBraked);
@@ -1054,7 +1054,7 @@ mod tests {
 
     #[test]
     fn evaluate_ignores_publish_error_ordering() {
-        let mut machine = SafetyMachine::new();
+        let mut machine = crate::safety::test_machine();
         let missing = assess(&fixtures::nvml_unavailable(), fixtures::NOW);
         let (snap, pub_res) =
             evaluate_then_try_publish(&mut machine, &missing, &FailingPublisher::disconnected());
@@ -1363,7 +1363,7 @@ mod tests {
     fn queue_safety_evaluation_continues_when_consumer_stalled() {
         let (queue, _rx) =
             IsolatedPublishQueue::bounded_with_policy(1, QueueFullPolicy::DropOldest).unwrap();
-        let mut machine = SafetyMachine::new();
+        let mut machine = crate::safety::test_machine();
         for _ in 0..16 {
             let (snap, pub_res) =
                 evaluate_then_try_publish(&mut machine, &critical_frame(), &queue);
@@ -1456,7 +1456,7 @@ mod tests {
             PublishError::SlowConsumer
         );
 
-        let mut machine = SafetyMachine::new();
+        let mut machine = crate::safety::test_machine();
         let (snap, pub_res) =
             evaluate_then_try_publish(&mut machine, &critical_frame(), &publisher);
         assert_eq!(pub_res, Err(PublishError::SlowConsumer));
@@ -1564,7 +1564,7 @@ mod tests {
         let publisher =
             CorpusIpcPublisher::spawn(dest, None, QueueConfig::default()).expect("spawn publisher");
 
-        let mut machine = SafetyMachine::new();
+        let mut machine = crate::safety::test_machine();
         let (snap, mut pub_res) = evaluate_then_try_publish(&mut machine, &frame, &publisher);
         for _ in 0..100 {
             if pub_res.is_ok() {
@@ -1600,7 +1600,7 @@ mod tests {
     fn hysteresis_still_reaches_release_while_publisher_fails() {
         use crate::safety::{ActuatorOutcome, BRAKE_FRACTION, FakeActuator, SafetyActuator};
 
-        let mut machine = SafetyMachine::new();
+        let mut machine = crate::safety::test_machine();
         let publisher = FailingPublisher::send_failed();
         let fake = FakeActuator::new();
 
@@ -1652,7 +1652,7 @@ mod tests {
     #[test]
     fn successful_try_publish_does_not_mutate_safety_snapshot() {
         let (queue, consumer) = IsolatedPublishQueue::bounded(4).expect("capacity 4 is valid");
-        let mut machine = SafetyMachine::new();
+        let mut machine = crate::safety::test_machine();
         let (snap, pub_res) = evaluate_then_try_publish(&mut machine, &healthy_frame(), &queue);
         assert!(pub_res.is_ok());
         assert_eq!(snap.state, SafetyState::HealthyReal);
