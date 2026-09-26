@@ -160,7 +160,7 @@ thalamic-relay
   - SafetyMachine (never waits on IPC)
   - privileged brake actuator
   - Prometheus safety/brake state
-      ↓  best-effort try_publish into a bounded queue (policy on full / absent)
+      ↓  best-effort try_publish into a bounded queue (policy on full; AbsentPublisher if IPC disabled)
 corpus-ipc          IpcMessage::Stimuli JSON over UDP (not required for safety)
       ↓
 brainstem-daemon
@@ -240,7 +240,7 @@ Key options (with env var equivalent):
 - `--sensory-queue-full-policy` / `THALAMIC_SENSORY_QUEUE_FULL_POLICY` (default: `drop-oldest`; also `reject-newest`)
 - `--ipc-endpoint` / `THALAMIC_IPC_ENDPOINT` (default: `127.0.0.1:9900`) — UDP destination for `IpcMessage::Stimuli`
 - `--ipc-disabled` / `THALAMIC_IPC_DISABLED` — skip publication; safety still runs
-- `--ipc-session-id` / `THALAMIC_IPC_SESSION_ID` (default: `thalamic-relay`)
+- `--ipc-session-id` / `THALAMIC_IPC_SESSION_ID` (default: process-unique boot/session id)
 - `RUST_LOG` (standard for tracing; or --log-level in future extensions)
 
 Example with env + flag:

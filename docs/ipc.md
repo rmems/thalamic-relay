@@ -91,11 +91,16 @@ without conversion would make the corpus-ipc timestamp 1,000,000× too small.
 Freshness is computed before encoding from the frame's receive time, as
 specified in [`telemetry.md`](telemetry.md); this wire timestamp is not its
 authoritative freshness clock.
-`batch_id` on the wire is allocated by `CorpusIpcPublisher` (counter
-initialized to 1; each attempt uses `fetch_add` before validation, so the
-first emitted batch after process start is `1`, not `0`). Rejected attempts
-can leave gaps. `session_id` comes from
-`--ipc-session-id` / `THALAMIC_IPC_SESSION_ID` (default `thalamic-relay`).
+`batch_id` is the strictly increasing per-session sequence stamped at
+acquisition (via `SampleClock` in `thalamic_relay::time`), before
+publication is attempted. When `--ipc-session-id` / `THALAMIC_IPC_SESSION_ID`
+overrides the session, `CorpusIpcPublisher` allocates a publisher-scoped
+`batch_id` sequence (starting at `0` on process start) instead of reusing the
+mapping counter. Validation failures and queue policy can leave sequence gaps.
+`session_id` comes from that CLI/env override when configured (empty default
+leaves stamping to the process-unique boot session on each frame); otherwise
+the mapping's boot/session id is used. Consumers use `(session_id, batch_id)` as
+the idempotency key and may discard a duplicate or replayed pair.
 
 Channel order is the GH#41 runtime-input inventory (no observability filler):
 
@@ -134,12 +139,17 @@ SafetySnapshot (state, brake, intent)
       │
       ├─ spawn_blocking apply/release   (gpu, not on the eval path)
       └─ SensoryPublisher::try_publish   (best-effort, after eval)
-             IsolatedPublishQueue.try_enqueue  (drop on full)
+             IsolatedPublishQueue.try_enqueue  (drop oldest on full; keep newest)
                    │
                    ▼  detached worker (not awaited)
              serde_json(IpcMessage::Stimuli) → UDP sendto
 ```
 
-A full or disconnected queue is `SlowConsumer` / `Disconnected`. UDP send
-errors and a missing Brainstem listener are dropped on the worker. None of
-these paths can stall or disable `SafetyMachine::evaluate`.
+Delivery is best-effort, single-producer (so unordered delivery within the
+queue is not applicable), and lossy under backpressure. The bounded queue
+uses **drop-oldest / keep-newest**: a full enqueue replaces the oldest queued
+frame and returns `SlowConsumer` to report that loss. It never waits, receives,
+serializes, or sends UDP on the safety path. A disconnected queue returns
+`Disconnected`. UDP send errors and a missing Brainstem listener are dropped
+on the worker. None of these paths can stall or disable
+`SafetyMachine::evaluate`.

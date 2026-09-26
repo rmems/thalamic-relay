@@ -37,8 +37,11 @@ use std::time::Duration;
 pub const SOURCE_IDENTITY: &str = "thalamic-relay";
 /// Default UDP destination for [`IpcMessage::Stimuli`] datagrams.
 pub const DEFAULT_IPC_ENDPOINT: &str = "127.0.0.1:9900";
-/// Default [`StimulusBatch::session_id`] when `--ipc-session-id` is unset.
-pub const DEFAULT_IPC_SESSION_ID: &str = "thalamic-relay";
+/// Empty CLI default: do not override acquisition; [`crate::time::SampleClock`]
+/// stamps a process-unique boot session on each frame (not this literal string).
+pub const DEFAULT_IPC_SESSION_ID: &str = "";
+/// Legacy default capacity when only a bare usize is needed (see [`QueueConfig`]).
+pub const DEFAULT_IPC_QUEUE_CAPACITY: usize = 8;
 
 /// Why a best-effort publish did not complete.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -689,7 +692,8 @@ impl<T> Drop for SensoryQueueConsumer<T> {
 pub struct CorpusIpcPublisher {
     queue: IsolatedPublishQueue<IpcMessage>,
     session_id: Option<String>,
-    batch_id: Arc<AtomicU64>,
+    /// Publisher-scoped sequence used when `session_id` overrides the mapping.
+    session_seq: Arc<AtomicU64>,
 }
 
 impl CorpusIpcPublisher {
@@ -717,7 +721,7 @@ impl CorpusIpcPublisher {
         Ok(Self {
             queue,
             session_id,
-            batch_id: Arc::new(AtomicU64::new(1)),
+            session_seq: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -731,7 +735,7 @@ impl CorpusIpcPublisher {
             Self {
                 queue,
                 session_id,
-                batch_id: Arc::new(AtomicU64::new(1)),
+                session_seq: Arc::new(AtomicU64::new(0)),
             },
             consumer,
         ))
@@ -740,8 +744,14 @@ impl CorpusIpcPublisher {
 
 impl SensoryPublisher for CorpusIpcPublisher {
     fn try_publish(&self, mapping: &SensoryMapping) -> Result<(), PublishError> {
-        let batch_id = self.batch_id.fetch_add(1, Ordering::Relaxed);
-        let batch = mapping_to_stimulus_batch(mapping, self.session_id.clone(), batch_id);
+        let (session_id, batch_id) = match &self.session_id {
+            Some(id) => (
+                Some(id.clone()),
+                self.session_seq.fetch_add(1, Ordering::Relaxed),
+            ),
+            None => (Some(mapping.session_id.clone()), mapping.batch_id),
+        };
+        let batch = mapping_to_stimulus_batch(mapping, session_id, batch_id);
         if let Err(err) = batch.validate() {
             self.queue.record_publish_loss(DropReason::SendFailed);
             return Err(PublishError::SendFailed(err.to_string()));
@@ -960,7 +970,8 @@ mod tests {
     use super::*;
     use crate::gpu::HardwareBridge;
     use crate::safety::{BrakeIntent, SafetyState};
-    use crate::telemetry::{SignalId, assess, fixtures};
+    use crate::telemetry::{SignalId, assess, assess_with_clock, fixtures};
+    use crate::time::SampleClock;
     use std::collections::BTreeSet;
     use std::net::UdpSocket;
     use std::sync::Arc;
@@ -1454,8 +1465,90 @@ mod tests {
     }
 
     #[test]
+    fn capacity_one_drop_oldest_keeps_newest_sequence() {
+        let config = QueueConfig::new(1, QueueFullPolicy::DropOldest).expect("valid config");
+        let (publisher, consumer) = CorpusIpcPublisher::channel(None, config).expect("valid queue");
+        let mut mapping = mapping_at_now(&healthy_frame());
+        mapping.session_id = "boot-a".into();
+
+        for batch_id in 10..=12 {
+            mapping.batch_id = batch_id;
+            assert_eq!(publisher.try_publish(&mapping), Ok(()));
+        }
+
+        let IpcMessage::Stimuli(batch) = consumer.try_recv().expect("newest frame retained") else {
+            panic!("expected stimuli");
+        };
+        assert_eq!(batch.session_id.as_deref(), Some("boot-a"));
+        assert_eq!(batch.batch_id, 12);
+    }
+
+    #[test]
+    fn override_session_uses_publisher_sequence() {
+        let config = QueueConfig::new(8, QueueFullPolicy::DropOldest).expect("valid config");
+        let (publisher, consumer) =
+            CorpusIpcPublisher::channel(Some("run".into()), config).expect("valid queue");
+        let mut mapping = mapping_at_now(&healthy_frame());
+        mapping.session_id = "mapping-session".into();
+        mapping.batch_id = 0;
+        publisher.try_publish(&mapping).unwrap();
+        publisher.try_publish(&mapping).unwrap();
+        let IpcMessage::Stimuli(a) = consumer.try_recv().expect("stimuli") else {
+            panic!("stimuli");
+        };
+        let IpcMessage::Stimuli(b) = consumer.try_recv().expect("stimuli") else {
+            panic!("stimuli");
+        };
+        assert_eq!(a.session_id.as_deref(), Some("run"));
+        assert_eq!(b.session_id.as_deref(), Some("run"));
+        assert_eq!(a.batch_id, 0);
+        assert_eq!(b.batch_id, 1);
+    }
+
+    #[test]
+    fn paused_consumer_burst_retains_bounded_newest_tail() {
+        let (queue, consumer) =
+            IsolatedPublishQueue::bounded_with_policy(3, QueueFullPolicy::DropOldest).unwrap();
+        for value in 0..10 {
+            let _ = queue.try_enqueue(value);
+        }
+        assert_eq!(consumer.try_recv(), Some(7));
+        assert_eq!(consumer.try_recv(), Some(8));
+        assert_eq!(consumer.try_recv(), Some(9));
+        assert_eq!(consumer.try_recv(), None);
+    }
+
+    #[test]
+    fn reconnect_uses_new_receiver_and_preserves_frame_identity() {
+        let config = QueueConfig::new(1, QueueFullPolicy::DropOldest).expect("valid config");
+        let (old, old_consumer) = CorpusIpcPublisher::channel(None, config).expect("valid queue");
+        drop(old_consumer);
+        let mut mapping = mapping_at_now(&healthy_frame());
+        mapping.session_id = "boot-after-reconnect".into();
+        mapping.batch_id = 41;
+        assert_eq!(old.try_publish(&mapping), Err(PublishError::Disconnected));
+
+        let (connected, consumer) = CorpusIpcPublisher::channel(None, config).expect("valid queue");
+        connected.try_publish(&mapping).unwrap();
+        let IpcMessage::Stimuli(batch) = consumer.try_recv().expect("expected stimuli") else {
+            panic!("expected stimuli");
+        };
+        assert_eq!(batch.session_id.as_deref(), Some("boot-after-reconnect"));
+        assert_eq!(batch.batch_id, 41);
+    }
+
+    #[test]
     fn software_only_emits_typed_corpus_ipc_frame_without_gpu() {
-        let frame = HardwareBridge::read_telemetry_force(true);
+        use crate::telemetry::DEFAULT_ACQUISITION_CADENCE_MS;
+
+        let raw = HardwareBridge::acquire_raw(true);
+        let mut clock = SampleClock::with_session_id("software-only");
+        let frame = assess_with_clock(
+            &raw,
+            fixtures::NOW,
+            DEFAULT_ACQUISITION_CADENCE_MS,
+            &mut clock,
+        );
         assert_eq!(frame.source, TelemetrySource::SoftwareFallback);
         let mapping = frame.to_sensory_mapping();
         assert_eq!(
@@ -1469,11 +1562,17 @@ mod tests {
             .unwrap();
         let dest = listener.local_addr().unwrap();
         let publisher =
-            CorpusIpcPublisher::spawn(dest, Some("software-only".into()), QueueConfig::default())
-                .expect("spawn UDP publisher");
+            CorpusIpcPublisher::spawn(dest, None, QueueConfig::default()).expect("spawn publisher");
 
         let mut machine = SafetyMachine::new();
-        let (snap, pub_res) = evaluate_then_try_publish(&mut machine, &frame, &publisher);
+        let (snap, mut pub_res) = evaluate_then_try_publish(&mut machine, &frame, &publisher);
+        for _ in 0..100 {
+            if pub_res.is_ok() {
+                break;
+            }
+            std::thread::yield_now();
+            pub_res = publisher.try_publish(&mapping);
+        }
         assert!(pub_res.is_ok(), "enqueue must succeed: {pub_res:?}");
         assert_eq!(snap.state, SafetyState::SimulatedSoftwareOnly);
 
@@ -1487,7 +1586,7 @@ mod tests {
             panic!("expected IpcMessage::Stimuli, got {decoded:?}");
         };
         assert_eq!(batch.session_id.as_deref(), Some("software-only"));
-        assert_eq!(batch.batch_id, 1);
+        assert_eq!(batch.batch_id, frame.batch_id);
         assert!(!batch.values.is_empty());
         let meta = batch.metadata.expect("provenance");
         assert_eq!(meta.source.as_deref(), Some(SOURCE_IDENTITY));
