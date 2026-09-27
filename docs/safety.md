@@ -38,10 +38,10 @@ require querying neural state.
 | `SafetyState` | When | Brake policy |
 | --- | --- | --- |
 | `healthy_real` | NVML, valid temp/power, below warn, brake released | none |
-| `warning` | Valid warn-band (75–85 °C or 300–350 W) | hold if already on; **re-apply if just released** |
-| `critical_braked` | Valid temp > 85 °C or power > 350 W | apply / hold |
-| `recovering` | Brake on; consecutive **real** Ok streak | release after 3 Ok |
-| `telemetry_missing` | Safety sample missing (`NvmlUnavailable`, dropout, Valid+`None`) | apply / hold (fail closed) |
+| `warning` | Valid configured warn-band | hold if already on; **re-apply if just released** |
+| `critical_braked` | Valid temp or power exceeds configured critical limit | apply / hold |
+| `recovering` | Brake on; consecutive **real** Ok streak | release after configured Ok streak (default 3) |
+| `telemetry_missing` | Safety sample or power policy missing (`NvmlUnavailable`, dropout, Valid+`None`) | apply / hold (fail closed) |
 | `telemetry_stale` | Safety sample older than stale threshold | apply / hold |
 | `telemetry_invalid` | Non-finite or out of engineering range | apply / hold |
 | `simulated_software_only` | `TelemetrySource::SoftwareFallback` | do not apply; **hold** if already on; reset hysteresis |
@@ -61,8 +61,9 @@ worst fault wins: **missing > invalid > stale**. Equal rank prefers
 2. Warn while released (and not immediately post-release) does **not** apply.
 3. Warn or critical **immediately after a successful release** re-applies
    (the restored default PL is not left in a still-hot/warn band).
-4. Release requires **3 consecutive real Ok** evaluations while the brake is
-   engaged (~3 s at the default 100 ms tick × every 10 ticks).
+4. Release requires the configured real `Ok` streak
+   (`SafetyPolicyConfig.release_ok_streak`, default **3**) while the brake is
+   engaged (~3 s at the default streak and 100 ms tick × every 10 ticks).
 5. Simulated telemetry while braked holds the brake and resets the Ok streak.
 6. Actuator failure does not freeze evaluation: the next frame still
    classifies and the intent is retried.
@@ -75,13 +76,40 @@ never publishes and never calls `nvidia-smi`. Pre-telemetry snapshots are
 not dispatched as hardware commands: `--force-software-only` must be
 classified first (hold, do not apply).
 
+## Configurable policy
+
+`SafetyPolicyConfig::resolve(device_default_w)` validates finite ordered limits
+and produces an immutable `SafetyPolicy`. Paired operator watt limits override
+the derived 85%/100% device-default envelope and cannot exceed a known default.
+Missing capabilities without explicit watts fail closed on real frames. Thermal
+75/85 C defaults are explicit operator policy, not vendor-derived limits.
+
+`SafetyMachine::new()` intentionally has no device envelope. Library consumers
+resolve their capabilities/configuration and use `SafetyMachine::with_policy`.
+`classify_frame_with_policy` and `instant_status_with_policy` use the same policy;
+the variants without a policy cannot authorize healthy real telemetry.
+
+Sample age can be tightened below 2000 ms, and the declared acquisition interval
+is bounded (100 ms by default). Age is measured at the frame assessment time;
+reassess held frames before evaluation. The daemon rejects configured ten-tick
+intervals exceeding the sample-age limit. Actual scheduling and sensor reads
+add elapsed time, so this is not a hard real-time response guarantee. The full
+CLI/environment option table and valid ranges are in the README.
+
+The 50% brake fraction stays fixed for restart compatibility. Apply requires
+readable positive current/default power limits and refuses foreign sub-default
+caps above or below the target; it never substitutes current for default.
+Release rechecks that current still matches the expected relay target. Refusal
+is an observable actuator error. Matching within 2 W is heuristic ownership:
+external caps at the same target cannot be distinguished, and concurrent
+operator writes can race the read/command sequence.
+
 ## Shutdown and restart
 
 SIGINT (Ctrl-C) and SIGTERM enter a **controlled shutdown**. The process lock
 at `/tmp/thalamic_relay.lock` is released on the way out. Background metrics
 collection and in-flight actuation are joined with a bounded timeout (they
-must not hang indefinitely). There is no control-plane IPC task to drain
-today (`AbsentPublisher`). SIGKILL and power loss are **not** promised to
+must not hang indefinitely). Sensory UDP publication is best-effort and has no shutdown delivery guarantee. SIGKILL and power loss are **not** promised to
 clean up.
 
 **Fail-closed invariant:** shutdown never dispatches a new apply or release.
@@ -105,7 +133,7 @@ Crash/restart recovery uses `classify_power_limit`:
 
 - Current PL matches the relay's expected 50% target (2 W tolerance) → adopt
   as a leftover brake (`seed_brake_applied`) and release only after the
-  normal 3 real Ok streak.
+  configured real Ok streak (default 3).
 - Current PL is below default but **not** that target → treat as an
   operator/device cap. Do **not** seed, do **not** auto-release.
 - Limits unreadable, or at/above default → do not seed. The first acquired
@@ -172,3 +200,7 @@ from input data.
 Numeric ids: 0 `healthy_real`, 1 `warning`, 2 `critical_braked`,
 3 `recovering`, 4 `telemetry_missing`, 5 `telemetry_stale`,
 6 `telemetry_invalid`, 7 `simulated_software_only`, 8 `actuator_failure`.
+
+Brake targets whose ±2 W matching band overlaps the device-default band are
+refused as ambiguous (including default limits of 8 W or less with the 50%
+strategy). They cannot be adopted as an already-engaged relay brake.

@@ -1,6 +1,6 @@
 [package]
 name = "thalamic-relay"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.98.1"
 authors = ["Raul Cardenas Montoya"]
@@ -21,7 +21,10 @@ include = [
     "LICENSE-APACHE-2.0",
     "LICENSE-MIT",
     "src/**",
-    "docs/**",
+    "docs/ipc.md",
+    "docs/safety.md",
+    "docs/telemetry.md",
+    "docs/telemetry_csv.md",
     "examples/**",
 ]
 
