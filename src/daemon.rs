@@ -88,12 +88,21 @@ fn try_acquire_lock(lock_path: &str) -> Result<LockGuard, String> {
     }
 }
 
-/// Run the supervisor: lockfile, Prometheus, telemetry, and isolated safety.
-///
-/// This is the `thalamic-relay` executable entry, not a reusable library API.
-/// Prefer [`crate::safety::SafetyMachine`] and [`crate::telemetry`] for
-/// in-process use.
-pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
+const PROCESS_LOCK_PATH: &str = "/tmp/thalamic_relay.lock";
+
+/// Prepared supervisor whose process lock remains owned by the caller until
+/// the Tokio runtime has completed its bounded shutdown.
+#[doc(hidden)]
+pub struct SupervisorStart {
+    cli: Cli,
+    config: SafetyPolicyConfig,
+    _lock_guard: LockGuard,
+}
+
+/// Parse and validate configuration, then acquire the process lock before
+/// starting any potentially blocking driver call.
+#[doc(hidden)]
+pub fn prepare() -> Result<SupervisorStart, Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let config = cli.safety_policy_config();
     // Reject contradictory operator inputs before NVML, locks, ports or workers.
@@ -105,14 +114,26 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Acquire the process lock before any potentially blocking driver call.
-    let lock_path = "/tmp/thalamic_relay.lock";
-    let _lock_guard = match try_acquire_lock(lock_path) {
+    let lock_guard = match try_acquire_lock(PROCESS_LOCK_PATH) {
         Ok(guard) => guard,
         Err(msg) => {
             eprintln!("[relay] FATAL: {msg}");
             std::process::exit(1);
         }
     };
+    Ok(SupervisorStart {
+        cli,
+        config,
+        _lock_guard: lock_guard,
+    })
+}
+
+/// Run the supervisor using a lock retained by the caller through runtime shutdown.
+/// This is executable plumbing, not a reusable library API.
+#[doc(hidden)]
+pub async fn run(prepared: &mut SupervisorStart) -> Result<(), Box<dyn std::error::Error>> {
+    let cli = &prepared.cli;
+    let config = &prepared.config;
     let nvml_gate = NvmlGate::default();
 
     // Resolve the single GPU identity once, before constructing the adapters.
@@ -181,7 +202,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         SampleClock::with_session_id(cli.ipc_session_id.clone())
     };
-    let publisher = build_publisher(&cli);
+    let publisher = build_publisher(cli);
     let mut warned_brake_held_sim = false;
     let mut warned_nvml_busy = false;
     let mut brake_task: Option<ActuationTask> = None;
@@ -196,6 +217,21 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let shutdown_reason = loop {
         step_count += 1;
+        // A previously blocked emergency brake gets first claim on a gate
+        // that became free during the sleep. Otherwise the next read can
+        // repeatedly reacquire it and starve actuation.
+        if pending_intent == Some(BrakeIntent::Apply) {
+            dispatch_due_or_pending(
+                &machine.snapshot(),
+                &actuator,
+                &nvml_gate,
+                DispatchAttempt {
+                    slots: (&mut brake_task, &mut release_task),
+                    pending: &mut pending_intent,
+                    due: false,
+                },
+            );
+        }
         let raw = acquire_raw_with_timeout(
             &nvml_gate,
             &bridge,
@@ -356,7 +392,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         metrics_task,
     )
     .await;
-    eprintln!("[relay] releasing process lock {lock_path}");
+    eprintln!("[relay] runtime stopping; process lock remains held through shutdown");
 
     Ok(())
 }
@@ -1235,6 +1271,27 @@ mod tests {
         assert_eq!(content.trim(), std::process::id().to_string());
         drop(guard);
         assert!(!std::path::Path::new(lock_path).exists());
+    }
+
+    #[test]
+    fn prepared_process_lock_outlives_supervisor_future_and_runtime() {
+        let path = "/tmp/thalamic_relay_test_prepared_runtime.lock";
+        let _ = std::fs::remove_file(path);
+        let cli = Cli::parse_from(["thalamic-relay"]);
+        let prepared = SupervisorStart {
+            config: cli.safety_policy_config(),
+            cli,
+            _lock_guard: try_acquire_lock(path).unwrap(),
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let _ = &prepared;
+        });
+        assert!(try_acquire_lock(path).is_err());
+        runtime.shutdown_timeout(Duration::from_millis(10));
+        assert!(try_acquire_lock(path).is_err());
+        drop(prepared);
+        assert!(!std::path::Path::new(path).exists());
     }
 
     #[test]

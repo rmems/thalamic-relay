@@ -68,4 +68,4 @@ pub mod time;
 
 /// Process entry for the `thalamic-relay` executable. Not reusable library API.
 #[doc(hidden)]
-pub use daemon::run;
+pub use daemon::{SupervisorStart, prepare, run};

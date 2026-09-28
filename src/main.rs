@@ -4,7 +4,13 @@
 //! library crate as private modules. The reusable API is `thalamic_relay::{telemetry, safety, publish}`.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    drive_runtime(thalamic_relay::run())?
+    let mut prepared = thalamic_relay::prepare()?;
+    let outcome = drive_runtime(thalamic_relay::run(&mut prepared));
+    // The lock lives outside the run future, including on unwind, and is
+    // released only after bounded runtime shutdown completes.
+    drop(prepared);
+    outcome??;
+    Ok(())
 }
 
 fn drive_runtime<F: std::future::Future>(future: F) -> Result<F::Output, std::io::Error> {
