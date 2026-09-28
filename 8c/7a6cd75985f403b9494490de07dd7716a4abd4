@@ -1,0 +1,26 @@
+src/main.rs
+  s_b455974b5633b4::t_0cab611087d45d 7-13
+src/daemon.rs
+  s_b455974b5633b4::t_47c6486bd50a37 91-105,117,124-136,395
+  s_b455974b5633b4::t_437a68bc495d76 1277-1296
+  s_b455974b5633b4::t_88a99e49cbc90c 205
+  s_b455974b5633b4::t_cae36e6d9ccc5c 220-234
+src/lib.rs
+  s_b455974b5633b4::t_0cab611087d45d 71
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "8c7a6cd75985f403b9494490de07dd7716a4abd4",
+  "prompts": {},
+  "sessions": {
+    "s_b455974b5633b4": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0e6fc-e0ab-7741-86b0-75bd1514cf46",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "Raul Cardenas Montoya <montoyaraul34@gmail.com>"
+    }
+  }
+}
