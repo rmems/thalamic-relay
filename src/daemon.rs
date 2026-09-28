@@ -186,6 +186,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut warned_nvml_busy = false;
     let mut brake_task: Option<ActuationTask> = None;
     let mut release_task: Option<ActuationTask> = None;
+    let mut pending_intent: Option<BrakeIntent> = None;
 
     seed_startup_brake(&mut machine, &relay_metrics, current_w, default_w);
 
@@ -207,6 +208,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut evaluated_this_iter = false;
         let mut actuation_failed_this_tick = false;
+        let mut dispatch_due = false;
 
         if brake_task.as_ref().is_some_and(|task| task.is_finished()) {
             let task = brake_task.take().expect("finished brake task exists");
@@ -232,12 +234,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     let _ = pub_res;
                     store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
-                    spawn_intent(
-                        &snap,
-                        &actuator,
-                        &nvml_gate,
-                        (&mut brake_task, &mut release_task),
-                    );
+                    dispatch_due = true;
                     evaluated_this_iter = true;
                 }
                 Ok(Err(e)) => {
@@ -278,12 +275,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     let _ = pub_res;
                     store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
-                    spawn_intent(
-                        &snap,
-                        &actuator,
-                        &nvml_gate,
-                        (&mut brake_task, &mut release_task),
-                    );
+                    dispatch_due = true;
                     evaluated_this_iter = true;
                 }
                 Ok(Err(e)) => {
@@ -313,23 +305,25 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 evaluate_then_try_publish(&mut machine, &telemetry, publisher.as_ref());
             let _ = pub_res;
             store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
-            if should_dispatch_intent(
+            dispatch_due = should_dispatch_intent(
                 step_count,
                 prior_intent,
                 snap.intent,
                 actuation_failed_this_tick,
-            ) {
-                spawn_intent(
-                    &snap,
-                    &actuator,
-                    &nvml_gate,
-                    (&mut brake_task, &mut release_task),
-                );
-            }
+            );
         } else if !evaluated_this_iter {
             // Publication is outside the safety critical path and never awaited.
             let _ = publisher.try_publish(&telemetry.to_sensory_mapping());
         }
+
+        dispatch_due_or_pending(
+            &machine.snapshot(),
+            &actuator,
+            &nvml_gate,
+            (&mut brake_task, &mut release_task),
+            &mut pending_intent,
+            dispatch_due,
+        );
 
         {
             let mut metrics = relay_metrics.lock().unwrap();
@@ -700,6 +694,38 @@ fn log_safety_snapshot(snap: &SafetySnapshot, warned_brake_held_sim: &mut bool) 
 /// Handle to an in-flight privileged actuation attempt.
 type ActuationTask = JoinHandle<Result<(), ActuatorError>>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DispatchResult {
+    Spawned,
+    GateBusy,
+    AlreadyInFlight,
+    NoIntent,
+}
+
+/// Retry only intents skipped because another NVML worker held the gate.
+/// Reconcile with the latest safety snapshot before any retry.
+fn dispatch_due_or_pending(
+    snap: &SafetySnapshot,
+    actuator: &Arc<dyn SafetyActuator>,
+    gate: &NvmlGate,
+    slots: (&mut Option<ActuationTask>, &mut Option<ActuationTask>),
+    pending: &mut Option<BrakeIntent>,
+    due: bool,
+) {
+    if *pending != Some(snap.intent) {
+        *pending = None;
+    }
+    if !due && pending.is_none() {
+        return;
+    }
+    *pending = match spawn_intent(snap, actuator, gate, slots) {
+        DispatchResult::GateBusy => Some(snap.intent),
+        DispatchResult::Spawned | DispatchResult::AlreadyInFlight | DispatchResult::NoIntent => {
+            None
+        }
+    };
+}
+
 /// Dispatch the machine's [`BrakeIntent`] onto a blocking worker so the
 /// telemetry loop is never stalled by `nvidia-smi`. Actuation always goes
 /// through the [`SafetyActuator`] boundary; the outcome is fed back into the
@@ -709,20 +735,20 @@ fn spawn_intent(
     actuator: &Arc<dyn SafetyActuator>,
     gate: &NvmlGate,
     slots: (&mut Option<ActuationTask>, &mut Option<ActuationTask>),
-) {
+) -> DispatchResult {
     let (brake_task, release_task) = slots;
     if brake_task.is_some() || release_task.is_some() {
-        return;
+        return DispatchResult::AlreadyInFlight;
     }
     let slot = match snap.intent {
         BrakeIntent::Apply => brake_task,
         BrakeIntent::Release => release_task,
-        BrakeIntent::None => return,
+        BrakeIntent::None => return DispatchResult::NoIntent,
     };
     let Ok(permit) = gate.try_enter() else {
         // A wedged driver has not attempted a new actuation. Preserve the
         // machine's intent without inventing an actuator failure outcome.
-        return;
+        return DispatchResult::GateBusy;
     };
     let actuator = Arc::clone(actuator);
     let intent = snap.intent;
@@ -734,6 +760,7 @@ fn spawn_intent(
             BrakeIntent::None => unreachable!("only actuation intents acquire a slot"),
         }
     }));
+    DispatchResult::Spawned
 }
 
 fn print_dashboard(frame: &TelemetryFrame, step: u64, safety: SafetyState) {
@@ -970,6 +997,86 @@ mod tests {
         );
         assert!(brake_task.is_none());
         assert!(release_task.is_none());
+    }
+
+    #[tokio::test]
+    async fn gate_blocked_brake_dispatches_on_next_non_evaluation_tick() {
+        use crate::safety::FakeActuator;
+
+        let gate = NvmlGate::default();
+        let permit = gate.try_enter().unwrap();
+        let mut machine = crate::safety::test_machine();
+        let frame = crate::telemetry::assess(
+            &crate::telemetry::fixtures::nvml_unavailable(),
+            crate::telemetry::fixtures::NOW,
+        );
+        let snap = machine.evaluate(&frame);
+        assert_eq!(snap.intent, BrakeIntent::Apply);
+        let fake = Arc::new(FakeActuator::new());
+        let actuator: Arc<dyn SafetyActuator> = fake.clone();
+        let mut brake_task = None;
+        let mut release_task = None;
+        let mut pending = None;
+
+        dispatch_due_or_pending(
+            &snap,
+            &actuator,
+            &gate,
+            (&mut brake_task, &mut release_task),
+            &mut pending,
+            true,
+        );
+        assert_eq!(pending, Some(BrakeIntent::Apply));
+        assert!(brake_task.is_none());
+        drop(permit);
+
+        dispatch_due_or_pending(
+            &snap,
+            &actuator,
+            &gate,
+            (&mut brake_task, &mut release_task),
+            &mut pending,
+            false,
+        );
+        assert_eq!(pending, None);
+        assert!(brake_task.take().unwrap().await.unwrap().is_ok());
+        assert_eq!(fake.apply_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn gate_blocked_intent_clears_when_safety_intent_changes() {
+        use crate::safety::FakeActuator;
+
+        let gate = NvmlGate::default();
+        let fake = Arc::new(FakeActuator::new());
+        let actuator: Arc<dyn SafetyActuator> = fake.clone();
+        let mut machine = crate::safety::test_machine();
+        let unavailable = crate::telemetry::assess(
+            &crate::telemetry::fixtures::nvml_unavailable(),
+            crate::telemetry::fixtures::NOW,
+        );
+        let _ = machine.evaluate(&unavailable);
+        let healthy = crate::telemetry::assess(
+            &crate::telemetry::fixtures::healthy_real(),
+            crate::telemetry::fixtures::NOW,
+        );
+        let snap = machine.evaluate(&healthy);
+        assert_eq!(snap.intent, BrakeIntent::None);
+        let mut pending = Some(BrakeIntent::Apply);
+        let mut brake_task = None;
+        let mut release_task = None;
+
+        dispatch_due_or_pending(
+            &snap,
+            &actuator,
+            &gate,
+            (&mut brake_task, &mut release_task),
+            &mut pending,
+            false,
+        );
+        assert_eq!(pending, None);
+        assert!(brake_task.is_none());
+        assert_eq!(fake.apply_calls(), 0);
     }
 
     #[tokio::test]
