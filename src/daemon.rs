@@ -246,47 +246,80 @@ pub async fn run(prepared: &mut SupervisorStart) -> Result<(), Box<dyn std::erro
         let mut actuation_failed_this_tick = false;
         let mut dispatch_due = false;
 
-        // Only one privileged actuation can own the NVML gate at a time.
-        let finished_task = if brake_task.as_ref().is_some_and(|task| task.is_finished()) {
-            Some((BrakeIntent::Apply, brake_task.take().unwrap()))
-        } else if release_task.as_ref().is_some_and(|task| task.is_finished()) {
-            Some((BrakeIntent::Release, release_task.take().unwrap()))
-        } else {
-            None
-        };
-        if let Some((intent, task)) = finished_task {
-            let result = match task.await {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(e)) => Err(e.to_string()),
-                Err(e) => Err(format!("actuation worker panicked: {e}")),
-            };
-            if let Err(err) = &result {
-                eprintln!("[relay] {intent:?} actuation failed: {err}");
+        if brake_task.as_ref().is_some_and(|task| task.is_finished()) {
+            let task = brake_task.take().expect("finished brake task exists");
+            match task.await {
+                Ok(Ok(())) => {
+                    reassess_after_actuation(
+                        ActuatorOutcome::Applied,
+                        PostActuationContext {
+                            machine: &mut machine,
+                            relay_metrics: &relay_metrics,
+                            warned_brake_held_sim: &mut warned_brake_held_sim,
+                            warned_nvml_busy: &mut warned_nvml_busy,
+                            sample_clock: &mut sample_clock,
+                            gate: &nvml_gate,
+                            bridge: &bridge,
+                            publisher: publisher.as_ref(),
+                            force_software_only: cli.force_software_only,
+                            cadence_ms: cli.step_interval_ms,
+                        },
+                    )
+                    .await;
+                    dispatch_due = true;
+                    evaluated_this_iter = true;
+                }
+                Ok(Err(e)) => {
+                    eprintln!("[relay] Emergency brake failed: {e}");
+                    let snap = machine.record_actuator(ActuatorOutcome::ApplyFailed(e.to_string()));
+                    store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
+                    actuation_failed_this_tick = true;
+                }
+                Err(e) => {
+                    eprintln!("[relay] Brake task panicked: {e}");
+                    let snap = machine.record_actuator(ActuatorOutcome::ApplyFailed(e.to_string()));
+                    store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
+                    actuation_failed_this_tick = true;
+                }
             }
-            let (outcome, succeeded) = classify_completion(intent, result);
-            if succeeded {
-                reassess_after_actuation(
-                    outcome,
-                    PostActuationContext {
-                        machine: &mut machine,
-                        relay_metrics: &relay_metrics,
-                        warned_brake_held_sim: &mut warned_brake_held_sim,
-                        warned_nvml_busy: &mut warned_nvml_busy,
-                        sample_clock: &mut sample_clock,
-                        gate: &nvml_gate,
-                        bridge: &bridge,
-                        publisher: publisher.as_ref(),
-                        force_software_only: cli.force_software_only,
-                        cadence_ms: cli.step_interval_ms,
-                    },
-                )
-                .await;
-                dispatch_due = true;
-                evaluated_this_iter = true;
-            } else {
-                let snap = machine.record_actuator(outcome);
-                store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
-                actuation_failed_this_tick = true;
+        }
+        if release_task.as_ref().is_some_and(|task| task.is_finished()) {
+            let task = release_task.take().expect("finished release task exists");
+            match task.await {
+                Ok(Ok(())) => {
+                    reassess_after_actuation(
+                        ActuatorOutcome::Released,
+                        PostActuationContext {
+                            machine: &mut machine,
+                            relay_metrics: &relay_metrics,
+                            warned_brake_held_sim: &mut warned_brake_held_sim,
+                            warned_nvml_busy: &mut warned_nvml_busy,
+                            sample_clock: &mut sample_clock,
+                            gate: &nvml_gate,
+                            bridge: &bridge,
+                            publisher: publisher.as_ref(),
+                            force_software_only: cli.force_software_only,
+                            cadence_ms: cli.step_interval_ms,
+                        },
+                    )
+                    .await;
+                    dispatch_due = true;
+                    evaluated_this_iter = true;
+                }
+                Ok(Err(e)) => {
+                    eprintln!("[relay] Brake release failed: {e}");
+                    let snap =
+                        machine.record_actuator(ActuatorOutcome::ReleaseFailed(e.to_string()));
+                    store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
+                    actuation_failed_this_tick = true;
+                }
+                Err(e) => {
+                    eprintln!("[relay] Brake release task panicked: {e}");
+                    let snap =
+                        machine.record_actuator(ActuatorOutcome::ReleaseFailed(e.to_string()));
+                    store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
+                    actuation_failed_this_tick = true;
+                }
             }
         }
 
@@ -553,16 +586,6 @@ struct PostActuationContext<'a> {
     publisher: &'a dyn SensoryPublisher,
     force_software_only: bool,
     cadence_ms: u64,
-}
-
-fn classify_completion(intent: BrakeIntent, result: Result<(), String>) -> (ActuatorOutcome, bool) {
-    match (intent, result) {
-        (BrakeIntent::Apply, Ok(())) => (ActuatorOutcome::Applied, true),
-        (BrakeIntent::Release, Ok(())) => (ActuatorOutcome::Released, true),
-        (BrakeIntent::Apply, Err(err)) => (ActuatorOutcome::ApplyFailed(err), false),
-        (BrakeIntent::Release, Err(err)) => (ActuatorOutcome::ReleaseFailed(err), false),
-        (BrakeIntent::None, _) => unreachable!("only dispatched intents own a task"),
-    }
 }
 
 /// Reassess telemetry after either successful hardware mutation before
@@ -994,26 +1017,6 @@ mod tests {
             BrakeIntent::Apply,
             true,
         ));
-    }
-
-    #[test]
-    fn completed_task_keeps_apply_and_release_outcomes_distinct() {
-        assert_eq!(
-            classify_completion(BrakeIntent::Apply, Ok(())),
-            (ActuatorOutcome::Applied, true),
-        );
-        assert_eq!(
-            classify_completion(BrakeIntent::Release, Ok(())),
-            (ActuatorOutcome::Released, true),
-        );
-        assert_eq!(
-            classify_completion(BrakeIntent::Apply, Err("driver".into())),
-            (ActuatorOutcome::ApplyFailed("driver".into()), false),
-        );
-        assert_eq!(
-            classify_completion(BrakeIntent::Release, Err("driver".into())),
-            (ActuatorOutcome::ReleaseFailed("driver".into()), false),
-        );
     }
 
     #[test]
