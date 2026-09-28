@@ -1,6 +1,15 @@
 # Thalamic Relay
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](https://github.com/rmems/thalamic-relay#license)
+[![GitHub Actions CI](https://img.shields.io/github/actions/workflow/status/rmems/thalamic-relay/ci.yml?branch=main&label=CI)](https://github.com/rmems/thalamic-relay/actions/workflows/ci.yml)
+[![CodeRabbit Pull Request Reviews](https://img.shields.io/coderabbit/prs/github/rmems/thalamic-relay?utm_source=oss&utm_medium=github&utm_campaign=rmems%2Fthalamic-relay&labelColor=171717&color=FF570A&link=https%3A%2F%2Fcoderabbit.ai&label=CodeRabbit+Reviews)](https://coderabbit.ai)
+[![Codacy: project unverified](https://img.shields.io/badge/Codacy-project%20unverified-lightgrey)](https://app.codacy.com/gh/rmems/thalamic-relay/dashboard)
+[![Qlty: badge unavailable](https://img.shields.io/badge/Qlty-badge%20unavailable-lightgrey)](https://qlty.sh/gh/rmems/projects/thalamic-relay)
+[![DeepWiki: not indexed](https://img.shields.io/badge/DeepWiki-not%20indexed-lightgrey)](https://deepwiki.com/rmems/thalamic-relay)
+[![crates.io: unpublished](https://img.shields.io/badge/crates.io-unpublished-lightgrey)](https://crates.io/search?q=thalamic-relay)
+
+Gray badges show provider or publication status checked on 2026-09-28; they
+are not quality scores.
 
 A lightweight **library** (`thalamic_relay`) and **CLI** (`thalamic-relay`)
 that observes hardware telemetry and provides deterministic hardware
