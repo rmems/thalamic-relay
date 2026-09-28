@@ -334,6 +334,26 @@ impl NvmlActuator {
     pub fn new(target: Option<GpuTarget>) -> Self {
         Self { target }
     }
+
+    /// The exact `nvidia-smi` argument vector this actuator would run to set
+    /// `limit_w`, or `None` when no [`GpuTarget`] is resolved (mutation refused,
+    /// no command).
+    ///
+    /// This is the single command-planning seam the mutation paths use, so the
+    /// UUID scoping of a real apply/release is observable without a GPU or a
+    /// subprocess. Pure and side-effect free.
+    fn planned_command(&self, limit_w: u32) -> Option<Vec<String>> {
+        self.target
+            .as_ref()
+            .map(|target| power_limit_command_args(target, limit_w))
+    }
+
+    /// Execute a planned power-limit command, or refuse (no command) when the
+    /// target is absent. Keeps `-i <UUID>` scoping on every real mutation.
+    fn run_power_limit(&self, limit_w: u32) -> Result<(), ActuatorError> {
+        let args = self.planned_command(limit_w).ok_or_else(no_target_error)?;
+        run_power_limit_command(&args, limit_w)
+    }
 }
 
 impl SafetyActuator for NvmlActuator {
@@ -354,7 +374,7 @@ impl SafetyActuator for NvmlActuator {
         };
         println!("[hardware_bridge] EMERGENCY BRAKE: setting PL to {target_pl}W");
 
-        set_power_limit_w(target, target_pl)
+        self.run_power_limit(target_pl)
     }
 
     /// Release the emergency brake — restore GPU power limit to its default.
@@ -371,7 +391,7 @@ impl SafetyActuator for NvmlActuator {
             default_limit
         );
 
-        set_power_limit_w(target, default_limit)
+        self.run_power_limit(default_limit)
     }
 
     fn query_power_limits_w(&self) -> (Option<u32>, Option<u32>) {
@@ -463,20 +483,19 @@ fn power_limit_command_args(target: &GpuTarget, limit_w: u32) -> Vec<String> {
     ]
 }
 
-/// Set the target GPU's power limit via `timeout` + non-interactive `sudo -n`
-/// so a password prompt or wedged nvidia-smi cannot stall the relay loop
-/// indefinitely. The command is scoped to `target` via `-i <UUID>`.
-fn set_power_limit_w(target: &GpuTarget, limit_w: u32) -> Result<(), ActuatorError> {
-    let args = power_limit_command_args(target, limit_w);
+/// Execute a pre-built power-limit command via `timeout` + non-interactive
+/// `sudo -n` so a password prompt or wedged nvidia-smi cannot stall the relay
+/// loop indefinitely. `args` is the exact vector from
+/// [`power_limit_command_args`] (already scoped to the target via `-i <UUID>`).
+fn run_power_limit_command(args: &[String], limit_w: u32) -> Result<(), ActuatorError> {
     let status = std::process::Command::new("timeout")
-        .args(&args)
+        .args(args)
         .status()
         .map_err(|e| ActuatorError::CommandFailed(format!("Failed to exec nvidia-smi: {e}")))?;
 
     if !status.success() {
         return Err(ActuatorError::CommandFailed(format!(
-            "nvidia-smi -i {} -pl {limit_w} failed (timeout, missing passwordless sudo, or command error)",
-            target.uuid
+            "nvidia-smi -pl {limit_w} failed (timeout, missing passwordless sudo, or command error)"
         )));
     }
     Ok(())
@@ -1005,28 +1024,55 @@ mod gpu_target_tests {
         assert_eq!(args[i_pos + 1], OK_UUID);
     }
 
+    /// Assert `args` is the canonical `-i <UUID> -pl <watts>` invocation.
+    fn assert_scoped_command(args: &[String], uuid: &str, watts: &str) {
+        let i_pos = args.iter().position(|a| a == "-i").expect("has -i");
+        let pl_pos = args.iter().position(|a| a == "-pl").expect("has -pl");
+        assert!(i_pos < pl_pos, "-i must precede -pl");
+        assert_eq!(
+            args[i_pos + 1],
+            uuid,
+            "device selector must be the target UUID"
+        );
+        assert_eq!(args.last().unwrap(), watts);
+    }
+
     #[test]
-    fn apply_command_uses_the_planned_brake_wattage() {
-        // plan_brake_apply picks 50% of a 400 W default -> 200 W; the command
-        // must carry exactly that wattage against the scoped UUID.
-        let target = GpuTarget::from_uuid_for_test(OK_UUID);
+    fn apply_command_path_preserves_uuid_scoping_at_the_planned_wattage() {
+        // plan_brake_apply picks 50% of a 400 W default -> 200 W. The actuator's
+        // own command plan (the seam apply_emergency_brake runs) must carry that
+        // wattage against the scoped UUID.
         let planned = plan_brake_apply(Some(400), Some(400), BRAKE_FRACTION)
             .unwrap()
             .expect("apply should target a wattage");
         assert_eq!(planned, 200);
-        let args = power_limit_command_args(&target, planned);
-        assert_eq!(args.last().unwrap(), "200");
+        let actuator = NvmlActuator::new(Some(GpuTarget::from_uuid_for_test(OK_UUID)));
+        let args = actuator
+            .planned_command(planned)
+            .expect("resolved target plans a command");
+        assert_scoped_command(&args, OK_UUID, "200");
     }
 
     #[test]
-    fn release_command_uses_the_device_default_wattage() {
+    fn release_command_path_preserves_uuid_scoping_at_the_default_wattage() {
         // plan_brake_release restores the device default (400 W) when current
-        // still matches the relay's 200 W brake target.
-        let target = GpuTarget::from_uuid_for_test(OK_UUID);
+        // still matches the relay's 200 W brake target. The actuator's command
+        // plan for release must carry that wattage against the scoped UUID.
         let default_w = plan_brake_release(Some(200), Some(400)).unwrap();
         assert_eq!(default_w, 400);
-        let args = power_limit_command_args(&target, default_w);
-        assert_eq!(args.last().unwrap(), "400");
+        let actuator = NvmlActuator::new(Some(GpuTarget::from_uuid_for_test(OK_UUID)));
+        let args = actuator
+            .planned_command(default_w)
+            .expect("resolved target plans a command");
+        assert_scoped_command(&args, OK_UUID, "400");
+    }
+
+    #[test]
+    fn actuator_without_target_plans_no_command() {
+        // The command seam itself refuses without a target, so no mutation path
+        // can build (or run) a command when identity resolution failed.
+        let actuator = NvmlActuator::new(None);
+        assert_eq!(actuator.planned_command(200), None);
     }
 
     #[test]
