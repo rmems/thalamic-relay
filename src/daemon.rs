@@ -250,26 +250,22 @@ pub async fn run(prepared: &mut SupervisorStart) -> Result<(), Box<dyn std::erro
             let task = brake_task.take().expect("finished brake task exists");
             match task.await {
                 Ok(Ok(())) => {
-                    let snap = machine.record_actuator(ActuatorOutcome::Applied);
-                    store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
-                    let force_software_only = cli.force_software_only;
-                    let cadence_ms = cli.step_interval_ms;
-                    let raw = acquire_raw_with_timeout(
-                        &nvml_gate,
-                        &bridge,
-                        force_software_only,
-                        &mut warned_nvml_busy,
+                    reassess_after_actuation(
+                        ActuatorOutcome::Applied,
+                        PostActuationContext {
+                            machine: &mut machine,
+                            relay_metrics: &relay_metrics,
+                            warned_brake_held_sim: &mut warned_brake_held_sim,
+                            warned_nvml_busy: &mut warned_nvml_busy,
+                            sample_clock: &mut sample_clock,
+                            gate: &nvml_gate,
+                            bridge: &bridge,
+                            publisher: publisher.as_ref(),
+                            force_software_only: cli.force_software_only,
+                            cadence_ms: cli.step_interval_ms,
+                        },
                     )
                     .await;
-                    let post_telemetry =
-                        assess_with_clock(&raw, unix_now_ms(), cadence_ms, &mut sample_clock);
-                    let (snap, pub_res) = evaluate_then_try_publish(
-                        &mut machine,
-                        &post_telemetry,
-                        publisher.as_ref(),
-                    );
-                    let _ = pub_res;
-                    store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
                     dispatch_due = true;
                     evaluated_this_iter = true;
                 }
@@ -291,26 +287,22 @@ pub async fn run(prepared: &mut SupervisorStart) -> Result<(), Box<dyn std::erro
             let task = release_task.take().expect("finished release task exists");
             match task.await {
                 Ok(Ok(())) => {
-                    let snap = machine.record_actuator(ActuatorOutcome::Released);
-                    store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
-                    let force_software_only = cli.force_software_only;
-                    let cadence_ms = cli.step_interval_ms;
-                    let raw = acquire_raw_with_timeout(
-                        &nvml_gate,
-                        &bridge,
-                        force_software_only,
-                        &mut warned_nvml_busy,
+                    reassess_after_actuation(
+                        ActuatorOutcome::Released,
+                        PostActuationContext {
+                            machine: &mut machine,
+                            relay_metrics: &relay_metrics,
+                            warned_brake_held_sim: &mut warned_brake_held_sim,
+                            warned_nvml_busy: &mut warned_nvml_busy,
+                            sample_clock: &mut sample_clock,
+                            gate: &nvml_gate,
+                            bridge: &bridge,
+                            publisher: publisher.as_ref(),
+                            force_software_only: cli.force_software_only,
+                            cadence_ms: cli.step_interval_ms,
+                        },
                     )
                     .await;
-                    let post_telemetry =
-                        assess_with_clock(&raw, unix_now_ms(), cadence_ms, &mut sample_clock);
-                    let (snap, pub_res) = evaluate_then_try_publish(
-                        &mut machine,
-                        &post_telemetry,
-                        publisher.as_ref(),
-                    );
-                    let _ = pub_res;
-                    store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
                     dispatch_due = true;
                     evaluated_this_iter = true;
                 }
@@ -583,15 +575,50 @@ fn should_evaluate_tick(step_count: u64, source: TelemetrySource) -> bool {
     step_count == 1 || step_count.is_multiple_of(10) || source == TelemetrySource::NvmlUnavailable
 }
 
+struct PostActuationContext<'a> {
+    machine: &'a mut SafetyMachine,
+    relay_metrics: &'a Arc<Mutex<RelayMetrics>>,
+    warned_brake_held_sim: &'a mut bool,
+    warned_nvml_busy: &'a mut bool,
+    sample_clock: &'a mut SampleClock,
+    gate: &'a NvmlGate,
+    bridge: &'a HardwareBridge,
+    publisher: &'a dyn SensoryPublisher,
+    force_software_only: bool,
+    cadence_ms: u64,
+}
+
+/// Reassess telemetry after either successful hardware mutation before
+/// dispatching any further safety intent.
+async fn reassess_after_actuation(outcome: ActuatorOutcome, ctx: PostActuationContext<'_>) {
+    let snap = ctx.machine.record_actuator(outcome);
+    store_safety(ctx.relay_metrics, &snap, ctx.warned_brake_held_sim);
+    let raw = acquire_raw_with_timeout(
+        ctx.gate,
+        ctx.bridge,
+        ctx.force_software_only,
+        ctx.warned_nvml_busy,
+    )
+    .await;
+    let frame = assess_with_clock(&raw, unix_now_ms(), ctx.cadence_ms, ctx.sample_clock);
+    let (snap, pub_res) = evaluate_then_try_publish(ctx.machine, &frame, ctx.publisher);
+    let _ = pub_res;
+    store_safety(ctx.relay_metrics, &snap, ctx.warned_brake_held_sim);
+}
+
 fn should_dispatch_intent(
     step_count: u64,
     prior: BrakeIntent,
     current: BrakeIntent,
     actuation_failed_this_tick: bool,
 ) -> bool {
-    current != BrakeIntent::None
-        && (current != prior
-            || (!actuation_failed_this_tick && (step_count == 1 || step_count.is_multiple_of(10))))
+    if current == BrakeIntent::None {
+        return false;
+    }
+    if current != prior {
+        return true;
+    }
+    !actuation_failed_this_tick && (step_count == 1 || step_count.is_multiple_of(10))
 }
 
 fn should_log_acquisition_error(warned_busy: &mut bool, error: Option<&NvmlRunError>) -> bool {
