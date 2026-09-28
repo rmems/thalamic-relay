@@ -1,20 +1,7 @@
-src/daemon.rs
-  s_b455974b5633b4::t_d0054c06b7c27a 455-494
-  s_b455974b5633b4::t_d31a8297bcf93b 189
 ---
 {
   "schema_version": "authorship/3.0.0",
   "git_ai_version": "1.5.2",
   "base_commit_sha": "9d44d3dc407486450163149b48cb180c77e40d42",
-  "prompts": {},
-  "sessions": {
-    "s_b455974b5633b4": {
-      "agent_id": {
-        "tool": "codex",
-        "id": "01a0e6fc-e0ab-7741-86b0-75bd1514cf46",
-        "model": "gpt-6-sol"
-      },
-      "human_author": "Raul Cardenas Montoya <montoyaraul34@gmail.com>"
-    }
-  }
+  "prompts": {}
 }
