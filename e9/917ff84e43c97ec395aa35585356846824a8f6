@@ -1,0 +1,29 @@
+src/gpu.rs
+  s_b455974b5633b4::t_16429ad13e12cf 232
+docs/gpu-hardware-validation.md
+  s_b455974b5633b4::t_16429ad13e12cf 1-56
+Cargo.toml
+  s_b455974b5633b4::t_16429ad13e12cf 28
+.github/actionlint.yaml
+  s_b455974b5633b4::t_16429ad13e12cf 1-21
+.github/workflows/gpu-hardware-smoke.yml
+  s_b455974b5633b4::t_16429ad13e12cf 1-30
+README.md
+  s_b455974b5633b4::t_16429ad13e12cf 124-131
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "e9917ff84e43c97ec395aa35585356846824a8f6",
+  "prompts": {},
+  "sessions": {
+    "s_b455974b5633b4": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0e6fc-e0ab-7741-86b0-75bd1514cf46",
+        "model": "gpt-6-sol"
+      },
+      "human_author": "Raul Cardenas Montoya <montoyaraul34@gmail.com>"
+    }
+  }
+}
