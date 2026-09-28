@@ -57,6 +57,7 @@
 mod cpu;
 mod daemon;
 mod gpu;
+mod nvml_gate;
 
 pub mod publish;
 pub mod safety;
@@ -65,8 +66,8 @@ pub mod telemetry;
 pub mod telemetry_csv;
 pub mod time;
 
-/// Process entry for the `thalamic-relay` executable. Not reusable library API.
-#[doc(hidden)]
-pub use daemon::run;
 #[doc(hidden)]
 pub use daemon::run_gpu_hardware_smoke_if_requested;
+/// Process entry for the `thalamic-relay` executable. Not reusable library API.
+#[doc(hidden)]
+pub use daemon::{SupervisorStart, prepare, run};

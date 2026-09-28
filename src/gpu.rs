@@ -26,10 +26,9 @@ use crate::safety::{ActuatorError, SafetyActuator};
 use crate::safety::{SafetyStatus, instant_status_with_policy};
 #[cfg(test)]
 use crate::telemetry::DEFAULT_ACQUISITION_CADENCE_MS;
-use crate::telemetry::{
-    RawTelemetry, SampleClock, TelemetryFrame, TelemetrySource, TimestampOrigin, assess_with_clock,
-    unix_now_ms,
-};
+use crate::telemetry::{RawTelemetry, TelemetrySource, TimestampOrigin, unix_now_ms};
+#[cfg(test)]
+use crate::telemetry::{SampleClock, TelemetryFrame, assess_with_clock};
 use lazy_static::lazy_static;
 use nvml_wrapper::Nvml;
 use nvml_wrapper::enum_wrappers::device::{Clock, TemperatureSensor};
@@ -200,6 +199,7 @@ impl HardwareBridge {
     }
 
     /// Acquire + assess through a shared session [`SampleClock`].
+    #[cfg(test)]
     pub fn read_telemetry_with_clock(
         &self,
         force_software: bool,
