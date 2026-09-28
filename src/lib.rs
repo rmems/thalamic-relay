@@ -69,4 +69,4 @@ pub mod time;
 #[doc(hidden)]
 pub use daemon::run;
 #[doc(hidden)]
-pub use daemon::run_gpu_hardware_smoke;
+pub use daemon::run_gpu_hardware_smoke_if_requested;

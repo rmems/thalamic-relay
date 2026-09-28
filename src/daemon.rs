@@ -87,6 +87,23 @@ fn try_acquire_lock(lock_path: &str) -> Result<LockGuard, String> {
     }
 }
 
+/// Run the read-only smoke when its Clap option is present. Returns `false`
+/// when normal supervisor startup should continue.
+#[doc(hidden)]
+pub fn run_gpu_hardware_smoke_if_requested() -> Result<bool, Box<dyn std::error::Error>> {
+    if !std::env::args_os().any(|arg| arg == "--gpu-hardware-smoke") {
+        return Ok(false);
+    }
+
+    let cli = Cli::parse();
+    if cli.gpu_hardware_smoke {
+        run_gpu_hardware_smoke()?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 /// Run the supervisor: lockfile, Prometheus, telemetry, and isolated safety.
 ///
 /// This is the `thalamic-relay` executable entry, not a reusable library API.
@@ -375,7 +392,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Perform an explicit, read-only validation of the same GPU adapters used by
 /// the supervisor. This path does not start the daemon or mutate power limits.
-pub fn run_gpu_hardware_smoke() -> Result<(), Box<dyn std::error::Error>> {
+fn run_gpu_hardware_smoke() -> Result<(), Box<dyn std::error::Error>> {
     let list = std::process::Command::new("timeout")
         .args(["-k", "2s", "3s", "nvidia-smi", "-L"])
         .output()
@@ -789,6 +806,10 @@ struct Cli {
     /// Relay loop tick interval (ms); minimum 1 to prevent busy-looping
     #[arg(long, default_value_t = 100, env = "THALAMIC_STEP_INTERVAL_MS", value_parser = clap::value_parser!(u64).range(1..))]
     step_interval_ms: u64,
+
+    /// Validate read-only NVIDIA hardware access and exit without starting the supervisor.
+    #[arg(long)]
+    gpu_hardware_smoke: bool,
 
     /// Force simulated idle telemetry (skip NVML). Documented estimates, not real sensors.
     /// Usable as a bare flag (`--force-software-only`) or with an explicit

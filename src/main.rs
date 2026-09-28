@@ -5,11 +5,8 @@
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::args_os()
-        .nth(1)
-        .is_some_and(|arg| arg == "--gpu-hardware-smoke")
-    {
-        return thalamic_relay::run_gpu_hardware_smoke();
+    if thalamic_relay::run_gpu_hardware_smoke_if_requested()? {
+        return Ok(());
     }
 
     thalamic_relay::run().await
