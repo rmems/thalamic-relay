@@ -1,7 +1,5 @@
 src/daemon.rs
-  s_b455974b5633b4::t_3a356d2e66ecb5 578-608
-  s_b455974b5633b4::t_a4605f9e15601a 253-266,290-303
-  s_b455974b5633b4::t_542af8c2b16a0d 615-621
+  s_b455974b5633b4::t_f6d9efbd2438ac 615-621
 ---
 {
   "schema_version": "authorship/3.0.0",
