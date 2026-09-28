@@ -16,6 +16,27 @@ emits **intents**; hardware side effects go through [`SafetyActuator`]
 best-effort and requires Linux, NVML, and passwordless `sudo -n nvidia-smi`
 (see the crate README).
 
+### GPU identity
+
+The relay resolves a single GPU identity once at startup: it reads NVML index 0,
+takes its immutable UUID, validates the UUID shape, and confirms it resolves
+back through `device_by_uuid`. Every telemetry read, power-limit query, and
+`nvidia-smi` command for the life of the process is scoped to that UUID:
+
+```text
+timeout -k 2 5s sudo -n nvidia-smi -i <UUID> -pl <watts>
+```
+
+Because the command pins `-i <UUID>`, a `sudo` rule restricted to a specific
+`nvidia-smi` invocation must permit the `-i <UUID> -pl <watts>` form; the older
+unqualified `nvidia-smi -pl` form no longer matches. If identity resolution
+fails, the relay logs the reason and continues with **fail-closed** telemetry
+(`NvmlUnavailable`) while **refusing** power-limit mutation — apply and release
+return an `ActuatorError` without building or running any command. The relay
+never tries another device and does not re-resolve mid-run; a restart binds a
+newly attached GPU. This is a single-GPU (index 0) supervisor, not a
+GPU-selection or multi-GPU tool.
+
 ## Ownership
 
 | Guarantee | Owner |
@@ -140,7 +161,11 @@ Crash/restart recovery uses `classify_power_limit`:
   frame still fail-closes if telemetry is missing.
 
 `--force-software-only` does not skip leftover-brake detection on the real
-actuator. Simulated frames hold an adopted brake and reset hysteresis.
+actuator, and it binds the same startup-resolved GPU UUID as the normal path so
+a real persistent brake stays addressable under simulated telemetry. Simulated
+frames hold an adopted brake and reset hysteresis. Leftover-brake detection and
+release act on the UUID resolved at this start; if identity resolution failed,
+power limits read as unreadable and no brake is adopted or released.
 
 ## IPC isolation
 
