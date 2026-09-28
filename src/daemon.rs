@@ -1,6 +1,3 @@
-Warning: truncated output (original token count: 11299)
-Total output lines: 1121
-
 //! Supervisor loop used by the `thalamic-relay` executable.
 //!
 //! Not part of the public library surface: Prometheus bind, process lock,
@@ -474,7 +471,136 @@ async fn perform_orderly_shutdown(
     machine: &mut SafetyMachine,
     brake_task: &mut Option<ActuationTask>,
     release_task: &mut Option<ActuationTask>,
-    rel…1299 tokens truncated… cli.ipc_disabled {
+    relay_metrics: &Arc<Mutex<RelayMetrics>>,
+    warned_brake_held_sim: &mut bool,
+    metrics_shutdown: &tokio::sync::watch::Sender<bool>,
+    metrics_task: JoinHandle<()>,
+) -> ShutdownPlan {
+    let snap = machine.snapshot();
+    let in_flight = InFlightActuation::from_tasks(brake_task.is_some(), release_task.is_some());
+    let plan = plan_shutdown(reason, &snap, in_flight);
+
+    println!();
+    eprintln!(
+        "[relay] shutdown reason={} state={} policy_state={} brake_engaged={} desired_brake={} \
+         in_flight={} unresolved_brake={} unresolved_actuator={} actuation={} ({})",
+        plan.reason.as_str(),
+        snap.state.as_str(),
+        snap.policy_state.as_str(),
+        snap.brake_engaged,
+        snap.desired_brake,
+        in_flight.as_str(),
+        plan.unresolved_brake,
+        plan.unresolved_actuator,
+        plan.actuation.as_str(),
+        plan.summary,
+    );
+    tracing::info!(
+        reason = plan.reason.as_str(),
+        state = snap.state.as_str(),
+        policy_state = snap.policy_state.as_str(),
+        brake_engaged = snap.brake_engaged,
+        desired_brake = snap.desired_brake,
+        in_flight = in_flight.as_str(),
+        unresolved_brake = plan.unresolved_brake,
+        unresolved_actuator = plan.unresolved_actuator,
+        actuation = plan.actuation.as_str(),
+        summary = plan.summary,
+        "orderly shutdown (fail-closed: no new power-limit restore)"
+    );
+
+    {
+        let mut metrics = relay_metrics.lock().unwrap();
+        cpu::record_shutdown(&mut metrics, &plan);
+    }
+
+    match plan.actuation {
+        ShutdownActuation::Idle => {
+            if let Some(task) = brake_task.take() {
+                task.abort();
+            }
+            if let Some(task) = release_task.take() {
+                task.abort();
+            }
+        }
+        ShutdownActuation::AwaitApply => {
+            if let Some(task) = brake_task.take() {
+                match join_in_flight(task, SHUTDOWN_ACTUATOR_TIMEOUT).await {
+                    InFlightJoin::Succeeded => {
+                        let snap = machine.record_actuator(ActuatorOutcome::Applied);
+                        store_safety(relay_metrics, &snap, warned_brake_held_sim);
+                    }
+                    InFlightJoin::Failed(e) | InFlightJoin::Panicked(e) => {
+                        eprintln!("[relay] shutdown: in-flight apply did not succeed: {e}");
+                        let snap = machine.record_actuator(ActuatorOutcome::ApplyFailed(e));
+                        store_safety(relay_metrics, &snap, warned_brake_held_sim);
+                    }
+                    InFlightJoin::TimedOut => {
+                        eprintln!(
+                            "[relay] shutdown: in-flight apply timed out; leaving hardware unchanged"
+                        );
+                    }
+                }
+            }
+            if let Some(task) = release_task.take() {
+                task.abort();
+            }
+        }
+        ShutdownActuation::AwaitAuthorizedRelease => {
+            if let Some(task) = release_task.take() {
+                match join_in_flight(task, SHUTDOWN_ACTUATOR_TIMEOUT).await {
+                    InFlightJoin::Succeeded => {
+                        let snap = machine.record_actuator(ActuatorOutcome::Released);
+                        store_safety(relay_metrics, &snap, warned_brake_held_sim);
+                    }
+                    InFlightJoin::Failed(e) | InFlightJoin::Panicked(e) => {
+                        eprintln!("[relay] shutdown: in-flight release did not succeed: {e}");
+                        let snap = machine.record_actuator(ActuatorOutcome::ReleaseFailed(e));
+                        store_safety(relay_metrics, &snap, warned_brake_held_sim);
+                    }
+                    InFlightJoin::TimedOut => {
+                        eprintln!(
+                            "[relay] shutdown: in-flight release timed out; leaving brake engaged"
+                        );
+                    }
+                }
+            }
+            if let Some(task) = brake_task.take() {
+                task.abort();
+            }
+        }
+    }
+
+    shutdown_metrics_collector(metrics_shutdown, metrics_task, SHUTDOWN_METRICS_TIMEOUT).await;
+    plan
+}
+
+/// Bounded wait for NVML acquisition after actuation so a wedged driver cannot
+/// stall the supervisor loop indefinitely. Uses the same `bridge` (and thus the
+/// same [`GpuTarget`]) as the per-tick reads.
+async fn acquire_raw_with_timeout(
+    bridge: &HardwareBridge,
+    force_software_only: bool,
+) -> RawTelemetry {
+    const TIMEOUT: Duration = Duration::from_secs(2);
+    let bridge = bridge.clone();
+    match tokio::time::timeout(
+        TIMEOUT,
+        tokio::task::spawn_blocking(move || bridge.acquire_raw(force_software_only)),
+    )
+    .await
+    {
+        Ok(Ok(raw)) => raw,
+        Ok(Err(_)) => panic!("post-actuation telemetry read task panicked"),
+        Err(_) => {
+            tracing::warn!("post-actuation NVML acquisition timed out; treating as unavailable");
+            RawTelemetry::nvml_unavailable(unix_now_ms())
+        }
+    }
+}
+
+fn build_publisher(cli: &Cli) -> Box<dyn SensoryPublisher> {
+    if cli.ipc_disabled {
         println!("[relay] corpus-ipc: disabled; hardware safety is independent of Brainstem");
         return Box::new(AbsentPublisher);
     }
