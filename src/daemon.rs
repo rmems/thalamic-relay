@@ -186,45 +186,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut brake_task: Option<ActuationTask> = None;
     let mut release_task: Option<ActuationTask> = None;
 
-    // Privileged NVML/nvidia-smi actuation backend. The supervisor only ever
-    // reaches hardware through this `SafetyActuator`; all safety semantics live
-    // in `crate::safety`, never in the NVIDIA adapter (GH#46).
-    // Detect leftover throttle from a prior crash (hardware PL persists across process restarts).
-    // Only seed brake_applied when the current limit matches this relay's expected 50% brake
-    // target, so deliberate operator-set sub-default caps are not auto-restored to default.
-    // This query uses the real actuator even under `--force-software-only`: simulated
-    // telemetry must not hide or authorize release of a real persistent brake.
-    match classify_power_limit(current_w, default_w, BRAKE_FRACTION) {
-        PowerLimitObservation::RelayOwnedBrake(m) => {
-            eprintln!(
-                "[relay] WARNING: GPU power limit {}W matches expected emergency brake \
-                 target {}W (default {}W); will auto-release after Ok streak",
-                m.current_w, m.expected_w, m.default_w
-            );
-            machine.seed_brake_applied();
-            let seed = machine.snapshot();
-            {
-                let mut metrics = relay_metrics.lock().unwrap();
-                cpu::record_safety_snapshot(&mut metrics, &seed);
-            }
-        }
-        PowerLimitObservation::ForeignSubDefaultCap {
-            current_w,
-            default_w,
-            expected_brake_w,
-        } => {
-            eprintln!(
-                "[relay] GPU power limit {current_w}W is below default {default_w}W but does not \
-                 match relay brake target {expected_brake_w}W; leaving operator/device cap unchanged"
-            );
-        }
-        PowerLimitObservation::Unreadable => {
-            tracing::info!(
-                "power limits unreadable at startup; first-frame eval will fail-closed if needed"
-            );
-        }
-        PowerLimitObservation::AtOrAboveDefault { .. } => {}
-    }
+    seed_startup_brake(&mut machine, &relay_metrics, current_w, default_w);
 
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
@@ -489,6 +451,46 @@ async fn perform_orderly_shutdown(
 }
 
 const NVML_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Seed only a power cap that unambiguously matches this relay's brake.
+/// The read-only startup query runs in software-only mode too, so simulated
+/// telemetry cannot hide or authorize release of a real persistent brake.
+fn seed_startup_brake(
+    machine: &mut SafetyMachine,
+    relay_metrics: &Arc<Mutex<RelayMetrics>>,
+    current_w: Option<u32>,
+    default_w: Option<u32>,
+) {
+    match classify_power_limit(current_w, default_w, BRAKE_FRACTION) {
+        PowerLimitObservation::RelayOwnedBrake(m) => {
+            eprintln!(
+                "[relay] WARNING: GPU power limit {}W matches expected emergency brake \
+                 target {}W (default {}W); will auto-release after Ok streak",
+                m.current_w, m.expected_w, m.default_w
+            );
+            machine.seed_brake_applied();
+            let seed = machine.snapshot();
+            let mut metrics = relay_metrics.lock().unwrap();
+            cpu::record_safety_snapshot(&mut metrics, &seed);
+        }
+        PowerLimitObservation::ForeignSubDefaultCap {
+            current_w,
+            default_w,
+            expected_brake_w,
+        } => {
+            eprintln!(
+                "[relay] GPU power limit {current_w}W is below default {default_w}W but does not \
+                 match relay brake target {expected_brake_w}W; leaving operator/device cap unchanged"
+            );
+        }
+        PowerLimitObservation::Unreadable => {
+            tracing::info!(
+                "power limits unreadable at startup; first-frame eval will fail-closed if needed"
+            );
+        }
+        PowerLimitObservation::AtOrAboveDefault { .. } => {}
+    }
+}
 
 async fn resolve_gpu_target(gate: &NvmlGate) -> Option<GpuTarget> {
     let resolution = match gate.run(NVML_TIMEOUT, GpuTarget::resolve).await {
