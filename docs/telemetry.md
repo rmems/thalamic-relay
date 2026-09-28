@@ -57,7 +57,7 @@ spuriously stale) and is flagged `Missing`.
 Consumers must key frames by `(session_id, batch_id)`, never `batch_id`
 alone. Live NVML, `--force-software-only`, and CSV/replay rows share this
 contract by passing the same `SampleClock` into
-`TelemetryFrame::from_raw_with_clock` / `HardwareBridge::read_telemetry_with_clock`.
+`TelemetryFrame::from_raw_with_clock` / `assess_with_clock`.
 
 Prometheus `telemetry_freshness_s` is computed from a monotonic
 `Instant` captured at receive, not from source wall time.
@@ -68,6 +68,16 @@ Simulated data is [`TelemetrySource::SoftwareFallback`] and is used only for
 **fail-closes** safety — it is not treated as simulated idle. An NVML sample
 that happens to read `0 °C` and `25 W` is still `source = Nvml` and may be a
 legitimate idle GPU.
+
+The supervisor takes its process lock before startup NVML queries. Startup,
+per-tick, and post-actuation NVML reads have a two-second wait limit. One
+shared gate admits only one blocking NVML operation at a time, including
+power-limit actuation queries. A timed-out driver call may remain blocked in
+its worker because NVML does not provide safe cancellation; the gate stays
+occupied until that call returns. Later real reads report `NvmlUnavailable`
+without launching more blocked workers. An unavailable tick is evaluated by
+the safety machine immediately. Forced software-only telemetry keeps its
+explicit `SoftwareFallback` provenance.
 
 ## Pipeline
 
