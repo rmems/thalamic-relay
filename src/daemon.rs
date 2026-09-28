@@ -11,7 +11,7 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
 use crate::cpu::{self, RelayMetrics};
-use crate::gpu::{HardwareBridge, NvmlActuator};
+use crate::gpu::{GpuTarget, HardwareBridge, NvmlActuator};
 use crate::publish::{
     AbsentPublisher, CorpusIpcPublisher, DEFAULT_IPC_ENDPOINT, DEFAULT_IPC_SESSION_ID, QueueConfig,
     QueueFullPolicy, SensoryPublisher, evaluate_then_try_publish,
@@ -102,7 +102,37 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     {
         return Err("step interval exceeds safety acquisition limit or ten-tick evaluation exceeds sample-age limit".into());
     }
-    let actuator: Arc<dyn SafetyActuator> = Arc::new(NvmlActuator::new());
+
+    // Resolve the single GPU identity once, before constructing the adapters.
+    // Both `--force-software-only` and the normal path bind the same target so
+    // a real persistent brake stays addressable even under simulated telemetry.
+    // On failure we continue with fail-closed telemetry and refuse mutation.
+    let target = match GpuTarget::resolve() {
+        Ok(target) => {
+            tracing::info!(
+                gpu_uuid = target.uuid(),
+                "resolved GPU target (NVML index 0)"
+            );
+            println!(
+                "[relay] GPU target resolved: {} (NVML index 0)",
+                target.uuid()
+            );
+            Some(target)
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "GPU target resolution failed; continuing with fail-closed telemetry and refusing power-limit mutation"
+            );
+            eprintln!(
+                "[relay] WARNING: GPU target resolution failed ({err}); telemetry fail-closes and power-limit mutation is refused"
+            );
+            None
+        }
+    };
+
+    let bridge = HardwareBridge::new(target.clone());
+    let actuator: Arc<dyn SafetyActuator> = Arc::new(NvmlActuator::new(target));
     // Read-only startup query also detects a persistent brake in software-only mode.
     let (current_w, default_w) = actuator.query_power_limits_w();
     let policy = config.resolve(if cli.force_software_only {
@@ -215,7 +245,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let shutdown_reason = loop {
         step_count += 1;
-        let telemetry = HardwareBridge::read_telemetry_with_clock(
+        let telemetry = bridge.read_telemetry_with_clock(
             cli.force_software_only,
             cli.step_interval_ms,
             &mut sample_clock,
@@ -231,7 +261,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
                     let force_software_only = cli.force_software_only;
                     let cadence_ms = cli.step_interval_ms;
-                    let raw = acquire_raw_with_timeout(force_software_only).await;
+                    let raw = acquire_raw_with_timeout(&bridge, force_software_only).await;
                     let post_telemetry =
                         assess_with_clock(&raw, unix_now_ms(), cadence_ms, &mut sample_clock);
                     let (snap, pub_res) = evaluate_then_try_publish(
@@ -265,7 +295,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
                     let force_software_only = cli.force_software_only;
                     let cadence_ms = cli.step_interval_ms;
-                    let raw = acquire_raw_with_timeout(force_software_only).await;
+                    let raw = acquire_raw_with_timeout(&bridge, force_software_only).await;
                     let post_telemetry =
                         assess_with_clock(&raw, unix_now_ms(), cadence_ms, &mut sample_clock);
                     let (snap, pub_res) = evaluate_then_try_publish(
@@ -454,12 +484,17 @@ async fn perform_orderly_shutdown(
 }
 
 /// Bounded wait for NVML acquisition after actuation so a wedged driver cannot
-/// stall the supervisor loop indefinitely.
-async fn acquire_raw_with_timeout(force_software_only: bool) -> RawTelemetry {
+/// stall the supervisor loop indefinitely. Uses the same `bridge` (and thus the
+/// same [`GpuTarget`]) as the per-tick reads.
+async fn acquire_raw_with_timeout(
+    bridge: &HardwareBridge,
+    force_software_only: bool,
+) -> RawTelemetry {
     const TIMEOUT: Duration = Duration::from_secs(2);
+    let bridge = bridge.clone();
     match tokio::time::timeout(
         TIMEOUT,
-        tokio::task::spawn_blocking(move || HardwareBridge::acquire_raw(force_software_only)),
+        tokio::task::spawn_blocking(move || bridge.acquire_raw(force_software_only)),
     )
     .await
     {

@@ -1541,7 +1541,9 @@ mod tests {
     fn software_only_emits_typed_corpus_ipc_frame_without_gpu() {
         use crate::telemetry::DEFAULT_ACQUISITION_CADENCE_MS;
 
-        let raw = HardwareBridge::acquire_raw(true);
+        // Software-only acquisition never touches NVML, so the bridge needs no
+        // resolved GPU target.
+        let raw = HardwareBridge::new(None).acquire_raw(true);
         let mut clock = SampleClock::with_session_id("software-only");
         let frame = assess_with_clock(
             &raw,

@@ -76,9 +76,10 @@ simulated path. Running the daemon without a GPU and without that flag is
 ## GPU power-limit actuation (privileges)
 
 Policy (`SafetyMachine`) is deterministic and unprivileged. Applying or
-releasing a brake is a best-effort Linux side effect:
+releasing a brake is a best-effort Linux side effect, scoped to the GPU chosen
+at startup by its immutable NVML UUID:
 
-`timeout -k 2 5s sudo -n nvidia-smi -pl <watts>`
+`timeout -k 2 5s sudo -n nvidia-smi -i <UUID> -pl <watts>`
 
 That requires:
 
@@ -87,10 +88,26 @@ That requires:
 - **passwordless sudo** for `nvidia-smi` (`sudo -n`; a password prompt is a
   failure, not a hang — the command is non-interactive)
 
-Without those, actuation returns `ActuatorError` and the machine records
-`actuator_failure` while continuing to evaluate. A fail-closed *intent* does
-not guarantee the board power limit changed. This is not a substitute for GPU
-firmware thermal protection.
+The command now pins `-i <UUID>`, so a passwordless `sudo` rule restricted to a
+specific `nvidia-smi` invocation must permit the `-i <UUID> -pl <watts>` form
+(the previous unqualified `nvidia-smi -pl` form no longer matches). A rule that
+allows `nvidia-smi` broadly is unaffected.
+
+**Startup GPU identity.** On start the relay resolves NVML index 0 once, reads
+its UUID, validates it, and confirms it resolves back through `device_by_uuid`.
+Every telemetry read, power-limit query, and brake command for the rest of the
+process is scoped to that one UUID. If resolution fails (no driver, no device,
+unreadable/malformed UUID), the relay logs the reason, continues with
+**fail-closed** telemetry (`NvmlUnavailable`), and **refuses** power-limit
+mutation — apply/release return an `ActuatorError` without running any command.
+The relay never falls back to a different device, and it does not re-resolve
+during the run; restart to bind a newly attached GPU. This is a single-GPU
+supervisor (index 0), not a multi-GPU or GPU-selection tool.
+
+Without the privileges above, actuation returns `ActuatorError` and the machine
+records `actuator_failure` while continuing to evaluate. A fail-closed *intent*
+does not guarantee the board power limit changed. This is not a substitute for
+GPU firmware thermal protection.
 
 ## Features
 
@@ -287,8 +304,9 @@ frames remain simulated and cannot release an adopted real brake. The library's
 `SafetyPolicyConfig::resolve` and `SafetyMachine::with_policy` for real telemetry.
 
 The default power limit is a device capability used as a policy ceiling, not a
-claim about safe sustained operation for every workload. NVML queries target
-device index 0; this release is not a multi-GPU supervisor. It does not infer
+claim about safe sustained operation for every workload. NVML index 0 is
+resolved to a UUID once at startup and every read and command is scoped to that
+UUID; this release is not a multi-GPU supervisor. It does not infer
 vendor thermal limits or overclock settings. The brake remains 50% of default
 to keep restart matching consistent. Foreign sub-default caps are refused by
 the actuator and reported as `actuator_failure`; the relay does not claim them
