@@ -1,3 +1,6 @@
+Warning: truncated output (original token count: 11299)
+Total output lines: 1121
+
 //! Supervisor loop used by the `thalamic-relay` executable.
 //!
 //! Not part of the public library surface: Prometheus bind, process lock,
@@ -94,6 +97,10 @@ fn try_acquire_lock(lock_path: &str) -> Result<LockGuard, String> {
 /// in-process use.
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    if cli.gpu_hardware_smoke {
+        run_gpu_hardware_smoke()?;
+        return Ok(());
+    }
     let config = cli.safety_policy_config();
     // Reject contradictory operator inputs before NVML, locks, ports or workers.
     config.resolve(None)?;
@@ -373,142 +380,101 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Perform an explicit, read-only validation of the same GPU adapters used by
+/// the supervisor. This path does not start the daemon or mutate power limits.
+fn run_gpu_hardware_smoke() -> Result<(), Box<dyn std::error::Error>> {
+    let list = std::process::Command::new("timeout")
+        .args(["3s", "nvidia-smi", "-L"])
+        .output()
+        .map_err(|error| {
+            std::io::Error::other(format!(
+                "could not execute `timeout 3s nvidia-smi -L`: {error}"
+            ))
+        })?;
+    if !list.status.success() {
+        return Err(std::io::Error::other(format!(
+            "`nvidia-smi -L` exited with {}; NVIDIA driver/device unavailable",
+            list.status
+        ))
+        .into());
+    }
+    print!("{}", String::from_utf8_lossy(&list.stdout));
+
+    let target = GpuTarget::resolve()?;
+    println!("GPU target UUID: {}", target.uuid());
+    println!("Validation scope: read-only NVML telemetry and power limits; no actuation");
+
+    let raw = HardwareBridge::new(Some(target.clone())).acquire_raw(false);
+    if raw.source != TelemetrySource::Nvml {
+        return Err(std::io::Error::other(format!(
+            "resolved GPU {} did not produce NVML telemetry (source: {:?})",
+            target.uuid(),
+            raw.source
+        ))
+        .into());
+    }
+    let frame = assess_with_clock(&raw, unix_now_ms(), 100, &mut SampleClock::new());
+    require_hardware_smoke_sample("GPU temperature", &frame.gpu_temp_c)?;
+    require_hardware_smoke_sample("GPU board power", &frame.power_w)?;
+    println!(
+        "NVML telemetry on {}: temperature={:.1} C power={:.1} W",
+        target.uuid(),
+        frame.gpu_temp_c.value.expect("validated above"),
+        frame.power_w.value.expect("validated above")
+    );
+
+    let (current_w, default_w) = NvmlActuator::new(Some(target.clone())).query_power_limits_w();
+    let current_w = current_w.ok_or_else(|| {
+        std::io::Error::other(format!(
+            "current power limit could not be read from UUID {}",
+            target.uuid()
+        ))
+    })?;
+    let default_w = default_w.ok_or_else(|| {
+        std::io::Error::other(format!(
+            "default power limit could not be read from UUID {}",
+            target.uuid()
+        ))
+    })?;
+    if current_w == 0 || default_w == 0 {
+        return Err(std::io::Error::other(format!(
+            "NVML returned non-positive power limits for {}: current={current_w} W default={default_w} W",
+            target.uuid()
+        ))
+        .into());
+    }
+    println!(
+        "NVML power limits on {}: current={} W default={} W",
+        target.uuid(),
+        current_w,
+        default_w
+    );
+    println!("GPU hardware smoke PASSED (read-only)");
+    Ok(())
+}
+
+fn require_hardware_smoke_sample(
+    label: &str,
+    sample: &TelemetrySample<f32>,
+) -> Result<(), std::io::Error> {
+    match (sample.validity, sample.value) {
+        (SampleValidity::Valid, Some(value)) if value.is_finite() => Ok(()),
+        (SampleValidity::Valid, _) => Err(std::io::Error::other(format!(
+            "{label} has no finite NVML value"
+        ))),
+        (validity, _) => Err(std::io::Error::other(format!(
+            "{label} is not valid NVML telemetry ({validity:?})"
+        ))),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn perform_orderly_shutdown(
     reason: ShutdownReason,
     machine: &mut SafetyMachine,
     brake_task: &mut Option<ActuationTask>,
     release_task: &mut Option<ActuationTask>,
-    relay_metrics: &Arc<Mutex<RelayMetrics>>,
-    warned_brake_held_sim: &mut bool,
-    metrics_shutdown: &tokio::sync::watch::Sender<bool>,
-    metrics_task: JoinHandle<()>,
-) -> ShutdownPlan {
-    let snap = machine.snapshot();
-    let in_flight = InFlightActuation::from_tasks(brake_task.is_some(), release_task.is_some());
-    let plan = plan_shutdown(reason, &snap, in_flight);
-
-    println!();
-    eprintln!(
-        "[relay] shutdown reason={} state={} policy_state={} brake_engaged={} desired_brake={} \
-         in_flight={} unresolved_brake={} unresolved_actuator={} actuation={} ({})",
-        plan.reason.as_str(),
-        snap.state.as_str(),
-        snap.policy_state.as_str(),
-        snap.brake_engaged,
-        snap.desired_brake,
-        in_flight.as_str(),
-        plan.unresolved_brake,
-        plan.unresolved_actuator,
-        plan.actuation.as_str(),
-        plan.summary,
-    );
-    tracing::info!(
-        reason = plan.reason.as_str(),
-        state = snap.state.as_str(),
-        policy_state = snap.policy_state.as_str(),
-        brake_engaged = snap.brake_engaged,
-        desired_brake = snap.desired_brake,
-        in_flight = in_flight.as_str(),
-        unresolved_brake = plan.unresolved_brake,
-        unresolved_actuator = plan.unresolved_actuator,
-        actuation = plan.actuation.as_str(),
-        summary = plan.summary,
-        "orderly shutdown (fail-closed: no new power-limit restore)"
-    );
-
-    {
-        let mut metrics = relay_metrics.lock().unwrap();
-        cpu::record_shutdown(&mut metrics, &plan);
-    }
-
-    match plan.actuation {
-        ShutdownActuation::Idle => {
-            if let Some(task) = brake_task.take() {
-                task.abort();
-            }
-            if let Some(task) = release_task.take() {
-                task.abort();
-            }
-        }
-        ShutdownActuation::AwaitApply => {
-            if let Some(task) = brake_task.take() {
-                match join_in_flight(task, SHUTDOWN_ACTUATOR_TIMEOUT).await {
-                    InFlightJoin::Succeeded => {
-                        let snap = machine.record_actuator(ActuatorOutcome::Applied);
-                        store_safety(relay_metrics, &snap, warned_brake_held_sim);
-                    }
-                    InFlightJoin::Failed(e) | InFlightJoin::Panicked(e) => {
-                        eprintln!("[relay] shutdown: in-flight apply did not succeed: {e}");
-                        let snap = machine.record_actuator(ActuatorOutcome::ApplyFailed(e));
-                        store_safety(relay_metrics, &snap, warned_brake_held_sim);
-                    }
-                    InFlightJoin::TimedOut => {
-                        eprintln!(
-                            "[relay] shutdown: in-flight apply timed out; leaving hardware unchanged"
-                        );
-                    }
-                }
-            }
-            if let Some(task) = release_task.take() {
-                task.abort();
-            }
-        }
-        ShutdownActuation::AwaitAuthorizedRelease => {
-            if let Some(task) = release_task.take() {
-                match join_in_flight(task, SHUTDOWN_ACTUATOR_TIMEOUT).await {
-                    InFlightJoin::Succeeded => {
-                        let snap = machine.record_actuator(ActuatorOutcome::Released);
-                        store_safety(relay_metrics, &snap, warned_brake_held_sim);
-                    }
-                    InFlightJoin::Failed(e) | InFlightJoin::Panicked(e) => {
-                        eprintln!("[relay] shutdown: in-flight release did not succeed: {e}");
-                        let snap = machine.record_actuator(ActuatorOutcome::ReleaseFailed(e));
-                        store_safety(relay_metrics, &snap, warned_brake_held_sim);
-                    }
-                    InFlightJoin::TimedOut => {
-                        eprintln!(
-                            "[relay] shutdown: in-flight release timed out; leaving brake engaged"
-                        );
-                    }
-                }
-            }
-            if let Some(task) = brake_task.take() {
-                task.abort();
-            }
-        }
-    }
-
-    shutdown_metrics_collector(metrics_shutdown, metrics_task, SHUTDOWN_METRICS_TIMEOUT).await;
-    plan
-}
-
-/// Bounded wait for NVML acquisition after actuation so a wedged driver cannot
-/// stall the supervisor loop indefinitely. Uses the same `bridge` (and thus the
-/// same [`GpuTarget`]) as the per-tick reads.
-async fn acquire_raw_with_timeout(
-    bridge: &HardwareBridge,
-    force_software_only: bool,
-) -> RawTelemetry {
-    const TIMEOUT: Duration = Duration::from_secs(2);
-    let bridge = bridge.clone();
-    match tokio::time::timeout(
-        TIMEOUT,
-        tokio::task::spawn_blocking(move || bridge.acquire_raw(force_software_only)),
-    )
-    .await
-    {
-        Ok(Ok(raw)) => raw,
-        Ok(Err(_)) => panic!("post-actuation telemetry read task panicked"),
-        Err(_) => {
-            tracing::warn!("post-actuation NVML acquisition timed out; treating as unavailable");
-            RawTelemetry::nvml_unavailable(unix_now_ms())
-        }
-    }
-}
-
-fn build_publisher(cli: &Cli) -> Box<dyn SensoryPublisher> {
-    if cli.ipc_disabled {
+    rel…1299 tokens truncated… cli.ipc_disabled {
         println!("[relay] corpus-ipc: disabled; hardware safety is independent of Brainstem");
         return Box::new(AbsentPublisher);
     }
@@ -708,6 +674,10 @@ struct Cli {
     /// Distinct from NVML/driver failure, which is fail-closed `NvmlUnavailable`.
     #[arg(long, env = "THALAMIC_FORCE_SOFTWARE_ONLY", num_args = 0..=1, default_missing_value = "true", default_value_t = false, value_parser = clap::value_parser!(bool))]
     force_software_only: bool,
+
+    /// Validate read-only NVIDIA hardware access and exit without starting the supervisor.
+    #[arg(long)]
+    gpu_hardware_smoke: bool,
 
     /// UDP destination for canonical `corpus-ipc` `IpcMessage::Stimuli` datagrams.
     /// Fire-and-forget; Brainstem absence does not stall safety.
