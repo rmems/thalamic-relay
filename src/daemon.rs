@@ -320,9 +320,11 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             &machine.snapshot(),
             &actuator,
             &nvml_gate,
-            (&mut brake_task, &mut release_task),
-            &mut pending_intent,
-            dispatch_due,
+            DispatchAttempt {
+                slots: (&mut brake_task, &mut release_task),
+                pending: &mut pending_intent,
+                due: dispatch_due,
+            },
         );
 
         {
@@ -702,23 +704,27 @@ enum DispatchResult {
     NoIntent,
 }
 
+struct DispatchAttempt<'a> {
+    slots: (&'a mut Option<ActuationTask>, &'a mut Option<ActuationTask>),
+    pending: &'a mut Option<BrakeIntent>,
+    due: bool,
+}
+
 /// Retry only intents skipped because another NVML worker held the gate.
 /// Reconcile with the latest safety snapshot before any retry.
 fn dispatch_due_or_pending(
     snap: &SafetySnapshot,
     actuator: &Arc<dyn SafetyActuator>,
     gate: &NvmlGate,
-    slots: (&mut Option<ActuationTask>, &mut Option<ActuationTask>),
-    pending: &mut Option<BrakeIntent>,
-    due: bool,
+    attempt: DispatchAttempt<'_>,
 ) {
-    if *pending != Some(snap.intent) {
-        *pending = None;
+    if *attempt.pending != Some(snap.intent) {
+        *attempt.pending = None;
     }
-    if !due && pending.is_none() {
+    if !attempt.due && attempt.pending.is_none() {
         return;
     }
-    *pending = match spawn_intent(snap, actuator, gate, slots) {
+    *attempt.pending = match spawn_intent(snap, actuator, gate, attempt.slots) {
         DispatchResult::GateBusy => Some(snap.intent),
         DispatchResult::Spawned | DispatchResult::AlreadyInFlight | DispatchResult::NoIntent => {
             None
@@ -1022,9 +1028,11 @@ mod tests {
             &snap,
             &actuator,
             &gate,
-            (&mut brake_task, &mut release_task),
-            &mut pending,
-            true,
+            DispatchAttempt {
+                slots: (&mut brake_task, &mut release_task),
+                pending: &mut pending,
+                due: true,
+            },
         );
         assert_eq!(pending, Some(BrakeIntent::Apply));
         assert!(brake_task.is_none());
@@ -1034,9 +1042,11 @@ mod tests {
             &snap,
             &actuator,
             &gate,
-            (&mut brake_task, &mut release_task),
-            &mut pending,
-            false,
+            DispatchAttempt {
+                slots: (&mut brake_task, &mut release_task),
+                pending: &mut pending,
+                due: false,
+            },
         );
         assert_eq!(pending, None);
         assert!(brake_task.take().unwrap().await.unwrap().is_ok());
@@ -1070,9 +1080,11 @@ mod tests {
             &snap,
             &actuator,
             &gate,
-            (&mut brake_task, &mut release_task),
-            &mut pending,
-            false,
+            DispatchAttempt {
+                slots: (&mut brake_task, &mut release_task),
+                pending: &mut pending,
+                due: false,
+            },
         );
         assert_eq!(pending, None);
         assert!(brake_task.is_none());
