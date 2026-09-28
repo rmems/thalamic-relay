@@ -4,9 +4,13 @@
 [![GitHub Actions CI](https://img.shields.io/github/actions/workflow/status/rmems/thalamic-relay/ci.yml?branch=main&label=CI)](https://github.com/rmems/thalamic-relay/actions/workflows/ci.yml)
 [![CodeRabbit Pull Request Reviews](https://img.shields.io/coderabbit/prs/github/rmems/thalamic-relay?utm_source=oss&utm_medium=github&utm_campaign=rmems%2Fthalamic-relay&labelColor=171717&color=FF570A&link=https%3A%2F%2Fcoderabbit.ai&label=CodeRabbit+Reviews)](https://coderabbit.ai)
 [![Codacy: project unverified](https://img.shields.io/badge/Codacy-project%20unverified-lightgrey)](https://app.codacy.com/gh/rmems/thalamic-relay/dashboard)
-[![Qlty: badge unavailable](https://img.shields.io/badge/Qlty-badge%20unavailable-lightgrey)](https://qlty.sh/gh/rmems/projects/thalamic-relay)
+[![Qlty Maintainability](https://qlty.sh/gh/rmems/projects/thalamic-relay/maintainability.svg)](https://qlty.sh/gh/rmems/projects/thalamic-relay)
 [![DeepWiki: not indexed](https://img.shields.io/badge/DeepWiki-not%20indexed-lightgrey)](https://deepwiki.com/rmems/thalamic-relay)
 [![crates.io: unpublished](https://img.shields.io/badge/crates.io-unpublished-lightgrey)](https://crates.io/search?q=thalamic-relay)
+[![CodeScene Average Code Health](https://codescene.io/projects/85266/status-badges/average-code-health)](https://codescene.io/projects/85266)
+[![CodeScene Hotspot Code Health](https://codescene.io/projects/85266/status-badges/hotspot-code-health)](https://codescene.io/projects/85266)
+[![CodeScene System Mastery](https://codescene.io/projects/85266/status-badges/system-mastery)](https://codescene.io/projects/85266)
+[![Analyzed by CodeScene](https://codescene.io/images/analyzed-by-codescene-badge.svg)](https://codescene.io/projects/85266)
 
 Gray badges show provider or publication status checked on 2026-09-28; they
 are not quality scores.
