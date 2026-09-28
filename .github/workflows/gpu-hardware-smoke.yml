@@ -1,0 +1,30 @@
+name: Trusted GPU Hardware Smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  read-only-smoke:
+    name: Read-only NVML smoke
+    # Manual dispatch can select a branch. Only route the job to the privileged
+    # workstation when the selected ref is the protected main branch.
+    if: github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, linux, x64, gpu, nvidia]
+    timeout-minutes: 10
+    steps:
+      - name: Checkout trusted main commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Show trusted commit
+        run: |
+          set -euo pipefail
+          echo "Trusted commit: $(git rev-parse HEAD)"
+
+      - name: Validate NVML identity, telemetry, and power limits
+        run: cargo run --locked --bin thalamic-relay -- --gpu-hardware-smoke

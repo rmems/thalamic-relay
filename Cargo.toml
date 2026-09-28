@@ -25,6 +25,7 @@ include = [
     "docs/safety.md",
     "docs/telemetry.md",
     "docs/telemetry_csv.md",
+    "docs/gpu-hardware-validation.md",
     "examples/**",
 ]
 

@@ -66,6 +66,8 @@ pub mod telemetry;
 pub mod telemetry_csv;
 pub mod time;
 
+#[doc(hidden)]
+pub use daemon::run_gpu_hardware_smoke_if_requested;
 /// Process entry for the `thalamic-relay` executable. Not reusable library API.
 #[doc(hidden)]
 pub use daemon::{SupervisorStart, prepare, run};

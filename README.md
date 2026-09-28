@@ -121,6 +121,14 @@ records `actuator_failure` while continuing to evaluate. A fail-closed *intent*
 does not guarantee the board power limit changed. This is not a substitute for
 GPU firmware thermal protection.
 
+### Trusted GPU hardware validation
+
+The optional [trusted hardware validation lane](docs/gpu-hardware-validation.md)
+can be manually dispatched by maintainers from `main` to read real NVML
+identity, telemetry, and power-limit state on a dedicated self-hosted NVIDIA
+runner. It is read-only and supplements the normal software-only CI jobs; it
+does not run for public pull requests or change the GPU power limit.
+
 ## Features
 
 - **GPU Telemetry**: NVML sensors (temperature, power, clocks, fan,
