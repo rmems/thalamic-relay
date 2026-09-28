@@ -94,10 +94,6 @@ fn try_acquire_lock(lock_path: &str) -> Result<LockGuard, String> {
 /// in-process use.
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    if cli.gpu_hardware_smoke {
-        run_gpu_hardware_smoke()?;
-        return Ok(());
-    }
     let config = cli.safety_policy_config();
     // Reject contradictory operator inputs before NVML, locks, ports or workers.
     config.resolve(None)?;
@@ -379,13 +375,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Perform an explicit, read-only validation of the same GPU adapters used by
 /// the supervisor. This path does not start the daemon or mutate power limits.
-fn run_gpu_hardware_smoke() -> Result<(), Box<dyn std::error::Error>> {
+pub fn run_gpu_hardware_smoke() -> Result<(), Box<dyn std::error::Error>> {
     let list = std::process::Command::new("timeout")
-        .args(["3s", "nvidia-smi", "-L"])
+        .args(["-k", "2s", "3s", "nvidia-smi", "-L"])
         .output()
         .map_err(|error| {
             std::io::Error::other(format!(
-                "could not execute `timeout 3s nvidia-smi -L`: {error}"
+                "could not execute `timeout -k 2s 3s nvidia-smi -L`: {error}"
             ))
         })?;
     if !list.status.success() {
@@ -800,10 +796,6 @@ struct Cli {
     /// Distinct from NVML/driver failure, which is fail-closed `NvmlUnavailable`.
     #[arg(long, env = "THALAMIC_FORCE_SOFTWARE_ONLY", num_args = 0..=1, default_missing_value = "true", default_value_t = false, value_parser = clap::value_parser!(bool))]
     force_software_only: bool,
-
-    /// Validate read-only NVIDIA hardware access and exit without starting the supervisor.
-    #[arg(long)]
-    gpu_hardware_smoke: bool,
 
     /// UDP destination for canonical `corpus-ipc` `IpcMessage::Stimuli` datagrams.
     /// Fire-and-forget; Brainstem absence does not stall safety.

@@ -15,14 +15,13 @@ and runs only on a runner carrying all of these labels:
 self-hosted, linux, x64, gpu, nvidia
 ```
 
-The runner should be dedicated to this repository and kept offline from
-untrusted workloads. Public pull requests do not trigger this workflow. GitHub
+The runner needs the NVIDIA driver, `nvidia-smi`, a working NVML library, and GNU coreutils (`timeout`). The production NVIDIA adapter also uses `timeout` to bound health and actuation commands. Keep the runner dedicated to this repository and offline from untrusted workloads. Public pull requests do not trigger this workflow. GitHub
 allows manual dispatch only to users with write access; protect `main` and
 limit that access to maintainers trusted to run code on the hardware host.
 The workflow has only `contents: read` permission and checks out without
 persistent credentials.
 
-The job runs `nvidia-smi -L`, then executes the supervisor's explicit
+The job runs `timeout -k 2s 3s nvidia-smi -L`, then executes the supervisor's explicit
 `--gpu-hardware-smoke` mode. It uses the same NVML adapter as the supervisor
 to:
 
