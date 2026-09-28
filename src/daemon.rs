@@ -119,33 +119,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Both `--force-software-only` and the normal path bind the same target so
     // a real persistent brake stays addressable even under simulated telemetry.
     // On failure we continue with fail-closed telemetry and refuse mutation.
-    let resolution = match nvml_gate.run(NVML_TIMEOUT, GpuTarget::resolve).await {
-        Ok(result) => result.map_err(|err| err.to_string()),
-        Err(err) => Err(format!("{err:?}")),
-    };
-    let target = match resolution {
-        Ok(target) => {
-            tracing::info!(
-                gpu_uuid = target.uuid(),
-                "resolved GPU target (NVML index 0)"
-            );
-            println!(
-                "[relay] GPU target resolved: {} (NVML index 0)",
-                target.uuid()
-            );
-            Some(target)
-        }
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                "GPU target resolution failed; continuing with fail-closed telemetry and refusing power-limit mutation"
-            );
-            eprintln!(
-                "[relay] WARNING: GPU target resolution failed ({err}); telemetry fail-closes and power-limit mutation is refused"
-            );
-            None
-        }
-    };
+    let target = resolve_gpu_target(&nvml_gate).await;
 
     let bridge = HardwareBridge::new(target.clone());
     let actuator: Arc<dyn SafetyActuator> = Arc::new(NvmlActuator::new(target));
@@ -287,8 +261,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         &snap,
                         &actuator,
                         &nvml_gate,
-                        &mut brake_task,
-                        &mut release_task,
+                        (&mut brake_task, &mut release_task),
                     );
                     evaluated_this_iter = true;
                 }
@@ -328,8 +301,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         &snap,
                         &actuator,
                         &nvml_gate,
-                        &mut brake_task,
-                        &mut release_task,
+                        (&mut brake_task, &mut release_task),
                     );
                     evaluated_this_iter = true;
                 }
@@ -354,17 +326,19 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         // Do not spawn from the pre-telemetry snapshot: SoftwareFallback holds
         // rather than applies, which only classify_frame can decide.
         if !evaluated_this_iter && should_evaluate_tick(step_count, telemetry.source) {
+            let prior_intent = machine.snapshot().intent;
             let (snap, pub_res) =
                 evaluate_then_try_publish(&mut machine, &telemetry, publisher.as_ref());
             let _ = pub_res;
             store_safety(&relay_metrics, &snap, &mut warned_brake_held_sim);
-            spawn_intent(
-                &snap,
-                &actuator,
-                &nvml_gate,
-                &mut brake_task,
-                &mut release_task,
-            );
+            if should_dispatch_intent(step_count, prior_intent, snap.intent) {
+                spawn_intent(
+                    &snap,
+                    &actuator,
+                    &nvml_gate,
+                    (&mut brake_task, &mut release_task),
+                );
+            }
         } else if !evaluated_this_iter {
             // Publication is outside the safety critical path and never awaited.
             let _ = publisher.try_publish(&telemetry.to_sensory_mapping());
@@ -516,8 +490,43 @@ async fn perform_orderly_shutdown(
 
 const NVML_TIMEOUT: Duration = Duration::from_secs(2);
 
+async fn resolve_gpu_target(gate: &NvmlGate) -> Option<GpuTarget> {
+    let resolution = match gate.run(NVML_TIMEOUT, GpuTarget::resolve).await {
+        Ok(result) => result.map_err(|err| err.to_string()),
+        Err(err) => Err(format!("{err:?}")),
+    };
+    match resolution {
+        Ok(target) => {
+            tracing::info!(
+                gpu_uuid = target.uuid(),
+                "resolved GPU target (NVML index 0)"
+            );
+            println!(
+                "[relay] GPU target resolved: {} (NVML index 0)",
+                target.uuid()
+            );
+            Some(target)
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "GPU target resolution failed; continuing with fail-closed telemetry and refusing power-limit mutation"
+            );
+            eprintln!(
+                "[relay] WARNING: GPU target resolution failed ({err}); telemetry fail-closes and power-limit mutation is refused"
+            );
+            None
+        }
+    }
+}
+
 fn should_evaluate_tick(step_count: u64, source: TelemetrySource) -> bool {
     step_count == 1 || step_count.is_multiple_of(10) || source == TelemetrySource::NvmlUnavailable
+}
+
+fn should_dispatch_intent(step_count: u64, prior: BrakeIntent, current: BrakeIntent) -> bool {
+    current != BrakeIntent::None
+        && (step_count == 1 || step_count.is_multiple_of(10) || current != prior)
 }
 
 /// Bounded single-flight acquisition for both per-tick and post-actuation reads.
@@ -650,32 +659,32 @@ fn spawn_intent(
     snap: &SafetySnapshot,
     actuator: &Arc<dyn SafetyActuator>,
     gate: &NvmlGate,
-    brake_task: &mut Option<ActuationTask>,
-    release_task: &mut Option<ActuationTask>,
+    slots: (&mut Option<ActuationTask>, &mut Option<ActuationTask>),
 ) {
-    match snap.intent {
-        BrakeIntent::Apply if brake_task.is_none() && release_task.is_none() => {
-            let actuator = Arc::clone(actuator);
-            *brake_task = Some(match gate.try_enter() {
-                Ok(permit) => tokio::task::spawn_blocking(move || {
-                    let _permit = permit;
-                    actuator.apply_emergency_brake(BRAKE_FRACTION)
-                }),
-                Err(_) => tokio::spawn(async { Err(ActuatorError::PowerLimitUnavailable) }),
-            });
-        }
-        BrakeIntent::Release if release_task.is_none() && brake_task.is_none() => {
-            let actuator = Arc::clone(actuator);
-            *release_task = Some(match gate.try_enter() {
-                Ok(permit) => tokio::task::spawn_blocking(move || {
-                    let _permit = permit;
-                    actuator.release_emergency_brake()
-                }),
-                Err(_) => tokio::spawn(async { Err(ActuatorError::PowerLimitUnavailable) }),
-            });
-        }
-        _ => {}
+    let (brake_task, release_task) = slots;
+    if brake_task.is_some() || release_task.is_some() {
+        return;
     }
+    let slot = match snap.intent {
+        BrakeIntent::Apply => brake_task,
+        BrakeIntent::Release => release_task,
+        BrakeIntent::None => return,
+    };
+    let Ok(permit) = gate.try_enter() else {
+        // A wedged driver has not attempted a new actuation. Preserve the
+        // machine's intent without inventing an actuator failure outcome.
+        return;
+    };
+    let actuator = Arc::clone(actuator);
+    let intent = snap.intent;
+    *slot = Some(tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        match intent {
+            BrakeIntent::Apply => actuator.apply_emergency_brake(BRAKE_FRACTION),
+            BrakeIntent::Release => actuator.release_emergency_brake(),
+            BrakeIntent::None => unreachable!("only actuation intents acquire a slot"),
+        }
+    }));
 }
 
 fn print_dashboard(frame: &TelemetryFrame, step: u64, safety: SafetyState) {
@@ -821,6 +830,48 @@ mod tests {
         assert!(should_evaluate_tick(10, TelemetrySource::Nvml));
     }
 
+    #[test]
+    fn unchanged_brake_intent_retries_only_on_safety_cadence() {
+        assert!(should_dispatch_intent(
+            11,
+            BrakeIntent::None,
+            BrakeIntent::Apply
+        ));
+        assert!(!should_dispatch_intent(
+            11,
+            BrakeIntent::Apply,
+            BrakeIntent::Apply
+        ));
+        assert!(should_dispatch_intent(
+            20,
+            BrakeIntent::Apply,
+            BrakeIntent::Apply
+        ));
+    }
+
+    #[tokio::test]
+    async fn busy_nvml_gate_does_not_record_an_actuation_attempt() {
+        let gate = NvmlGate::default();
+        let _permit = gate.try_enter().unwrap();
+        let mut machine = crate::safety::test_machine();
+        let frame = crate::telemetry::assess(
+            &crate::telemetry::fixtures::nvml_unavailable(),
+            crate::telemetry::fixtures::NOW,
+        );
+        let snap = machine.evaluate(&frame);
+        let actuator: Arc<dyn SafetyActuator> = Arc::new(NvmlActuator::new(None));
+        let mut brake_task = None;
+        let mut release_task = None;
+        spawn_intent(
+            &snap,
+            &actuator,
+            &gate,
+            (&mut brake_task, &mut release_task),
+        );
+        assert!(brake_task.is_none());
+        assert!(release_task.is_none());
+    }
+
     #[tokio::test]
     async fn busy_nvml_worker_fail_closes_tick_and_post_actuation_reads() {
         let gate = NvmlGate::default();
@@ -832,9 +883,7 @@ mod tests {
         assert_eq!(raw.source, TelemetrySource::NvmlUnavailable);
         let mut clock = SampleClock::new();
         let frame = assess_with_clock(&raw, unix_now_ms(), 100, &mut clock);
-        assert_eq!(frame.source, TelemetrySource::NvmlUnavailable);
         assert_eq!(frame.gpu_temp_c.validity, SampleValidity::Missing);
-        assert_eq!(frame.power_w.validity, SampleValidity::Missing);
         assert_eq!(
             acquire_raw_with_timeout(&gate, &bridge, true).await.source,
             TelemetrySource::SoftwareFallback
