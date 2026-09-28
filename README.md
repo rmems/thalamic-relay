@@ -3,7 +3,6 @@
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](https://github.com/rmems/thalamic-relay#license)
 [![GitHub Actions CI](https://img.shields.io/github/actions/workflow/status/rmems/thalamic-relay/ci.yml?branch=main&label=CI)](https://github.com/rmems/thalamic-relay/actions/workflows/ci.yml)
 [![CodeRabbit Pull Request Reviews](https://img.shields.io/coderabbit/prs/github/rmems/thalamic-relay?utm_source=oss&utm_medium=github&utm_campaign=rmems%2Fthalamic-relay&labelColor=171717&color=FF570A&link=https%3A%2F%2Fcoderabbit.ai&label=CodeRabbit+Reviews)](https://coderabbit.ai)
-[![Codacy: project unverified](https://img.shields.io/badge/Codacy-project%20unverified-lightgrey)](https://app.codacy.com/gh/rmems/thalamic-relay/dashboard)
 [![Qlty Maintainability](https://qlty.sh/gh/rmems/projects/thalamic-relay/maintainability.svg)](https://qlty.sh/gh/rmems/projects/thalamic-relay)
 [![DeepWiki](https://deepwiki.com/badge.svg)](https://app.devin.ai/org/your-organization-d33af45a/wiki/rmems/thalamic-relay?branch=main)
 [![GitHub Wiki](https://img.shields.io/badge/GitHub-Wiki-blue)](https://github.com/rmems/thalamic-relay/wiki)
@@ -13,8 +12,7 @@
 [![CodeScene System Mastery](https://codescene.io/projects/85266/status-badges/system-mastery)](https://codescene.io/projects/85266)
 [![Analyzed by CodeScene](https://codescene.io/images/analyzed-by-codescene-badge.svg)](https://codescene.io/projects/85266)
 
-Gray badges show provider or publication status checked on 2026-09-28; they
-are not quality scores.
+The gray crates.io badge shows publication status checked on 2026-09-28.
 
 A lightweight **library** (`thalamic_relay`) and **CLI** (`thalamic-relay`)
 that observes hardware telemetry and provides deterministic hardware
