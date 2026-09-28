@@ -229,7 +229,7 @@ impl HardwareBridge {
     /// Uses a tight timeout to prevent blocking the supervisor if the driver is "wedged".
     pub fn is_gpu_healthy() -> bool {
         let output = std::process::Command::new("timeout")
-            .args(["1s", "nvidia-smi", "-L"])
+            .args(["-k", "1s", "1s", "nvidia-smi", "-L"])
             .output();
 
         match output {

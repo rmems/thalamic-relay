@@ -87,6 +87,23 @@ fn try_acquire_lock(lock_path: &str) -> Result<LockGuard, String> {
     }
 }
 
+/// Run the read-only smoke when its Clap option is present. Returns `false`
+/// when normal supervisor startup should continue.
+#[doc(hidden)]
+pub fn run_gpu_hardware_smoke_if_requested() -> Result<bool, Box<dyn std::error::Error>> {
+    if !std::env::args_os().any(|arg| arg == "--gpu-hardware-smoke") {
+        return Ok(false);
+    }
+
+    let cli = Cli::parse();
+    if cli.gpu_hardware_smoke {
+        run_gpu_hardware_smoke()?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 /// Run the supervisor: lockfile, Prometheus, telemetry, and isolated safety.
 ///
 /// This is the `thalamic-relay` executable entry, not a reusable library API.
@@ -371,6 +388,94 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("[relay] releasing process lock {lock_path}");
 
     Ok(())
+}
+
+/// Perform an explicit, read-only validation of the same GPU adapters used by
+/// the supervisor. This path does not start the daemon or mutate power limits.
+fn run_gpu_hardware_smoke() -> Result<(), Box<dyn std::error::Error>> {
+    let list = std::process::Command::new("timeout")
+        .args(["-k", "2s", "3s", "nvidia-smi", "-L"])
+        .output()
+        .map_err(|error| {
+            std::io::Error::other(format!(
+                "could not execute `timeout -k 2s 3s nvidia-smi -L`: {error}"
+            ))
+        })?;
+    if !list.status.success() {
+        return Err(std::io::Error::other(format!(
+            "`nvidia-smi -L` exited with {}; NVIDIA driver/device unavailable",
+            list.status
+        ))
+        .into());
+    }
+    print!("{}", String::from_utf8_lossy(&list.stdout));
+
+    let target = GpuTarget::resolve()?;
+    println!("GPU target UUID: {}", target.uuid());
+    println!("Validation scope: read-only NVML telemetry and power limits; no actuation");
+
+    let raw = HardwareBridge::new(Some(target.clone())).acquire_raw(false);
+    if raw.source != TelemetrySource::Nvml {
+        return Err(std::io::Error::other(format!(
+            "resolved GPU {} did not produce NVML telemetry (source: {:?})",
+            target.uuid(),
+            raw.source
+        ))
+        .into());
+    }
+    let frame = assess_with_clock(&raw, unix_now_ms(), 100, &mut SampleClock::new());
+    require_hardware_smoke_sample("GPU temperature", &frame.gpu_temp_c)?;
+    require_hardware_smoke_sample("GPU board power", &frame.power_w)?;
+    println!(
+        "NVML telemetry on {}: temperature={:.1} C power={:.1} W",
+        target.uuid(),
+        frame.gpu_temp_c.value.expect("validated above"),
+        frame.power_w.value.expect("validated above")
+    );
+
+    let (current_w, default_w) = NvmlActuator::new(Some(target.clone())).query_power_limits_w();
+    let current_w = current_w.ok_or_else(|| {
+        std::io::Error::other(format!(
+            "current power limit could not be read from UUID {}",
+            target.uuid()
+        ))
+    })?;
+    let default_w = default_w.ok_or_else(|| {
+        std::io::Error::other(format!(
+            "default power limit could not be read from UUID {}",
+            target.uuid()
+        ))
+    })?;
+    if current_w == 0 || default_w == 0 {
+        return Err(std::io::Error::other(format!(
+            "NVML returned non-positive power limits for {}: current={current_w} W default={default_w} W",
+            target.uuid()
+        ))
+        .into());
+    }
+    println!(
+        "NVML power limits on {}: current={} W default={} W",
+        target.uuid(),
+        current_w,
+        default_w
+    );
+    println!("GPU hardware smoke PASSED (read-only)");
+    Ok(())
+}
+
+fn require_hardware_smoke_sample(
+    label: &str,
+    sample: &TelemetrySample<f32>,
+) -> Result<(), std::io::Error> {
+    match (sample.validity, sample.value) {
+        (SampleValidity::Valid, Some(value)) if value.is_finite() => Ok(()),
+        (SampleValidity::Valid, _) => Err(std::io::Error::other(format!(
+            "{label} has no finite NVML value"
+        ))),
+        (validity, _) => Err(std::io::Error::other(format!(
+            "{label} is not valid NVML telemetry ({validity:?})"
+        ))),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -701,6 +806,10 @@ struct Cli {
     /// Relay loop tick interval (ms); minimum 1 to prevent busy-looping
     #[arg(long, default_value_t = 100, env = "THALAMIC_STEP_INTERVAL_MS", value_parser = clap::value_parser!(u64).range(1..))]
     step_interval_ms: u64,
+
+    /// Validate read-only NVIDIA hardware access and exit without starting the supervisor.
+    #[arg(long)]
+    gpu_hardware_smoke: bool,
 
     /// Force simulated idle telemetry (skip NVML). Documented estimates, not real sensors.
     /// Usable as a bare flag (`--force-software-only`) or with an explicit
