@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 First intended crates.io release; the maintainer sets the release date and
 publishes only after final approval and clean-commit qualification.
 
-- **Breaking rename (RM-1902 / GH#76):** The crate, library, and binary are renamed from `thalamic-relay` / `thalamic_relay` to `vahtisiru`. Environment variables move from the `THALAMIC_` prefix to `VAHTISIRU_`, and the single-instance lock moves from `/tmp/thalamic_relay.lock` to `/tmp/vahtisiru.lock`. Downstream consumers must update `use` paths and any `THALAMIC_*` configuration.
+- **Breaking rename (RM-1902 / GH#76):** The crate, library, and binary are renamed from `thalamic-relay` / `thalamic_relay` to `vahtisiru`. Environment variables move from the `THALAMIC_` prefix to `VAHTISIRU_`, and the single-instance lock moves from `/tmp/thalamic_relay.lock` to `/tmp/vahtisiru.lock`. Downstream consumers must update `use` paths and any `THALAMIC_*` configuration. Startup refuses to run alongside a live pre-rename `thalamic-relay` instance (checked via `/tmp/thalamic_relay.lock`) so an old and new supervisor cannot actuate the same GPU during upgrades.
 - **Configurable safety (GH#47 / RM-1221):** Validated immutable policy with explicit temperature limits, device-derived or paired operator watt limits, configurable recovery count and freshness/acquisition bounds. Unknown power policy fails closed for real telemetry. CLI/env settings reject invalid configurations before services start and log the effective policy. `SafetyMachine::new()` no longer assumes a 300/350 W device envelope; use `with_policy` for real telemetry. Sensor sanity range is now 0–2000 W; sensory normalization remains 0–350 W.
 - **Operator caps (RM-1455):** Actuation refuses foreign sub-default caps and missing default limits, and checks the expected target before release. It no longer claims a lower operator cap as its own brake or compounds a current limit when the default is unavailable. Target-match ownership remains heuristic, with the documented external-writer race limitation.
 - **Release hygiene (GH#26 / GH#52):** Version, consumer examples and release procedure aligned to 0.2.0; consumer docs are explicitly allowlisted and contributor plans excluded. Registry availability, upload, tag and hosted documentation verification are separate release steps.
@@ -47,7 +47,7 @@ publishes only after final approval and clean-commit qualification.
 
 ### Added
 
-- Initial `vahtisiru` binary: a Rust CLI that observes hardware telemetry and forwards normalized stimuli to an in-process spiking neural network
+- Initial `thalamic-relay` binary: a Rust CLI that observes hardware telemetry and forwards normalized stimuli to an in-process spiking neural network
 - Software-only SNN stepping via `neuromod` with graceful fallback when no GPU is present
 - UDP IPC interface for streaming stimuli, applying reward signals, and querying neuromodulator state
 - Prometheus-compatible metrics export on `localhost:9000/metrics`

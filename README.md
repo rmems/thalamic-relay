@@ -4,7 +4,7 @@
 [![GitHub Actions CI](https://img.shields.io/github/actions/workflow/status/rmems/vahtisiru/ci.yml?branch=main&label=CI)](https://github.com/rmems/vahtisiru/actions/workflows/ci.yml)
 [![CodeRabbit Pull Request Reviews](https://img.shields.io/coderabbit/prs/github/rmems/vahtisiru?utm_source=oss&utm_medium=github&utm_campaign=rmems%2Fvahtisiru&labelColor=171717&color=FF570A&link=https%3A%2F%2Fcoderabbit.ai&label=CodeRabbit+Reviews)](https://coderabbit.ai)
 [![Qlty Maintainability](https://qlty.sh/gh/rmems/projects/vahtisiru/maintainability.svg)](https://qlty.sh/gh/rmems/projects/vahtisiru)
-[![DeepWiki](https://deepwiki.com/badge.svg)](https://app.devin.ai/org/your-organization-d33af45a/wiki/rmems/vahtisiru?branch=main)
+[![DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/rmems/vahtisiru)
 [![GitHub Wiki](https://img.shields.io/badge/GitHub-Wiki-blue)](https://github.com/rmems/vahtisiru/wiki)
 [![crates.io: unpublished](https://img.shields.io/badge/crates.io-unpublished-lightgrey)](https://crates.io/search?q=vahtisiru)
 [![CodeScene Average Code Health](https://codescene.io/projects/85266/status-badges/average-code-health)](https://codescene.io/projects/85266)

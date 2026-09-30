@@ -90,6 +90,39 @@ fn try_acquire_lock(lock_path: &str) -> Result<LockGuard, String> {
 
 const PROCESS_LOCK_PATH: &str = "/tmp/vahtisiru.lock";
 
+/// Pre-rename lock path kept for upgrade safety: while a legacy `thalamic-relay`
+/// process may still hold it, a new `vahtisiru` instance must not start, or two
+/// supervisors could actuate the same GPU concurrently.
+const LEGACY_PROCESS_LOCK_PATH: &str = "/tmp/thalamic_relay.lock";
+
+/// Refuse to start while a pre-rename `thalamic-relay` instance is alive (or its
+/// lock is ambiguous); clears the legacy lock once the recorded PID is dead.
+fn check_legacy_lock(legacy_path: &str) -> Result<(), String> {
+    let content = match std::fs::read_to_string(legacy_path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(format!("Failed to read legacy lock {legacy_path}: {err}"));
+        }
+    };
+    let Some(recorded_pid) = content.trim().parse::<u32>().ok() else {
+        return Err(format!(
+            "Legacy lock {legacy_path} is unreadable/unparseable; refusing to start."
+        ));
+    };
+    if std::path::Path::new(&format!("/proc/{recorded_pid}")).exists() {
+        return Err(format!(
+            "A pre-rename thalamic-relay instance is already active (PID: {recorded_pid})."
+        ));
+    }
+    if let Err(remove_err) = std::fs::remove_file(legacy_path) {
+        return Err(format!(
+            "Failed to clear stale legacy lock {legacy_path}: {remove_err}"
+        ));
+    }
+    Ok(())
+}
+
 /// Prepared supervisor whose process lock remains owned by the caller until
 /// the Tokio runtime has completed its bounded shutdown.
 #[doc(hidden)]
@@ -130,7 +163,12 @@ pub fn prepare() -> Result<SupervisorStart, Box<dyn std::error::Error>> {
         return Err("step interval exceeds safety acquisition limit or ten-tick evaluation exceeds sample-age limit".into());
     }
 
-    // Acquire the process lock before any potentially blocking driver call.
+    // Block while a pre-rename instance still holds its legacy lock, then
+    // acquire the process lock before any potentially blocking driver call.
+    if let Err(msg) = check_legacy_lock(LEGACY_PROCESS_LOCK_PATH) {
+        eprintln!("[relay] FATAL: {msg}");
+        std::process::exit(1);
+    }
     let lock_guard = match try_acquire_lock(PROCESS_LOCK_PATH) {
         Ok(guard) => guard,
         Err(msg) => {
@@ -1402,6 +1440,23 @@ mod tests {
         let content = std::fs::read_to_string(lock_path).unwrap();
         assert_eq!(content.trim(), std::process::id().to_string());
         drop(guard);
+        assert!(!std::path::Path::new(lock_path).exists());
+    }
+
+    #[test]
+    fn legacy_lock_rejects_active_pid_and_reclaims_stale() {
+        let lock_path = "/tmp/vahtisiru_test_legacy_active.lock";
+        let _ = std::fs::remove_file(lock_path);
+        std::fs::write(lock_path, std::process::id().to_string()).unwrap();
+        let err = check_legacy_lock(lock_path).unwrap_err();
+        assert!(
+            err.contains("already active"),
+            "expected active-instance error, got: {err}"
+        );
+        let _ = std::fs::remove_file(lock_path);
+
+        std::fs::write(lock_path, "0").unwrap();
+        check_legacy_lock(lock_path).unwrap();
         assert!(!std::path::Path::new(lock_path).exists());
     }
 
