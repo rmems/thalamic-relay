@@ -1,12 +1,12 @@
 # Telemetry contract
 
 This is the normative validity / freshness / normalization / provenance
-contract for `thalamic-relay` ([GH#41](https://github.com/rmems/thalamic-relay/issues/41)).
+contract for `vahtisiru` ([GH#41](https://github.com/rmems/vahtisiru/issues/41)).
 
 The frozen **CSV interchange** consumed by corinth-canal
 (`timestamp_ms,gpu_temp_c,gpu_power_w,cpu_tctl_c,cpu_package_power_w`) is a
 separate contract in [`docs/telemetry_csv.md`](telemetry_csv.md) and
-`thalamic_relay::telemetry_csv` ([RM-629](https://linear.app/rpd-34/issue/RM-629)).
+`vahtisiru::telemetry_csv` ([RM-629](https://linear.app/rpd-34/issue/RM-629)).
 Do not treat CSV columns as [`TelemetrySample`] values: CSV fields are
 required finite numbers, not `Option`.
 
@@ -16,7 +16,7 @@ into a legitimate `0.0`.
 
 Acquisition (`src/gpu.rs`) is separate from validation / normalization / encoding
 (`src/telemetry.rs`). Safety policy (`src/safety.rs`) consumes [`TelemetryFrame`]
-samples and does not depend on corpus-ipc transport ([GH#40](https://github.com/rmems/thalamic-relay/issues/40)).
+samples and does not depend on corpus-ipc transport ([GH#40](https://github.com/rmems/vahtisiru/issues/40)).
 Named relay states and hysteresis: [`docs/safety.md`](safety.md) (GH#42).
 
 ## Typed sample
@@ -178,7 +178,7 @@ timestamps, source-time status, acquisition source, validity (re-evaluated
 at `now`), raw engineering value, normalized `[0, 1]` (only when `Valid`
 at `now`), `stale_after_ms`, and the actual `cadence_ms`. The type name
 `MappedStimulus` is historical (retired UDP `Stimuli` protocol); it is
-**not** a neural stimulus and Thalamic does not run an SNN. `src/publish.rs`
+**not** a neural stimulus and Vahtisiru does not run an SNN. `src/publish.rs`
 (#40) maps this into published `corpus-ipc` `StimulusBatch` /
 `IpcMessage::Stimuli` off the safety path. `telemetry` does not depend on
 `corpus-ipc` and does not duplicate the wire schema.

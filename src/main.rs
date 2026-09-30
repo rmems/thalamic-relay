@@ -1,14 +1,14 @@
-//! `thalamic-relay` supervisor binary.
+//! `vahtisiru` supervisor binary.
 //!
 //! Process plumbing (lockfile, Prometheus, NVML, the async loop) lives in the
-//! library crate as private modules. The reusable API is `thalamic_relay::{telemetry, safety, publish}`.
+//! library crate as private modules. The reusable API is `vahtisiru::{telemetry, safety, publish}`.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if thalamic_relay::run_gpu_hardware_smoke_if_requested()? {
+    if vahtisiru::run_gpu_hardware_smoke_if_requested()? {
         return Ok(());
     }
-    let mut prepared = thalamic_relay::prepare()?;
-    let outcome = drive_runtime(thalamic_relay::run(&mut prepared));
+    let mut prepared = vahtisiru::prepare()?;
+    let outcome = drive_runtime(vahtisiru::run(&mut prepared));
     // The lock lives outside the run future, including on unwind, and is
     // released only after bounded runtime shutdown completes.
     drop(prepared);

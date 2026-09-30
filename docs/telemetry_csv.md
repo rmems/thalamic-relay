@@ -73,7 +73,7 @@ Those stay in corinth-canal.
 
 ## Producer follow-up
 
-Point exporters at this document and `thalamic_relay::telemetry_csv`:
+Point exporters at this document and `vahtisiru::telemetry_csv`:
 
 - [rmems/gaming-telemetry#50](https://github.com/rmems/gaming-telemetry/issues/50) — CSV export currently appends `session_label`; that fails exact header match here
 - [rmems/Theseus-Quarry#24](https://github.com/rmems/Theseus-Quarry/issues/24) — JSONL producer; any CSV projection for corinth must use this header

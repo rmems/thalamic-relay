@@ -1,17 +1,17 @@
 //! Typed hardware telemetry and deterministic safety for the Spikenaut stack.
 //!
-//! This crate is both a **library** (`thalamic_relay`) and the
-//! `thalamic-relay` **executable**. Downstream crates should depend on the
+//! This crate is both a **library** (`vahtisiru`) and the
+//! `vahtisiru` **executable**. Downstream crates should depend on the
 //! library surface below — telemetry validation, [`safety::SafetyMachine`],
 //! and best-effort [`publish::SensoryPublisher`] — without starting the
 //! supervisor, binding Prometheus, or taking the process lock.
 //!
 //! ```
-//! use thalamic_relay::safety::{SafetyMachine, SafetyState};
-//! use thalamic_relay::telemetry::{assess, fixtures};
+//! use vahtisiru::safety::{SafetyMachine, SafetyState};
+//! use vahtisiru::telemetry::{assess, fixtures};
 //!
 //! let frame = assess(&fixtures::healthy_real(), fixtures::NOW);
-//! let policy = thalamic_relay::safety::SafetyPolicyConfig::default()
+//! let policy = vahtisiru::safety::SafetyPolicyConfig::default()
 //!     .resolve(Some(400.0)).unwrap(); // Example device default: 400 W
 //! let mut machine = SafetyMachine::with_policy(policy);
 //! let snapshot = machine.evaluate(&frame);
@@ -43,11 +43,11 @@
 //! binary plumbing is undocumented by design.
 //!
 //! ```compile_fail
-//! use thalamic_relay::gpu::HardwareBridge;
+//! use vahtisiru::gpu::HardwareBridge;
 //! ```
 //!
 //! ```compile_fail
-//! use thalamic_relay::cpu::init_telemetry;
+//! use vahtisiru::cpu::init_telemetry;
 //! ```
 
 #![deny(missing_docs)]
@@ -68,6 +68,6 @@ pub mod time;
 
 #[doc(hidden)]
 pub use daemon::run_gpu_hardware_smoke_if_requested;
-/// Process entry for the `thalamic-relay` executable. Not reusable library API.
+/// Process entry for the `vahtisiru` executable. Not reusable library API.
 #[doc(hidden)]
 pub use daemon::{SupervisorStart, prepare, run};

@@ -234,7 +234,7 @@ fn generate_session_id() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let disc = SESSION_DISCRIMINATOR.fetch_add(1, Ordering::Relaxed);
-    format!("thalamic-{pid}-{nanos}-{disc}")
+    format!("vahtisiru-{pid}-{nanos}-{disc}")
 }
 
 #[cfg(test)]

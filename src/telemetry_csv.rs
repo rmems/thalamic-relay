@@ -289,7 +289,7 @@ mod tests {
 
     fn write_temp_csv(name: &str, contents: &str) -> PathBuf {
         let path = test_scratch_dir().join(format!(
-            "thalamic_relay_telemetry_csv_{}_{}.csv",
+            "vahtisiru_telemetry_csv_{}_{}.csv",
             name,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -415,7 +415,7 @@ mod tests {
 
     #[test]
     fn missing_file_is_io_error() {
-        let path = test_scratch_dir().join("thalamic_relay_telemetry_csv_does_not_exist.csv");
+        let path = test_scratch_dir().join("vahtisiru_telemetry_csv_does_not_exist.csv");
         let err = load_csv(&path).unwrap_err();
         assert!(err.to_string().contains("could not be read"));
     }
