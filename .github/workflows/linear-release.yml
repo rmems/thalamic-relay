@@ -21,14 +21,14 @@ jobs:
       # A scheduled pipeline needs an explicit version so this updates the
       # existing v0.2.0 release instead of selecting another planned release.
       - name: Sync v0.2.0 commits and issues to Linear
-        uses: linear/linear-release-action@v0
+        uses: linear/linear-release-action@d4af10092984f9bc6d5efa075b242bdf01333463 # v0
         with:
           access_key: ${{ secrets.LINEAR_ACCESS_KEY }}
           version: v0.2.0
 
       - name: Complete v0.2.0 in Linear
         if: github.event_name == 'release'
-        uses: linear/linear-release-action@v0
+        uses: linear/linear-release-action@d4af10092984f9bc6d5efa075b242bdf01333463 # v0
         with:
           access_key: ${{ secrets.LINEAR_ACCESS_KEY }}
           command: complete
