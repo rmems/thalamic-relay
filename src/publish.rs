@@ -34,7 +34,7 @@ use std::thread;
 use std::time::Duration;
 
 /// Canonical `corpus-ipc` identity stamped into [`BatchMetadata::source`].
-pub const SOURCE_IDENTITY: &str = "thalamic-relay";
+pub const SOURCE_IDENTITY: &str = "vahtisiru";
 /// Default UDP destination for [`IpcMessage::Stimuli`] datagrams.
 pub const DEFAULT_IPC_ENDPOINT: &str = "127.0.0.1:9900";
 /// Empty CLI default: do not override acquisition; [`crate::time::SampleClock`]

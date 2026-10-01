@@ -1,4 +1,4 @@
-//! Supervisor loop used by the `thalamic-relay` executable.
+//! Supervisor loop used by the `vahtisiru` executable.
 //!
 //! Not part of the public library surface: Prometheus bind, process lock,
 //! NVML acquisition, and privileged actuation stay here.
@@ -88,7 +88,40 @@ fn try_acquire_lock(lock_path: &str) -> Result<LockGuard, String> {
     }
 }
 
-const PROCESS_LOCK_PATH: &str = "/tmp/thalamic_relay.lock";
+const PROCESS_LOCK_PATH: &str = "/tmp/vahtisiru.lock";
+
+/// Pre-rename lock path kept for upgrade safety: while a legacy `thalamic-relay`
+/// process may still hold it, a new `vahtisiru` instance must not start, or two
+/// supervisors could actuate the same GPU concurrently.
+const LEGACY_PROCESS_LOCK_PATH: &str = "/tmp/thalamic_relay.lock";
+
+/// Refuse to start while a pre-rename `thalamic-relay` instance is alive (or its
+/// lock is ambiguous); clears the legacy lock once the recorded PID is dead.
+fn check_legacy_lock(legacy_path: &str) -> Result<(), String> {
+    let content = match std::fs::read_to_string(legacy_path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(format!("Failed to read legacy lock {legacy_path}: {err}"));
+        }
+    };
+    let Some(recorded_pid) = content.trim().parse::<u32>().ok() else {
+        return Err(format!(
+            "Legacy lock {legacy_path} is unreadable/unparseable; refusing to start."
+        ));
+    };
+    if std::path::Path::new(&format!("/proc/{recorded_pid}")).exists() {
+        return Err(format!(
+            "A pre-rename thalamic-relay instance is already active (PID: {recorded_pid})."
+        ));
+    }
+    if let Err(remove_err) = std::fs::remove_file(legacy_path) {
+        return Err(format!(
+            "Failed to clear stale legacy lock {legacy_path}: {remove_err}"
+        ));
+    }
+    Ok(())
+}
 
 /// Prepared supervisor whose process lock remains owned by the caller until
 /// the Tokio runtime has completed its bounded shutdown.
@@ -130,7 +163,12 @@ pub fn prepare() -> Result<SupervisorStart, Box<dyn std::error::Error>> {
         return Err("step interval exceeds safety acquisition limit or ten-tick evaluation exceeds sample-age limit".into());
     }
 
-    // Acquire the process lock before any potentially blocking driver call.
+    // Block while a pre-rename instance still holds its legacy lock, then
+    // acquire the process lock before any potentially blocking driver call.
+    if let Err(msg) = check_legacy_lock(LEGACY_PROCESS_LOCK_PATH) {
+        eprintln!("[relay] FATAL: {msg}");
+        std::process::exit(1);
+    }
     let lock_guard = match try_acquire_lock(PROCESS_LOCK_PATH) {
         Ok(guard) => guard,
         Err(msg) => {
@@ -201,7 +239,7 @@ pub async fn run(prepared: &mut SupervisorStart) -> Result<(), Box<dyn std::erro
         cpu::run_metrics_collector(metrics_clone, metrics_shutdown_rx).await;
     });
 
-    println!("[relay] --- Thalamic Relay ---");
+    println!("[relay] --- Vahtisiru ---");
     if cli.force_software_only {
         println!(
             "[relay] software-only telemetry (--force-software-only): documented idle estimates, not real GPU sensors"
@@ -964,48 +1002,48 @@ fn format_live_reading(sample: &TelemetrySample<f32>, fmt_val: impl Fn(f32) -> S
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "thalamic-relay",
+    name = "vahtisiru",
     version,
     about = "Sensory + deterministic hardware-safety relay (does not run neural computation)",
-    long_about = "thalamic-relay observes GPU telemetry, validates it, and evaluates an isolated thermal/power safety policy. It does not run a spiking neural network or own neural state.\n\nWithout --force-software-only it attempts NVML. Driver/device failure is NvmlUnavailable (fail-closed), not simulated idle. --force-software-only uses documented idle estimates tagged SoftwareFallback.\n\nBrake apply/release is best-effort: timeout + sudo -n nvidia-smi -pl on Linux (passwordless sudo for nvidia-smi). There is no control/query IPC; sensory publication is best-effort corpus-ipc UDP and Prometheus is served on :9000/metrics."
+    long_about = "vahtisiru observes GPU telemetry, validates it, and evaluates an isolated thermal/power safety policy. It does not run a spiking neural network or own neural state.\n\nWithout --force-software-only it attempts NVML. Driver/device failure is NvmlUnavailable (fail-closed), not simulated idle. --force-software-only uses documented idle estimates tagged SoftwareFallback.\n\nBrake apply/release is best-effort: timeout + sudo -n nvidia-smi -pl on Linux (passwordless sudo for nvidia-smi). There is no control/query IPC; sensory publication is best-effort corpus-ipc UDP and Prometheus is served on :9000/metrics."
 )]
 struct Cli {
     /// Explicit thermal warning limit (C); not inferred from vendor capabilities.
-    #[arg(long, default_value_t = 75.0, env = "THALAMIC_SAFETY_TEMP_WARN_C")]
+    #[arg(long, default_value_t = 75.0, env = "VAHTISIRU_SAFETY_TEMP_WARN_C")]
     safety_temp_warn_c: f32,
     /// Explicit thermal critical limit (C).
-    #[arg(long, default_value_t = 85.0, env = "THALAMIC_SAFETY_TEMP_CRITICAL_C")]
+    #[arg(long, default_value_t = 85.0, env = "VAHTISIRU_SAFETY_TEMP_CRITICAL_C")]
     safety_temp_critical_c: f32,
     /// Power warning override (W); requires a critical override.
-    #[arg(long, env = "THALAMIC_SAFETY_POWER_WARN_W")]
+    #[arg(long, env = "VAHTISIRU_SAFETY_POWER_WARN_W")]
     safety_power_warn_w: Option<f32>,
     /// Power critical override (W); cannot exceed a known device default.
-    #[arg(long, env = "THALAMIC_SAFETY_POWER_CRITICAL_W")]
+    #[arg(long, env = "VAHTISIRU_SAFETY_POWER_CRITICAL_W")]
     safety_power_critical_w: Option<f32>,
     /// Consecutive healthy real evaluations required to release a brake.
-    #[arg(long, default_value_t = 3, env = "THALAMIC_SAFETY_RELEASE_OK_STREAK")]
+    #[arg(long, default_value_t = 3, env = "VAHTISIRU_SAFETY_RELEASE_OK_STREAK")]
     safety_release_ok_streak: u32,
     /// Maximum sample age (ms); can tighten the 2000 ms telemetry limit.
     #[arg(
         long,
         default_value_t = 2000,
-        env = "THALAMIC_SAFETY_MAX_SAMPLE_AGE_MS"
+        env = "VAHTISIRU_SAFETY_MAX_SAMPLE_AGE_MS"
     )]
     safety_max_sample_age_ms: u64,
     /// Maximum declared acquisition interval (ms).
     #[arg(
         long,
         default_value_t = 100,
-        env = "THALAMIC_SAFETY_MAX_ACQUISITION_INTERVAL_MS"
+        env = "VAHTISIRU_SAFETY_MAX_ACQUISITION_INTERVAL_MS"
     )]
     safety_max_acquisition_interval_ms: u64,
 
     /// Prometheus metrics listen IP (port is always 9000 per compliance)
-    #[arg(long, default_value = "127.0.0.1", env = "THALAMIC_METRICS_IP", value_parser = clap::value_parser!(std::net::IpAddr))]
+    #[arg(long, default_value = "127.0.0.1", env = "VAHTISIRU_METRICS_IP", value_parser = clap::value_parser!(std::net::IpAddr))]
     metrics_ip: std::net::IpAddr,
 
     /// Relay loop tick interval (ms); minimum 1 to prevent busy-looping
-    #[arg(long, default_value_t = 100, env = "THALAMIC_STEP_INTERVAL_MS", value_parser = clap::value_parser!(u64).range(1..))]
+    #[arg(long, default_value_t = 100, env = "VAHTISIRU_STEP_INTERVAL_MS", value_parser = clap::value_parser!(u64).range(1..))]
     step_interval_ms: u64,
 
     /// Validate read-only NVIDIA hardware access and exit without starting the supervisor.
@@ -1014,29 +1052,29 @@ struct Cli {
 
     /// Force simulated idle telemetry (skip NVML). Documented estimates, not real sensors.
     /// Usable as a bare flag (`--force-software-only`) or with an explicit
-    /// value (`--force-software-only=false` / `THALAMIC_FORCE_SOFTWARE_ONLY=false`).
+    /// value (`--force-software-only=false` / `VAHTISIRU_FORCE_SOFTWARE_ONLY=false`).
     /// Distinct from NVML/driver failure, which is fail-closed `NvmlUnavailable`.
-    #[arg(long, env = "THALAMIC_FORCE_SOFTWARE_ONLY", num_args = 0..=1, default_missing_value = "true", default_value_t = false, value_parser = clap::value_parser!(bool))]
+    #[arg(long, env = "VAHTISIRU_FORCE_SOFTWARE_ONLY", num_args = 0..=1, default_missing_value = "true", default_value_t = false, value_parser = clap::value_parser!(bool))]
     force_software_only: bool,
 
     /// UDP destination for canonical `corpus-ipc` `IpcMessage::Stimuli` datagrams.
     /// Fire-and-forget; Brainstem absence does not stall safety.
-    #[arg(long, default_value = DEFAULT_IPC_ENDPOINT, env = "THALAMIC_IPC_ENDPOINT")]
+    #[arg(long, default_value = DEFAULT_IPC_ENDPOINT, env = "VAHTISIRU_IPC_ENDPOINT")]
     ipc_endpoint: String,
 
     /// Disable corpus-ipc publication. Hardware safety still evaluates.
-    #[arg(long, env = "THALAMIC_IPC_DISABLED", num_args = 0..=1, default_missing_value = "true", default_value_t = false, value_parser = clap::value_parser!(bool))]
+    #[arg(long, env = "VAHTISIRU_IPC_DISABLED", num_args = 0..=1, default_missing_value = "true", default_value_t = false, value_parser = clap::value_parser!(bool))]
     ipc_disabled: bool,
 
     /// Session id stamped on each `StimulusBatch` (`session_id`). Empty keeps the telemetry-generated session id and its sequence.
-    #[arg(long, default_value = DEFAULT_IPC_SESSION_ID, env = "THALAMIC_IPC_SESSION_ID")]
+    #[arg(long, default_value = DEFAULT_IPC_SESSION_ID, env = "VAHTISIRU_IPC_SESSION_ID")]
     ipc_session_id: String,
 
     /// Outbound sensory-queue capacity (frames). Finite; never unbounded.
     #[arg(
         long,
         default_value_t = QueueConfig::DEFAULT_CAPACITY,
-        env = "THALAMIC_SENSORY_QUEUE_CAPACITY",
+        env = "VAHTISIRU_SENSORY_QUEUE_CAPACITY",
         value_parser = parse_sensory_queue_capacity
     )]
     sensory_queue_capacity: usize,
@@ -1045,7 +1083,7 @@ struct Cli {
     #[arg(
         long,
         default_value_t = QueueFullPolicy::DropOldest,
-        env = "THALAMIC_SENSORY_QUEUE_FULL_POLICY"
+        env = "VAHTISIRU_SENSORY_QUEUE_FULL_POLICY"
     )]
     sensory_queue_full_policy: QueueFullPolicy,
 }
@@ -1289,7 +1327,7 @@ mod tests {
     fn parses_custom_args_and_env_equiv() {
         // direct args
         let cli = Cli::try_parse_from([
-            "thalamic-relay",
+            "vahtisiru",
             "--metrics-ip",
             "0.0.0.0",
             "--step-interval-ms",
@@ -1307,7 +1345,7 @@ mod tests {
 
     #[test]
     fn parses_defaults() {
-        let cli = Cli::try_parse_from(["thalamic-relay"]).unwrap();
+        let cli = Cli::try_parse_from(["vahtisiru"]).unwrap();
         assert_eq!(
             cli.metrics_ip,
             "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
@@ -1324,7 +1362,7 @@ mod tests {
     #[test]
     fn parses_sensory_queue_config() {
         let cli = Cli::try_parse_from([
-            "thalamic-relay",
+            "vahtisiru",
             "--sensory-queue-capacity",
             "8",
             "--sensory-queue-full-policy",
@@ -1337,25 +1375,21 @@ mod tests {
 
     #[test]
     fn rejects_zero_queue_capacity() {
-        assert!(Cli::try_parse_from(["thalamic-relay", "--sensory-queue-capacity", "0"]).is_err());
+        assert!(Cli::try_parse_from(["vahtisiru", "--sensory-queue-capacity", "0"]).is_err());
     }
 
     #[test]
     fn rejects_unknown_queue_policy() {
         assert!(
-            Cli::try_parse_from([
-                "thalamic-relay",
-                "--sensory-queue-full-policy",
-                "drop-random"
-            ])
-            .is_err()
+            Cli::try_parse_from(["vahtisiru", "--sensory-queue-full-policy", "drop-random"])
+                .is_err()
         );
     }
 
     #[test]
     fn parses_ipc_flags() {
         let cli = Cli::try_parse_from([
-            "thalamic-relay",
+            "vahtisiru",
             "--ipc-endpoint",
             "127.0.0.1:9911",
             "--ipc-disabled",
@@ -1370,13 +1404,13 @@ mod tests {
 
     #[test]
     fn parses_force_software_only_false() {
-        let cli = Cli::try_parse_from(["thalamic-relay", "--force-software-only=false"]).unwrap();
+        let cli = Cli::try_parse_from(["vahtisiru", "--force-software-only=false"]).unwrap();
         assert!(!cli.force_software_only);
     }
 
     #[test]
     fn lock_guard_created_and_removed() {
-        let lock_path = "/tmp/thalamic_relay_test_created.lock";
+        let lock_path = "/tmp/vahtisiru_test_created.lock";
         let _ = std::fs::remove_file(lock_path);
         let guard = try_acquire_lock(lock_path).unwrap();
         assert!(std::path::Path::new(lock_path).exists());
@@ -1386,7 +1420,7 @@ mod tests {
 
     #[test]
     fn lock_guard_rejects_active_pid() {
-        let lock_path = "/tmp/thalamic_relay_test_active.lock";
+        let lock_path = "/tmp/vahtisiru_test_active.lock";
         let _ = std::fs::remove_file(lock_path);
         std::fs::write(lock_path, std::process::id().to_string()).unwrap();
         let err = try_acquire_lock(lock_path).unwrap_err();
@@ -1399,7 +1433,7 @@ mod tests {
 
     #[test]
     fn lock_guard_reclaims_stale_lock() {
-        let lock_path = "/tmp/thalamic_relay_test_stale.lock";
+        let lock_path = "/tmp/vahtisiru_test_stale.lock";
         let _ = std::fs::remove_file(lock_path);
         std::fs::write(lock_path, "0").unwrap();
         let guard = try_acquire_lock(lock_path).unwrap();
@@ -1410,10 +1444,27 @@ mod tests {
     }
 
     #[test]
+    fn legacy_lock_rejects_active_pid_and_reclaims_stale() {
+        let lock_path = "/tmp/vahtisiru_test_legacy_active.lock";
+        let _ = std::fs::remove_file(lock_path);
+        std::fs::write(lock_path, std::process::id().to_string()).unwrap();
+        let err = check_legacy_lock(lock_path).unwrap_err();
+        assert!(
+            err.contains("already active"),
+            "expected active-instance error, got: {err}"
+        );
+        let _ = std::fs::remove_file(lock_path);
+
+        std::fs::write(lock_path, "0").unwrap();
+        check_legacy_lock(lock_path).unwrap();
+        assert!(!std::path::Path::new(lock_path).exists());
+    }
+
+    #[test]
     fn prepared_process_lock_outlives_supervisor_future_and_runtime() {
-        let path = "/tmp/thalamic_relay_test_prepared_runtime.lock";
+        let path = "/tmp/vahtisiru_test_prepared_runtime.lock";
         let _ = std::fs::remove_file(path);
-        let cli = Cli::parse_from(["thalamic-relay"]);
+        let cli = Cli::parse_from(["vahtisiru"]);
         let prepared = SupervisorStart {
             config: cli.safety_policy_config(),
             cli,
@@ -1533,7 +1584,7 @@ mod tests {
 
     #[tokio::test]
     async fn orderly_shutdown_then_lock_guard_releases_file() {
-        let lock_path = "/tmp/thalamic_relay_test_shutdown.lock";
+        let lock_path = "/tmp/vahtisiru_test_shutdown.lock";
         let _ = std::fs::remove_file(lock_path);
         let guard = try_acquire_lock(lock_path).unwrap();
         assert!(std::path::Path::new(lock_path).exists());

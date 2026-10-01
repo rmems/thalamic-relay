@@ -3,15 +3,15 @@
 //! A downstream crate should be able to validate samples and evaluate
 //! [`SafetyMachine`] without NVML, Prometheus, or the process lock.
 
-use thalamic_relay::publish::{
+use vahtisiru::publish::{
     AbsentPublisher, IsolatedPublishQueue, PublishError, SensoryPublisher,
     evaluate_then_try_publish,
 };
-use thalamic_relay::safety::{
+use vahtisiru::safety::{
     ActuatorOutcome, BRAKE_FRACTION, BrakeIntent, FakeActuator, SafetyActuator, SafetyMachine,
     SafetyState, classify_frame_with_policy,
 };
-use thalamic_relay::telemetry::{
+use vahtisiru::telemetry::{
     SampleValidity, SignalClass, SignalId, TelemetrySource, assess, fixtures, signal_spec,
 };
 
@@ -77,17 +77,17 @@ fn downstream_crate_maps_sensory_inputs_and_publishes_best_effort() {
     assert_eq!(
         classify_frame_with_policy(
             &frame,
-            &thalamic_relay::safety::SafetyPolicyConfig::default()
+            &vahtisiru::safety::SafetyPolicyConfig::default()
                 .resolve(Some(400.0))
                 .unwrap()
         )
         .kind,
-        thalamic_relay::safety::AssessmentKind::Ok
+        vahtisiru::safety::AssessmentKind::Ok
     );
 }
 
 fn configured_machine() -> SafetyMachine {
-    let config = thalamic_relay::safety::SafetyPolicyConfig {
+    let config = vahtisiru::safety::SafetyPolicyConfig {
         power_warn_w: Some(300.0),
         power_critical_w: Some(350.0),
         ..Default::default()

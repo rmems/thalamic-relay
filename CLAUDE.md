@@ -7,12 +7,12 @@ here too) — this file adds Claude-specific workflow notes and defers to
 
 ## Project
 
-`thalamic-relay` — a Rust CLI (binary `thalamic-relay`) that observes hardware
+`vahtisiru` — a Rust CLI (binary `vahtisiru`) that observes hardware
 telemetry and provides deterministic hardware safety (thermal/power emergency
 brake) for the Spikenaut runtime stack, exposing Prometheus metrics.
 No FPGA/silicon-bridge dependency. It does **not** run any
 neural computation itself — the in-process SNN it used to step was removed
-in [RM-1143 / GH#39](https://github.com/rmems/thalamic-relay/issues/39);
+in [RM-1143 / GH#39](https://github.com/rmems/vahtisiru/issues/39);
 neural execution lives in `brainstem-daemon`.
 
 ## Build / test

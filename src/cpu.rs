@@ -1,6 +1,6 @@
 //! Prometheus / tracing init and scrape-time gauges for the supervisor.
 //!
-//! Crate-private process plumbing: not part of the public `thalamic_relay` API.
+//! Crate-private process plumbing: not part of the public `vahtisiru` API.
 //! This module does not evaluate safety policy and does not publish sensory
 //! frames. Binding the metrics listener is a process-global side effect.
 

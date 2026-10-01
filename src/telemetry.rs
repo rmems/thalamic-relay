@@ -5,7 +5,7 @@
 //! values. Missing or invalid readings stay [`None`] and are never silently
 //! converted into a legitimate numeric zero.
 //!
-//! This module owns the typed mapping surface toward `corpus-ipc` ([#40](https://github.com/rmems/thalamic-relay/issues/40)):
+//! This module owns the typed mapping surface toward `corpus-ipc` ([#40](https://github.com/rmems/vahtisiru/issues/40)):
 //! [`SensoryMapping`] / [`MappedStimulus`]. Transport and the canonical
 //! `StimulusBatch` conversion live in [`crate::publish`].
 //!

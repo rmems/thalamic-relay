@@ -1,9 +1,9 @@
 ## Cursor Cloud specific instructions
 
-This repo is the `thalamic-relay` crate (binary `thalamic-relay`), a Rust CLI that
+This repo is the `vahtisiru` crate (binary `vahtisiru`), a Rust CLI that
 observes hardware telemetry and provides deterministic hardware safety for the
 Spikenaut runtime stack. It does not run any neural computation itself (see
-[RM-1143 / GH#39](https://github.com/rmems/thalamic-relay/issues/39)) —
+[RM-1143 / GH#39](https://github.com/rmems/vahtisiru/issues/39)) —
 that lives in `brainstem-daemon`.
 Below are the non-obvious gotchas.
 
@@ -35,16 +35,16 @@ in-process SNN it used to step was removed in RM-1143. Build with a plain
 
 ### Running the app
 
-- Run with `cargo run --bin thalamic-relay [OPTIONS]` (or the installed binary).
+- Run with `cargo run --bin vahtisiru [OPTIONS]` (or the installed binary).
   It is a long-running supervisor. Use `--help` for options (or the equivalent
-  THALAMIC_* environment variables). The supervisor now supports graceful arg
+  VAHTISIRU_* environment variables). The supervisor now supports graceful arg
   parsing via clap (derive + env features; implemented for #11). Run it in tmux /
   background when testing (unless the user explicitly requests foreground behavior).
 - The relay degrades gracefully with no GPU: without `--force-software-only`
   a missing NVML device is `NvmlUnavailable` and safety fail-closes; with
   that flag it uses documented idle estimates (`SoftwareFallback`) and keeps
   monitoring. It prints `nvidia-smi hung` on a wedged driver.
-- Single-instance guard: writes `/tmp/thalamic_relay.lock` with its PID. A stale
+- Single-instance guard: writes `/tmp/vahtisiru.lock` with its PID. A stale
   lock for a dead PID is ignored automatically, but a second concurrent instance
   exits immediately. Delete the lockfile only if no instance is actually running.
 
@@ -57,7 +57,7 @@ in-process SNN it used to step was removed in RM-1143. Build with a plain
 - Binds the Prometheus exporter on startup, so only one instance can run at a time.
 - Frozen hardware-telemetry CSV interchange (corinth ingest):
   `timestamp_ms,gpu_temp_c,gpu_power_w,cpu_tctl_c,cpu_package_power_w`.
-  Reader/validator: `thalamic_relay::telemetry_csv` /
+  Reader/validator: `vahtisiru::telemetry_csv` /
   [`docs/telemetry_csv.md`](docs/telemetry_csv.md). Do not change that schema.
 
 ### Responding to automated PR review bots

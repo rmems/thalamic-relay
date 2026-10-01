@@ -1,12 +1,12 @@
 //! Library consumer example: validate simulated telemetry and evaluate safety
-//! without a GPU or the `thalamic-relay` daemon.
+//! without a GPU or the `vahtisiru` daemon.
 //!
 //! ```sh
 //! cargo run --example software_only
 //! ```
 
-use thalamic_relay::safety::{SafetyMachine, SafetyState};
-use thalamic_relay::telemetry::{TelemetrySource, assess, fixtures};
+use vahtisiru::safety::{SafetyMachine, SafetyState};
+use vahtisiru::telemetry::{TelemetrySource, assess, fixtures};
 
 fn main() {
     let frame = assess(&fixtures::software_fallback(), fixtures::NOW);

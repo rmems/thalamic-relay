@@ -1,14 +1,14 @@
 [package]
-name = "thalamic-relay"
+name = "vahtisiru"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.98.1"
 authors = ["Raul Cardenas Montoya"]
-description = "Typed hardware telemetry and deterministic safety library, plus the thalamic-relay supervisor binary (software-only, no built-in FPGA bridge)."
+description = "Typed hardware telemetry and deterministic safety library, plus the vahtisiru supervisor binary (software-only, no built-in FPGA bridge)."
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/rmems/thalamic-relay"
-homepage = "https://github.com/rmems/thalamic-relay"
-documentation = "https://docs.rs/thalamic-relay"
+repository = "https://github.com/rmems/vahtisiru"
+homepage = "https://github.com/rmems/vahtisiru"
+documentation = "https://docs.rs/vahtisiru"
 readme = "README.md"
 keywords = ["telemetry", "gpu", "safety", "nvml", "prometheus"]
 categories = ["hardware-support", "command-line-utilities"]
@@ -56,7 +56,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 nvml-wrapper = "0.10"
 
 [[bin]]
-name = "thalamic-relay"
+name = "vahtisiru"
 path = "src/main.rs"
 
 [workspace]

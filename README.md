@@ -1,12 +1,12 @@
-# Thalamic Relay
+# Vahtisiru
 
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](https://github.com/rmems/thalamic-relay#license)
-[![GitHub Actions CI](https://img.shields.io/github/actions/workflow/status/rmems/thalamic-relay/ci.yml?branch=main&label=CI)](https://github.com/rmems/thalamic-relay/actions/workflows/ci.yml)
-[![CodeRabbit Pull Request Reviews](https://img.shields.io/coderabbit/prs/github/rmems/thalamic-relay?utm_source=oss&utm_medium=github&utm_campaign=rmems%2Fthalamic-relay&labelColor=171717&color=FF570A&link=https%3A%2F%2Fcoderabbit.ai&label=CodeRabbit+Reviews)](https://coderabbit.ai)
-[![Qlty Maintainability](https://qlty.sh/gh/rmems/projects/thalamic-relay/maintainability.svg)](https://qlty.sh/gh/rmems/projects/thalamic-relay)
-[![DeepWiki](https://deepwiki.com/badge.svg)](https://app.devin.ai/org/your-organization-d33af45a/wiki/rmems/thalamic-relay?branch=main)
-[![GitHub Wiki](https://img.shields.io/badge/GitHub-Wiki-blue)](https://github.com/rmems/thalamic-relay/wiki)
-[![crates.io: unpublished](https://img.shields.io/badge/crates.io-unpublished-lightgrey)](https://crates.io/search?q=thalamic-relay)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](https://github.com/rmems/vahtisiru#license)
+[![GitHub Actions CI](https://img.shields.io/github/actions/workflow/status/rmems/vahtisiru/ci.yml?branch=main&label=CI)](https://github.com/rmems/vahtisiru/actions/workflows/ci.yml)
+[![CodeRabbit Pull Request Reviews](https://img.shields.io/coderabbit/prs/github/rmems/vahtisiru?utm_source=oss&utm_medium=github&utm_campaign=rmems%2Fvahtisiru&labelColor=171717&color=FF570A&link=https%3A%2F%2Fcoderabbit.ai&label=CodeRabbit+Reviews)](https://coderabbit.ai)
+[![Qlty Maintainability](https://qlty.sh/gh/rmems/projects/vahtisiru/maintainability.svg)](https://qlty.sh/gh/rmems/projects/vahtisiru)
+[![DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/rmems/vahtisiru)
+[![GitHub Wiki](https://img.shields.io/badge/GitHub-Wiki-blue)](https://github.com/rmems/vahtisiru/wiki)
+[![crates.io: unpublished](https://img.shields.io/badge/crates.io-unpublished-lightgrey)](https://crates.io/search?q=vahtisiru)
 [![CodeScene Average Code Health](https://codescene.io/projects/85266/status-badges/average-code-health)](https://codescene.io/projects/85266)
 [![CodeScene Hotspot Code Health](https://codescene.io/projects/85266/status-badges/hotspot-code-health)](https://codescene.io/projects/85266)
 [![CodeScene System Mastery](https://codescene.io/projects/85266/status-badges/system-mastery)](https://codescene.io/projects/85266)
@@ -14,7 +14,7 @@
 
 The gray crates.io badge shows publication status checked on 2026-09-28.
 
-A lightweight **library** (`thalamic_relay`) and **CLI** (`thalamic-relay`)
+A lightweight **library** (`vahtisiru`) and **CLI** (`vahtisiru`)
 that observes hardware telemetry and provides deterministic hardware
 safety for the Spikenaut runtime stack (software-only;
 silicon-bridge/**FPGA (Field-Programmable Gate Array)** bridge dep removed
@@ -26,15 +26,15 @@ This crate ships two surfaces. They are not interchangeable:
 
 | Surface | Crate / binary | Use it when |
 | --- | --- | --- |
-| **Library** | `thalamic_relay` (`telemetry`, `safety`, `publish`) | A downstream crate needs typed samples, `SafetyMachine`, or a best-effort publisher **without** running the daemon |
-| **Executable** | `thalamic-relay` | You want the supervisor process: NVML acquisition, privileged power-limit brake, Prometheus on `:9000`, single-instance lock |
+| **Library** | `vahtisiru` (`telemetry`, `safety`, `publish`) | A downstream crate needs typed samples, `SafetyMachine`, or a best-effort publisher **without** running the daemon |
+| **Executable** | `vahtisiru` | You want the supervisor process: NVML acquisition, privileged power-limit brake, Prometheus on `:9000`, single-instance lock |
 
 ```rust
-use thalamic_relay::safety::{SafetyMachine, SafetyState};
-use thalamic_relay::telemetry::{assess, fixtures};
+use vahtisiru::safety::{SafetyMachine, SafetyState};
+use vahtisiru::telemetry::{assess, fixtures};
 
 let frame = assess(&fixtures::healthy_real(), fixtures::NOW);
-let policy = thalamic_relay::safety::SafetyPolicyConfig::default()
+let policy = vahtisiru::safety::SafetyPolicyConfig::default()
     .resolve(Some(400.0)).unwrap(); // Example device default: 400 W
 let mut machine = SafetyMachine::with_policy(policy);
 let snapshot = machine.evaluate(&frame);
@@ -42,7 +42,7 @@ assert_eq!(snapshot.state, SafetyState::HealthyReal);
 ```
 
 The NVML/`nvidia-smi` adapter, Prometheus exporter, clap CLI, and
-`/tmp/thalamic_relay.lock` are **not** part of the library API (they are
+`/tmp/vahtisiru.lock` are **not** part of the library API (they are
 private process plumbing). Public items are documented; missing rustdoc on
 that surface is a compile error (`#![deny(missing_docs)]`). This is a
 pre-1.0 crate: the library API is intentional, not frozen.
@@ -52,7 +52,7 @@ pre-1.0 crate: the library API is intentional, not frozen.
 ```text
 hardware telemetry
       ↓
-thalamic-relay
+vahtisiru
   - sensing
   - validation
   - normalization
@@ -69,7 +69,7 @@ brainstem-daemon
 
 Hardware safety is an isolated failure domain: it keeps evaluating with
 `brainstem-daemon` absent or crashed, and a missing/slow publisher cannot
-stall the safety loop. Brainstem has no authority to override Thalamic
+stall the safety loop. Brainstem has no authority to override Vahtisiru
 hard-safety.
 
 ## Software-only versus real hardware
@@ -159,8 +159,8 @@ does not run for public pull requests or change the GPU power limit.
 
 The first intended crates.io version is **0.2.0**, currently prepared for
 publication. Until the maintainer publishes it, build from this repository.
-After publication, install the CLI with `cargo install thalamic-relay --version
-0.2.0 --locked`, or add `thalamic-relay = "0.2.0"` to a library consumer.
+After publication, install the CLI with `cargo install vahtisiru --version
+0.2.0 --locked`, or add `vahtisiru = "0.2.0"` to a library consumer.
 
 ### Build
 
@@ -171,13 +171,13 @@ cargo build --release
 ### Run the daemon
 
 ```bash
-cargo run --bin thalamic-relay
+cargo run --bin vahtisiru
 ```
 
 Force documented idle estimates (no NVML attempt):
 
 ```bash
-cargo run --bin thalamic-relay -- --force-software-only
+cargo run --bin vahtisiru -- --force-software-only
 ```
 
 ## Usage
@@ -193,13 +193,13 @@ Hardware safety keeps evaluating if Brainstem is absent or the queue is full.
 
 ## Architecture
 
-Thalamic is a sensory + **independent hard-safety** process. Brainstem is
+Vahtisiru is a sensory + **independent hard-safety** process. Brainstem is
 the neural runtime. They do not share a fate:
 
 ```text
 hardware telemetry
       ↓
-thalamic-relay
+vahtisiru
   - sensing / validation / freshness
   - SafetyMachine (never waits on IPC)
   - privileged brake actuator
@@ -213,12 +213,12 @@ brainstem-daemon
   - tick loop
 ```
 
-### What Thalamic guarantees vs Brainstem
+### What Vahtisiru guarantees vs Brainstem
 
 | Owner | Guarantees |
 | --- | --- |
-| **Thalamic** | Hardware telemetry contract; fail-closed **intent** on missing/stale/invalid telemetry; brake apply/release **attempts**; observable safety/brake state **without** querying neural state; continues with Brainstem absent |
-| **Brainstem** | SNN execution, neural state, reward/plasticity. Consumes sensory mappings over corpus-ipc UDP. **Cannot** inhibit or override the Thalamic brake |
+| **Vahtisiru** | Hardware telemetry contract; fail-closed **intent** on missing/stale/invalid telemetry; brake apply/release **attempts**; observable safety/brake state **without** querying neural state; continues with Brainstem absent |
+| **Brainstem** | SNN execution, neural state, reward/plasticity. Consumes sensory mappings over corpus-ipc UDP. **Cannot** inhibit or override the Vahtisiru brake |
 | **corpus-ipc** | Transport only. Send failure is not a safety pause |
 
 See [`docs/safety.md`](docs/safety.md) for named states and hysteresis
@@ -273,26 +273,26 @@ actuation, Prometheus initialization, CLI, process lock, supervisor loop, SIGINT
 The daemon supports CLI flags **and** environment variables (clap derive +
 "env" feature). Defaults preserve prior hardcoded behavior.
 
-Run `thalamic-relay --help` (or `-V`) for the full documented surface.
+Run `vahtisiru --help` (or `-V`) for the full documented surface.
 
 Key options (with env var equivalent):
 
-- `--metrics-ip` / `THALAMIC_METRICS_IP` (default: 127.0.0.1; port is always 9000)
-- `--step-interval-ms` / `THALAMIC_STEP_INTERVAL_MS` (default: 100) — relay loop tick interval
-- `--force-software-only` / `THALAMIC_FORCE_SOFTWARE_ONLY`
-- `--sensory-queue-capacity` / `THALAMIC_SENSORY_QUEUE_CAPACITY` (default: 32, range 1–4096)
-- `--sensory-queue-full-policy` / `THALAMIC_SENSORY_QUEUE_FULL_POLICY` (default: `drop-oldest`; also `reject-newest`)
-- `--ipc-endpoint` / `THALAMIC_IPC_ENDPOINT` (default: `127.0.0.1:9900`) — UDP destination for `IpcMessage::Stimuli`
-- `--ipc-disabled` / `THALAMIC_IPC_DISABLED` — skip publication; safety still runs
-- `--ipc-session-id` / `THALAMIC_IPC_SESSION_ID` (default: process-unique boot/session id)
+- `--metrics-ip` / `VAHTISIRU_METRICS_IP` (default: 127.0.0.1; port is always 9000)
+- `--step-interval-ms` / `VAHTISIRU_STEP_INTERVAL_MS` (default: 100) — relay loop tick interval
+- `--force-software-only` / `VAHTISIRU_FORCE_SOFTWARE_ONLY`
+- `--sensory-queue-capacity` / `VAHTISIRU_SENSORY_QUEUE_CAPACITY` (default: 32, range 1–4096)
+- `--sensory-queue-full-policy` / `VAHTISIRU_SENSORY_QUEUE_FULL_POLICY` (default: `drop-oldest`; also `reject-newest`)
+- `--ipc-endpoint` / `VAHTISIRU_IPC_ENDPOINT` (default: `127.0.0.1:9900`) — UDP destination for `IpcMessage::Stimuli`
+- `--ipc-disabled` / `VAHTISIRU_IPC_DISABLED` — skip publication; safety still runs
+- `--ipc-session-id` / `VAHTISIRU_IPC_SESSION_ID` (default: process-unique boot/session id)
 - `RUST_LOG` (standard for tracing; or --log-level in future extensions)
 
 Example with env + flag:
 ```bash
-THALAMIC_METRICS_IP=0.0.0.0 \
-  THALAMIC_SENSORY_QUEUE_CAPACITY=16 \
-  THALAMIC_SENSORY_QUEUE_FULL_POLICY=reject-newest \
-  cargo run --bin thalamic-relay -- --force-software-only --step-interval-ms 50
+VAHTISIRU_METRICS_IP=0.0.0.0 \
+  VAHTISIRU_SENSORY_QUEUE_CAPACITY=16 \
+  VAHTISIRU_SENSORY_QUEUE_FULL_POLICY=reject-newest \
+  cargo run --bin vahtisiru -- --force-software-only --step-interval-ms 50
 ```
 
 ### Safety policy
@@ -301,7 +301,7 @@ The daemon resolves an immutable `SafetyPolicyConfig` at startup and prints
 `effective_safety_policy` with the effective limits and their provenance.
 Invalid or contradictory settings stop startup before locks, ports or workers.
 
-| Flag (environment variable uses `THALAMIC_` plus the uppercase flag with underscores) | Default / meaning |
+| Flag (environment variable uses `VAHTISIRU_` plus the uppercase flag with underscores) | Default / meaning |
 | --- | --- |
 | `--safety-temp-warn-c` / `--safety-temp-critical-c` | 75 / 85 C; explicit operator defaults, not vendor thermal limits |
 | `--safety-power-warn-w` / `--safety-power-critical-w` | Both omitted: 85% / 100% of NVML's device default power limit; supply both to override |
@@ -310,8 +310,8 @@ Invalid or contradictory settings stop startup before locks, ports or workers.
 | `--safety-max-acquisition-interval-ms` | 100 ms; bounds the declared acquisition interval |
 
 For example, `--safety-power-warn-w 80 --safety-power-critical-w 95` sets an
-explicit 80/95 W envelope (`THALAMIC_SAFETY_POWER_WARN_W` and
-`THALAMIC_SAFETY_POWER_CRITICAL_W` are equivalent). A reported device default
+explicit 80/95 W envelope (`VAHTISIRU_SAFETY_POWER_WARN_W` and
+`VAHTISIRU_SAFETY_POWER_CRITICAL_W` are equivalent). A reported device default
 below 95 W rejects this configuration. Limits must be finite, positive and
 ordered warning < critical. Thermal critical is at most 125 C; power critical
 and device default are at most the telemetry sanity bound of 2000 W.
@@ -375,7 +375,7 @@ Structured logging via `tracing` with configurable output levels.
 - **Independent safety loop**: `SafetyMachine::evaluate` has no publisher argument and is not awaited on IPC. Production uses `CorpusIpcPublisher` (bounded `IsolatedPublishQueue` enqueue with explicit full-queue policy + detached UDP worker). `--ipc-disabled` or a bind failure falls back to `AbsentPublisher`.
 - **GPU Safety Monitoring**: Safety cadence every ~1 second (every 10 ticks); named states for healthy-real, warning, critical/braked, recovering, missing/stale/invalid, simulated, actuator-failure
 - **Emergency Brakes**: Automatically throttles GPU power limit to 50% via `nvidia-smi -pl` on fail-closed or critical **when actuation succeeds**; the configured consecutive real Ok streak (default 3) to release; warn immediately after release re-applies
-- **Fail-closed shutdown / restart**: Ctrl-C and SIGTERM stop the run loop, join background tasks with a timeout, and release `/tmp/thalamic_relay.lock`. Shutdown **does not** restore the default GPU power limit. A persistent relay-owned brake (current PL matching the 50% target) is adopted on the next start and released only through the same Ok-streak hysteresis. An operator-configured sub-default cap is left unchanged. Simulated/software-only telemetry cannot authorize release of a real brake. SIGKILL/power loss have no cleanup promise.
+- **Fail-closed shutdown / restart**: Ctrl-C and SIGTERM stop the run loop, join background tasks with a timeout, and release `/tmp/vahtisiru.lock`. Shutdown **does not** restore the default GPU power limit. A persistent relay-owned brake (current PL matching the 50% target) is adopted on the next start and released only through the same Ok-streak hysteresis. An operator-configured sub-default cap is left unchanged. Simulated/software-only telemetry cannot authorize release of a real brake. SIGKILL/power loss have no cleanup promise.
 - **Graceful Degradation**: Continues in software-only mode when
   `--force-software-only` is set (`TelemetrySource::SoftwareFallback`).
   NVML/driver failure without that flag is `NvmlUnavailable` and fail-closes
@@ -392,7 +392,7 @@ receive/emit timestamps, and `source_time_status`. See
 
 A separate frozen **CSV interchange** for corinth-canal ingest lives in
 [`docs/telemetry_csv.md`](docs/telemetry_csv.md) and
-`thalamic_relay::telemetry_csv` (header
+`vahtisiru::telemetry_csv` (header
 `timestamp_ms,gpu_temp_c,gpu_power_w,cpu_tctl_c,cpu_package_power_w`).
 Producers should validate against that module before publishing a file
 corinth will read. The CSV schema is frozen; do not add columns.
@@ -425,7 +425,7 @@ The crates.io artifact is an **allowlist** (`include` in `Cargo.toml`), not a
 denylist, so development-only files cannot ship by accident. The package
 contains:
 
-- `src/` (library + `thalamic-relay` binary)
+- `src/` (library + `vahtisiru` binary)
 - consumer docs: `README.md`, `CHANGELOG.md`, and the four explicit `docs/*.md` contracts
 - `examples/software_only.rs` for a GPU-less library demonstration
 - `Cargo.lock` (this package has a binary)
@@ -443,7 +443,7 @@ coding standards and include appropriate tests.
 ## Releasing
 
 The first intended registry release is **0.2.0**, gated by
-[GH#44](https://github.com/rmems/thalamic-relay/issues/44). The 0.1.0 changelog
+[GH#44](https://github.com/rmems/vahtisiru/issues/44). The 0.1.0 changelog
 entry records repository history; it is not evidence of a crates.io release.
 Real publication requires explicit maintainer approval immediately before
 upload. CI performs only a token-free dry run.
@@ -473,7 +473,7 @@ upload. CI performs only a token-free dry run.
    run `cargo publish --locked`. A passing dry run does not verify credentials,
    reserve the crate name, or upload a release.
 4. Confirm the version is retrievable from crates.io with
-   `cargo info thalamic-relay@0.2.0 --registry crates-io` from outside this repo
+   `cargo info vahtisiru@0.2.0 --registry crates-io` from outside this repo
    and build a separate consumer using the registry version. Check docs.rs
    built 0.2.0 successfully before declaring hosted documentation available.
 5. After successful registry verification, create the annotated `v0.2.0` tag
@@ -494,14 +494,14 @@ For later patches, advance all version references together (for example,
 3. **Brake actuation**: Requires passwordless `sudo -n nvidia-smi`. Failures
    are `ActuatorError` / `actuator_failure`, not a frozen safety loop.
 4. **Instance Conflicts**: Check for an existing relay process holding the lockfile
-   at `/tmp/thalamic_relay.lock`
+   at `/tmp/vahtisiru.lock`
 
 ### Debug Mode
 
 Enable debug logging for detailed troubleshooting:
 
 ```bash
-RUST_LOG=debug cargo run --bin thalamic-relay
+RUST_LOG=debug cargo run --bin vahtisiru
 ```
 
 Brake targets whose ±2 W matching band overlaps the device-default band are

@@ -1,4 +1,4 @@
-# Thalamic Relay — Review Guide
+# Vahtisiru — Review Guide
 
 ## Running Tests
 
@@ -104,7 +104,7 @@ cargo test lock_guard         # single-instance lockfile tests
 | tests/software_only.rs | `slow_and_disconnected_publish_queues_do_not_block_critical_brake` | Disconnected queue ≠ safety pause |
 | tests/software_only.rs | `acquire_without_force_is_not_simulated_on_ci` | No-GPU acquire is NvmlUnavailable, not sim |
 
-As of RM-1143 (GH#39), `thalamic-relay` no longer runs an in-process SNN or
+As of RM-1143 (GH#39), `vahtisiru` no longer runs an in-process SNN or
 exposes a UDP control surface — the `Stimuli`/`LearningReward`/`GetNeuroState`
 tests and the `num-channels`/`num-lif`/`num-izh` CLI tests were removed along
 with that code. See [`docs/ipc.md`](docs/ipc.md).
