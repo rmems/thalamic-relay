@@ -1,5 +1,5 @@
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
-# Draft CodeRabbit config for rmems/vahtisiru (generated locally, not pushed).
+# CodeRabbit review configuration for rmems/vahtisiru.
 language: en-US
 reviews:
   profile: chill
