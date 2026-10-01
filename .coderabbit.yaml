@@ -1,0 +1,28 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# Draft CodeRabbit config for rmems/vahtisiru (generated locally, not pushed).
+language: en-US
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  fail_commit_status: false
+  auto_review:
+    enabled: true
+    drafts: false
+  path_filters:
+  - '!**/target/**'
+  path_instructions:
+  - path: '**/*.rs'
+    instructions: 'Rust edition 2024; `rust-version = "1.98.1"` is the authoritative pin and `rust-toolchain.toml` must match it (CI asserts equality). Edition (needs >=1.85) and MSRV are separate concerns. Do not suggest downgrading the edition or using std/language APIs newer than the pinned toolchain/MSRV. CI gate: `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test [--locked] --all-features`, `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features`, packaged-crate test. Flag anything that would fail `cargo fmt --check` or clippy `-D warnings`. NVML is runtime-loaded; the software path must work with no GPU/driver. Don''t change the telemetry CSV schema (`docs/telemetry_csv.md`). Don''t claim behaviour the code doesn''t implement in comments or docs.'
+  - path: '**/Cargo.toml'
+    instructions: Cargo manifest. Call out new dependencies and feature changes, and keep `rust-version` / `edition` consistent with CI. `rust-version` and `rust-toolchain.toml` must stay equal.
+  - path: .github/workflows/**
+    instructions: GitHub Actions workflows. Keep `permissions:` least-privilege and job commands in sync with the local gates documented in the repo. Every `uses:` is pinned to a full commit SHA today; new or bumped actions must be too. The hardware smoke (`--gpu-hardware-smoke`) runs only on `[self-hosted, linux, x64, gpu, nvidia]` for `main`; keep it off PR triggers.
+  tools:
+    clippy:
+      enabled: true
+    actionlint:
+      enabled: true
+    yamllint:
+      enabled: true
+    markdownlint:
+      enabled: true
