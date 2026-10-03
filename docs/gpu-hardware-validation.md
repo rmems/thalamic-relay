@@ -45,7 +45,7 @@ toolchain installed:
 
 ```sh
 nvidia-smi -L
-cargo run --locked --bin thalamic-relay -- --gpu-hardware-smoke
+cargo run --locked --bin vahtisiru -- --gpu-hardware-smoke
 ```
 
 ## Actuation validation

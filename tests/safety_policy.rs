@@ -1,9 +1,9 @@
-use thalamic_relay::safety::{
+use vahtisiru::safety::{
     ActuatorOutcome, BrakeIntent, SafetyMachine, SafetyPolicyConfig, SafetyState,
 };
-use thalamic_relay::telemetry::{assess, fixtures};
+use vahtisiru::telemetry::{assess, fixtures};
 
-fn frame(power: f32) -> thalamic_relay::telemetry::TelemetryFrame {
+fn frame(power: f32) -> vahtisiru::telemetry::TelemetryFrame {
     let mut raw = fixtures::healthy_real();
     raw.gpu_temp_c = Some(60.0);
     raw.power_w = Some(power);
@@ -138,7 +138,7 @@ fn policy_can_tighten_freshness_and_acquisition_cadence() {
 
 #[test]
 fn binary_rejects_contradictory_policy_before_process_lock() {
-    let result = std::process::Command::new(env!("CARGO_BIN_EXE_thalamic-relay"))
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_vahtisiru"))
         .args([
             "--force-software-only",
             "--safety-temp-warn-c",
@@ -158,9 +158,9 @@ fn binary_rejects_contradictory_policy_before_process_lock() {
 
 #[test]
 fn binary_validates_environment_policy_and_cli_precedence() {
-    let bin = env!("CARGO_BIN_EXE_thalamic-relay");
+    let bin = env!("CARGO_BIN_EXE_vahtisiru");
     let result = std::process::Command::new(bin)
-        .env("THALAMIC_SAFETY_POWER_WARN_W", "40")
+        .env("VAHTISIRU_SAFETY_POWER_WARN_W", "40")
         .args(["--force-software-only", "--safety-power-critical-w", "30"])
         .output()
         .unwrap();
@@ -169,7 +169,7 @@ fn binary_validates_environment_policy_and_cli_precedence() {
     // CLI must override the otherwise invalid environment temperature warning.
     // The second, deliberately invalid power pair stops before hardware/ports.
     let result = std::process::Command::new(bin)
-        .env("THALAMIC_SAFETY_TEMP_WARN_C", "100")
+        .env("VAHTISIRU_SAFETY_TEMP_WARN_C", "100")
         .args([
             "--force-software-only",
             "--safety-temp-warn-c",
@@ -253,7 +253,7 @@ fn binary_rejects_cadence_that_exceeds_policy() {
             "300",
         ],
     ] {
-        let result = std::process::Command::new(env!("CARGO_BIN_EXE_thalamic-relay"))
+        let result = std::process::Command::new(env!("CARGO_BIN_EXE_vahtisiru"))
             .arg("--force-software-only")
             .args(args)
             .output()

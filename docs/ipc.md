@@ -1,18 +1,18 @@
 # Sensory IPC contract (`corpus-ipc`)
 
-As of [RM-1143 / GH#39](https://github.com/rmems/thalamic-relay/issues/39),
-`thalamic-relay` no longer runs an in-process spiking neural network, and the
+As of [RM-1143 / GH#39](https://github.com/rmems/vahtisiru/issues/39),
+`vahtisiru` no longer runs an in-process spiking neural network, and the
 retired UDP **control** surface (`Stimuli` / `LearningReward` / `GetNeuroState`
 at `127.0.0.1:9898`) is gone. That protocol existed only to drive and query the
 relay's own SNN.
 
-Thalamic is a sensory + hardware-safety relay: it collects, validates,
+Vahtisiru is a sensory + hardware-safety relay: it collects, validates,
 and safety-gates GPU telemetry, independent of whether any downstream neural
 runtime (`brainstem-daemon`) is present. Safety evaluation is documented in
 [`docs/safety.md`](safety.md) and does not wait on this transport. It publishes validated,
 normalized runtime-input channels to Brainstem as canonical
 [`corpus-ipc`](https://github.com/Limen-Neural/corpus-ipc) `IpcMessage`
-values ([GH#40](https://github.com/rmems/thalamic-relay/issues/40) /
+values ([GH#40](https://github.com/rmems/vahtisiru/issues/40) /
 [RM-1144](https://linear.app/rpd-34/issue/RM-1144)). Hardware safety does
 **not** wait on this transport. There is still no control/query IPC: the
 relay does not listen, does not accept `LearningReward`, and does not
@@ -22,11 +22,11 @@ Prometheus metrics remain on `:9000/metrics`.
 
 The typed validity / freshness / provenance / normalization contract
 (GH#41) lives in [`docs/telemetry.md`](telemetry.md) and
-`thalamic_relay::telemetry`. Frame ordering and timestamp provenance
-(RM-1335) live in `thalamic_relay::time`: `session_id` / `batch_id` match
+`vahtisiru::telemetry`. Frame ordering and timestamp provenance
+(RM-1335) live in `vahtisiru::time`: `session_id` / `batch_id` match
 corpus-ipc `StimulusBatch`, source wall time is preserved separately from
 receive/emit time, and a process restart is a new `session_id`; telemetry
-`SampleClock` in `thalamic_relay::time` resets `batch_id` to 0 (wire
+`SampleClock` in `vahtisiru::time` resets `batch_id` to 0 (wire
 allocation below). `TelemetryFrame::to_sensory_mapping()` is the
 deterministic mapping surface toward `corpus-ipc`; it is **not** a second
 wire schema and does not implement transport. `publish` maps that into
@@ -42,12 +42,12 @@ loop, and transport failures never stall `SafetyMachine::evaluate`.
 
 | State | Owner |
 | --- | --- |
-| Hardware telemetry, validity, freshness, provenance | Thalamic (`telemetry` + `gpu`) |
-| Hard-safety classification and brake intent | Thalamic (`safety`) — never awaits IPC |
+| Hardware telemetry, validity, freshness, provenance | Vahtisiru (`telemetry` + `gpu`) |
+| Hard-safety classification and brake intent | Vahtisiru (`safety`) — never awaits IPC |
 | Canonical sensory wire schema | `corpus-ipc` (`IpcMessage`, `StimulusBatch`) |
 | SNN tick, neuromodulation, neural state | Brainstem |
 
-Relay/hardware state is observable from Thalamic (dashboard, Prometheus
+Relay/hardware state is observable from Vahtisiru (dashboard, Prometheus
 safety gauges). Neural-runtime state is Brainstem's and is not queried here.
 
 ## Wire schema
@@ -58,14 +58,14 @@ value, serde **externally tagged**. Production emits only:
 ```json
 {
   "Stimuli": {
-    "session_id": "thalamic-relay",
+    "session_id": "vahtisiru",
     "batch_id": 1,
     "timestamp": 1700000000000000000,
     "values": [0.65, 0.5714286, 0.6, 0.0],
     "valid_mask": [true, true, true, true],
     "metadata": {
       "processing_latency_ns": null,
-      "source": "thalamic-relay",
+      "source": "vahtisiru",
       "custom": {
         "acquisition_source": "nvml",
         "acquisition_cadence_ms": "100",
@@ -85,15 +85,15 @@ the corresponding `values[i]` is the corpus-ipc placeholder `0.0` and is
 `mem_util_pct = 0.0` while `Valid`) has `valid_mask[i] = true`.
 
 `timestamp` is the mapping/emission wall time in Unix-epoch nanoseconds:
-Thalamic's `emitted_at_unix_ms` multiplied by 1,000,000 with saturation on
+Vahtisiru's `emitted_at_unix_ms` multiplied by 1,000,000 with saturation on
 overflow. It is not `source_unix_ms`, and copying either millisecond field
 without conversion would make the corpus-ipc timestamp 1,000,000× too small.
 Freshness is computed before encoding from the frame's receive time, as
 specified in [`telemetry.md`](telemetry.md); this wire timestamp is not its
 authoritative freshness clock.
 `batch_id` is the strictly increasing per-session sequence stamped at
-acquisition (via `SampleClock` in `thalamic_relay::time`), before
-publication is attempted. When `--ipc-session-id` / `THALAMIC_IPC_SESSION_ID`
+acquisition (via `SampleClock` in `vahtisiru::time`), before
+publication is attempted. When `--ipc-session-id` / `VAHTISIRU_IPC_SESSION_ID`
 overrides the session, `CorpusIpcPublisher` allocates a publisher-scoped
 `batch_id` sequence (starting at `0` on process start) instead of reusing the
 mapping counter. Validation failures and queue policy can leave sequence gaps.
@@ -117,11 +117,11 @@ Configurable hardware-policy thresholds are **not** part of this schema.
 ## Transport
 
 Default: UDP to `127.0.0.1:9900` (`--ipc-endpoint` /
-`THALAMIC_IPC_ENDPOINT`). The supervisor binds an ephemeral local socket and
+`VAHTISIRU_IPC_ENDPOINT`). The supervisor binds an ephemeral local socket and
 `sendto`s one JSON datagram per frame. It does **not** bind the destination
 port, does not `recv`, and does not speak the retired 9898 control protocol.
 
-`--ipc-disabled` / `THALAMIC_IPC_DISABLED` uses `AbsentPublisher` (no worker).
+`--ipc-disabled` / `VAHTISIRU_IPC_DISABLED` uses `AbsentPublisher` (no worker).
 Invalid endpoint or a bind failure logs and continues; safety still evaluates.
 
 This crate depends on `corpus-ipc` **without** the `zmq` feature. ZeroMQ

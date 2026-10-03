@@ -1,16 +1,16 @@
 # Safety failure domain
 
-This is the normative hardware-protection contract for `thalamic-relay`
-([GH#42](https://github.com/rmems/thalamic-relay/issues/42)).
+This is the normative hardware-protection contract for `vahtisiru`
+([GH#42](https://github.com/rmems/vahtisiru/issues/42)).
 
 Safety evaluation is an **isolated failure domain**. It continues with
 Brainstem completely absent, and it never waits on `corpus-ipc` send,
 disconnect, or a slow consumer. Brainstem has **no** authority to override
-Thalamic hard-safety policy — there is no IPC command that can inhibit the
+Vahtisiru hard-safety policy — there is no IPC command that can inhibit the
 brake.
 
 Privileged `nvidia-smi` actuation stays in private `src/gpu.rs` (used only by
-the `thalamic-relay` executable). The state machine in `src/safety.rs` only
+the `vahtisiru` executable). The state machine in `src/safety.rs` only
 emits **intents**; hardware side effects go through [`SafetyActuator`]
 (`NvmlActuator` in production, `FakeActuator` in tests). Apply/release is
 best-effort and requires Linux, NVML, and passwordless `sudo -n nvidia-smi`
@@ -41,17 +41,17 @@ GPU-selection or multi-GPU tool.
 
 | Guarantee | Owner |
 | --- | --- |
-| Telemetry acquisition, validity, freshness, provenance | Thalamic (`telemetry` + `gpu` acquire) |
-| Hard-safety classification, hysteresis, brake intent | Thalamic (`safety`) |
-| Power-limit apply/release | Thalamic (`gpu` actuator) |
-| Safety/brake state and transition/error counters | Thalamic Prometheus (`:9000/metrics`) |
-| Orderly SIGINT/SIGTERM shutdown (fail-closed) | Thalamic (`shutdown` + supervisor) |
-| Sensory mapping types | Thalamic (`TelemetryFrame::to_sensory_mapping`) |
-| Sensory transport to Brainstem | Thalamic `publish` → `corpus-ipc` `IpcMessage::Stimuli` (not required for safety) |
+| Telemetry acquisition, validity, freshness, provenance | Vahtisiru (`telemetry` + `gpu` acquire) |
+| Hard-safety classification, hysteresis, brake intent | Vahtisiru (`safety`) |
+| Power-limit apply/release | Vahtisiru (`gpu` actuator) |
+| Safety/brake state and transition/error counters | Vahtisiru Prometheus (`:9000/metrics`) |
+| Orderly SIGINT/SIGTERM shutdown (fail-closed) | Vahtisiru (`shutdown` + supervisor) |
+| Sensory mapping types | Vahtisiru (`TelemetryFrame::to_sensory_mapping`) |
+| Sensory transport to Brainstem | Vahtisiru `publish` → `corpus-ipc` `IpcMessage::Stimuli` (not required for safety) |
 | SNN tick, neuromodulation, neural state | Brainstem |
-| Reward / plasticity | Brainstem (never Thalamic) |
+| Reward / plasticity | Brainstem (never Vahtisiru) |
 
-Thalamic does **not** run neural computation. Observing safety does **not**
+Vahtisiru does **not** run neural computation. Observing safety does **not**
 require querying neural state.
 
 ## Named states
@@ -128,7 +128,7 @@ operator writes can race the read/command sequence.
 ## Shutdown and restart
 
 SIGINT (Ctrl-C) and SIGTERM enter a **controlled shutdown**. The process lock
-at `/tmp/thalamic_relay.lock` is released on the way out. Background metrics
+at `/tmp/vahtisiru.lock` is released on the way out. Background metrics
 collection and in-flight actuation are joined with a bounded timeout (they
 must not hang indefinitely). Sensory UDP publication is best-effort and has no shutdown delivery guarantee. SIGKILL and power loss are **not** promised to
 clean up.

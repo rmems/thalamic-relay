@@ -8,22 +8,20 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
-use thalamic_relay::publish::{
+use vahtisiru::publish::{
     AbsentPublisher, FailingPublisher, IsolatedPublishQueue, PublishError,
     evaluate_then_try_publish,
 };
-use thalamic_relay::safety::{
+use vahtisiru::safety::{
     ActuatorOutcome, BRAKE_FRACTION, BrakeIntent, FakeActuator, SafetyActuator, SafetyMachine,
     SafetyState,
 };
-use thalamic_relay::telemetry::SensoryMapping;
-use thalamic_relay::telemetry::{
-    SampleValidity, TelemetrySource, assess, fixtures, software_fallback,
-};
+use vahtisiru::telemetry::SensoryMapping;
+use vahtisiru::telemetry::{SampleValidity, TelemetrySource, assess, fixtures, software_fallback};
 
 #[test]
 fn binary_help_and_version_exit_zero_without_gpu() {
-    let bin = env!("CARGO_BIN_EXE_thalamic-relay");
+    let bin = env!("CARGO_BIN_EXE_vahtisiru");
     for arg in ["--help", "-V"] {
         let output = Command::new(bin)
             .arg(arg)
@@ -46,8 +44,8 @@ fn binary_help_and_version_exit_zero_without_gpu() {
 
 #[test]
 fn binary_software_only_starts_without_nvidia() {
-    let bin = env!("CARGO_BIN_EXE_thalamic-relay");
-    let lock_path = "/tmp/thalamic_relay.lock";
+    let bin = env!("CARGO_BIN_EXE_vahtisiru");
+    let lock_path = "/tmp/vahtisiru.lock";
     reclaim_stale_production_lock(lock_path);
 
     let mut child = Command::new(bin)
@@ -55,13 +53,13 @@ fn binary_software_only_starts_without_nvidia() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn thalamic-relay");
+        .expect("spawn vahtisiru");
     let child_pid = child.id();
 
     // Stop the supervisor ourselves so this test does not depend on coreutils
     // `timeout` (missing on some CI images / non-GNU hosts).
     std::thread::sleep(Duration::from_secs(1));
-    let still_running = child.try_wait().expect("poll thalamic-relay").is_none();
+    let still_running = child.try_wait().expect("poll vahtisiru").is_none();
     if still_running {
         let _ = child.kill();
     }
@@ -83,7 +81,7 @@ fn binary_software_only_starts_without_nvidia() {
     );
 }
 
-/// Reclaim `/tmp/thalamic_relay.lock` only when the recorded PID is dead.
+/// Reclaim `/tmp/vahtisiru.lock` only when the recorded PID is dead.
 /// Never unlink a live supervisor's single-instance marker.
 fn reclaim_stale_production_lock(lock_path: &str) {
     if !Path::new(lock_path).exists() {
@@ -218,7 +216,7 @@ fn acquire_without_force_is_not_simulated_on_ci() {
 }
 
 fn configured_machine() -> SafetyMachine {
-    let config = thalamic_relay::safety::SafetyPolicyConfig {
+    let config = vahtisiru::safety::SafetyPolicyConfig {
         power_warn_w: Some(300.0),
         power_critical_w: Some(350.0),
         ..Default::default()

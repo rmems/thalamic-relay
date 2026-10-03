@@ -3,7 +3,7 @@
 //! Classification, hysteresis, and brake *intent* are pure functions of a
 //! [`TelemetryFrame`] plus machine state. This module has no corpus-ipc,
 //! Brainstem, NVML, subprocess, or async-runtime dependency. Privileged
-//! power-limit actuation is performed by the `thalamic-relay` executable
+//! power-limit actuation is performed by the `vahtisiru` executable
 //! through [`SafetyActuator`]; sensory publication lives in [`crate::publish`]
 //! and must never be awaited on this path.
 //!
@@ -209,10 +209,10 @@ impl SafetySnapshot {
 /// Deterministic safety state machine. Not coupled to IPC or GPU actuation.
 ///
 /// ```
-/// use thalamic_relay::safety::{SafetyMachine, SafetyState};
-/// use thalamic_relay::telemetry::{assess, fixtures};
+/// use vahtisiru::safety::{SafetyMachine, SafetyState};
+/// use vahtisiru::telemetry::{assess, fixtures};
 ///
-/// let policy = thalamic_relay::safety::SafetyPolicyConfig::default()
+/// let policy = vahtisiru::safety::SafetyPolicyConfig::default()
 ///     .resolve(Some(400.0)).unwrap(); // Example device default: 400 W
 /// let mut machine = SafetyMachine::with_policy(policy);
 /// let frame = assess(&fixtures::healthy_real(), fixtures::NOW);
@@ -803,7 +803,7 @@ pub fn classify_power_limit(
 ///
 /// Implementations apply/release a hardware power-limit brake and detect a
 /// leftover brake at startup. The NVML/`nvidia-smi` backend is private to the
-/// `thalamic-relay` executable; [`FakeActuator`] provides a deterministic test
+/// `vahtisiru` executable; [`FakeActuator`] provides a deterministic test
 /// double. This trait is the actuation half of GH#46: the [`SafetyMachine`]
 /// decides *intent* ([`BrakeIntent`]) and never actuates, while implementations
 /// here perform the privileged side effect and report typed [`ActuatorError`]s.

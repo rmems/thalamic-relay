@@ -1,6 +1,6 @@
 //! GPU telemetry acquisition and privileged NVML / `nvidia-smi` actuation.
 //!
-//! Crate-private: the `thalamic-relay` executable uses this adapter; it is not
+//! Crate-private: the `vahtisiru` executable uses this adapter; it is not
 //! public library API.
 //!
 //! Raw NVML acquisition lives on [`HardwareBridge`]; the `nvidia-smi`
